@@ -1,11 +1,19 @@
 """账号池管理 - 持久化存储所有账号状态"""
 
 import json
+import logging
 import time
 from pathlib import Path
 
+from autoteam.account_state import (
+    AccountState,
+    IllegalTransitionError,
+    default_machine,
+)
 from autoteam.admin_state import get_admin_email
 from autoteam.textio import read_text, write_text
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
@@ -134,15 +142,51 @@ def add_account(email, password, cloudmail_account_id=None, seat_type=SEAT_UNKNO
         }
     )
     save_accounts(accounts)
+    # Round 12 S1 — 新号入池触发 None → PENDING 转移,产生事件 + state_log 行
+    try:
+        default_machine.transition(
+            email=email,
+            to_state=STATUS_PENDING,
+            reason="add_account",
+            from_state=None,
+        )
+    except IllegalTransitionError:
+        logger.exception("add_account: illegal initial transition for %s", email)
 
 
 def update_account(email, **kwargs):
-    """更新账号字段"""
+    """更新账号字段。
+
+    如果 kwargs 含 ``status`` 且与当前状态不同 → 走 ``default_machine.transition``
+    做合法性校验 + 写 state_log + 发事件。其余字段照常 update。
+
+    可选 kwarg ``_reason`` (内部约定): 状态转移日志里的 reason,默认 "update_account"。
+    """
     accounts = load_accounts()
     acc = find_account(accounts, email)
-    if acc:
-        acc.update(kwargs)
-        save_accounts(accounts)
+    if not acc:
+        return None
+
+    new_status = kwargs.get("status")
+    cur_status = acc.get("status")
+    reason = kwargs.pop("_reason", "update_account")
+
+    if new_status is not None and new_status != cur_status:
+        extra_payload = {k: v for k, v in kwargs.items() if k != "status"}
+        try:
+            default_machine.transition(
+                email=email,
+                to_state=new_status,
+                reason=reason,
+                extra=extra_payload or None,
+                from_state=cur_status,
+            )
+        except IllegalTransitionError:
+            # 合法性校验失败一律抛给调用方,避免静默写坏 accounts.json
+            raise
+
+    acc.update(kwargs)
+    save_accounts(accounts)
     return acc
 
 
@@ -194,3 +238,55 @@ def get_next_reusable_account():
     if standby:
         return standby[0]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Round 12 S1 — 把 default_machine 的 from_state 查询挂在 accounts.json。
+# 放在文件尾部避免循环 import：account_state.py 加载时不会触发本模块,本模块
+# 加载完成后再注入 provider。
+# ---------------------------------------------------------------------------
+def _lookup_account_status(email: str):
+    """状态机的 state_provider：按 email 查 accounts.json 当前 status。"""
+    if not email:
+        return None
+    acc = find_account(load_accounts(), email)
+    if not acc:
+        return None
+    return acc.get("status")
+
+
+default_machine.set_state_provider(_lookup_account_status)
+
+
+# 显式 re-export AccountState：调用方 `from autoteam.accounts import AccountState` 也能拿到。
+# `IllegalTransitionError` 同理供上层捕获。
+__all__ = [
+    "ACCOUNTS_FILE",
+    "AccountState",
+    "IllegalTransitionError",
+    "PROJECT_ROOT",
+    "SEAT_CHATGPT",
+    "SEAT_CODEX",
+    "SEAT_UNKNOWN",
+    "STATUS_ACTIVE",
+    "STATUS_AUTH_INVALID",
+    "STATUS_DEGRADED_GRACE",
+    "STATUS_EXHAUSTED",
+    "STATUS_ORPHAN",
+    "STATUS_PENDING",
+    "STATUS_PERSONAL",
+    "STATUS_STANDBY",
+    "SUPPORTED_PLAN_TYPES",
+    "add_account",
+    "delete_account",
+    "find_account",
+    "get_active_accounts",
+    "get_next_reusable_account",
+    "get_personal_accounts",
+    "get_standby_accounts",
+    "is_supported_plan",
+    "load_accounts",
+    "normalize_plan_type",
+    "save_accounts",
+    "update_account",
+]
