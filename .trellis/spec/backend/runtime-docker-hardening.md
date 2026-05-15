@@ -45,6 +45,11 @@
 - `CHATGPT_API_TRANSPORT=curl_cffi` or `auto` is allowed only for backend API reads. It must not be used for free registration, Personal OAuth, captcha/challenge flows, or workspace UI selection; those call sites must force `require_browser=True` or launch their own Playwright context.
 - `/api/status` may include `runtime_resources`, but resource collection must never block or fail the status response.
 - Background Team member count probes must run in a killable subprocess and return unknown (`-1`) on timeout/failure.
+- `ChatGPTTeamAPI.start_with_session()` must call `stop()` if the browser fallback path fails after partial initialization, not only when `_launch_browser()` itself fails.
+- `ChatGPTTeamAPI.start_with_session()` must also call `stop()` when HTTP transport startup succeeds but later workspace detection or admin-state persistence fails.
+- Direct HTTP API fetches must close and clear the bad `http_transport` before browser fallback when the transport raises, returns HTML/challenge, or fails again after a 401-triggered token refresh retry.
+- Registration and OAuth Playwright call sites must use `close_playwright_objects()` rather than raw `browser.close()`, `context.close()`, or `page.close()`. Direct registration paths need a `try/finally` guard so unexpected page/navigation errors still release page, context, and browser.
+- `SessionCodexAuthFlow.start()` must stop its `ChatGPTTeamAPI` instance if page creation, cookie injection, navigation, or the first `_advance()` fails after `start_with_session(require_browser=True)`.
 
 ### 4. Validation & Error Matrix
 
@@ -56,10 +61,15 @@
 | browser zombie count >= threshold | Log a warning that init/reaper should be enabled |
 | Playwright page/context/browser/stop raises during cleanup | Log debug when logger exists; continue cleanup and do not re-raise |
 | `_launch_browser()` partially initializes then fails | Call `stop()` and re-raise the original exception |
+| `start_with_session(..., require_browser=True)` or browser fallback starts Playwright then fails during navigation/token/workspace setup | Call `stop()` and re-raise the original exception |
 | probe subprocess timeout | Kill the process group/tree and treat count as unknown |
 | `curl_cffi` missing or transport init fails | Return `None`; continue with Playwright |
 | transport returns HTML/challenge/401 token missing | Fall back to Playwright API fetch |
 | `ChatGPTTeamAPI.start()` succeeds via HTTP transport only | Cleanup and reuse checks must use `is_started()` / `_chatgpt_session_ready()`, not `browser` alone |
+| `http_transport.request()` raises before or after token refresh retry | Close/clear the transport, then fall back to Playwright using the saved `session_token` |
+| invite/direct registration or Codex OAuth opens a Playwright page then raises before a normal return | Cleanup must still close page, context, and browser in dependency order |
+| `SessionCodexAuthFlow.start()` fails after creating a `ChatGPTTeamAPI` | Call `stop()` and clear `chatgpt` / `page` fields |
+| `collect_runtime_resource_snapshot()` unexpectedly raises inside `/api/status` | Return a status response with a diagnostic `runtime_resources.error`; do not raise a 500 |
 
 ### 5. Good/Base/Bad Cases
 
@@ -67,13 +77,19 @@
 - Base: local non-Docker startup still uses the same Python modules and defaults to `auto`, while browser-dependent flows force Playwright explicitly.
 - Bad: letting `auto` leak into OAuth/UI flows, swallowing Playwright init failures without cleanup, or running periodic Team count checks in the long-lived API process.
 - Bad: guarding `stop()` with `if api.browser` after `auto` transport is enabled; HTTP-only sessions would leak.
+- Bad: keeping a failed `http_transport` after browser fallback; the next `_api_fetch()` would retry the same known-bad transport instead of using the live browser session.
+- Bad: replacing direct registration's final `browser.close()` but leaving unexpected navigation errors outside a `finally` cleanup guard.
 
 ### 6. Tests Required
 
 - Docker contract: `tests/integration/test_docker_guard.py`
 - Resource probe: `tests/unit/test_runtime_resources.py`
 - Playwright cleanup and subprocess probe behavior: `tests/unit/test_api_playwright_cleanup.py`
+- API status resource-snapshot boundary: `tests/unit/test_api_status.py`
 - HTTP transport auto/fallback: `tests/unit/test_chatgpt_transport.py`
+- Direct registration and OAuth cleanup source/exception guards:
+  - `tests/unit/test_api_playwright_cleanup.py`
+  - `tests/unit/test_round11_session_token_injection.py`
 - Status endpoint integration: `tests/unit/test_api_status.py`
 - Free registration regression:
   - `tests/unit/test_round11_personal_oauth_retry.py`

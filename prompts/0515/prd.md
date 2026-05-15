@@ -61,6 +61,7 @@
 - 内存使用比例超过阈值时记录 warning 并执行 `gc.collect()`。
 - browser zombie 超阈值时记录 warning，提示 `init` / reaper 配置。
 - 资源快照应被 API status 或自动巡检日志可见，但不得阻塞主流程。
+- `/api/status` 必须在资源快照采集异常时仍返回正常 status 响应，并携带可诊断的 `runtime_resources.error`。
 
 ### R4. Playwright 生命周期清理
 
@@ -68,7 +69,11 @@
 
 - 关闭顺序固定为 page -> context -> browser -> playwright。
 - `_launch_browser()` 失败时必须调用 `stop()` 清理半初始化对象。
+- `start_with_session()` 的浏览器 fallback 如果在浏览器已创建后失败，也必须调用 `stop()` 清理半初始化对象。
 - `stop()` 必须幂等，可重复调用。
+- 直接注册、邀请注册和 Codex OAuth 路径不得残留裸 `browser.close()` / `context.close()`；直接注册必须有覆盖未知异常路径的 `try/finally` cleanup。
+- `SessionCodexAuthFlow.start()` 若在真实浏览器 session 启动后失败，必须调用 `stop()`，避免主号 OAuth 修复路径留下浏览器资源。
+- HTTP transport 被判定失败后必须关闭并清空；首次 request、HTML/challenge/auth fallback、401 refresh 后 retry request 都必须能回退到浏览器。
 - API 登录、Team 成员探测、manual account、main codex 等路径若创建 `ChatGPTTeamAPI` 后失败，必须释放对象。
 - 不能把 Playwright 清理异常向上传播为业务失败，除非原始业务操作已经失败。
 
@@ -82,6 +87,8 @@
 - 不改 `STATUS_PERSONAL` / `STATUS_STANDBY` / `STATUS_AUTH_INVALID` 等状态语义。
 - 不改 `register_failures.json` 的关键分类语义。
 - 不让 Docker/runtime/transport 默认改变注册浏览器上下文、workspace select 或 OAuth callback 逻辑。
+- 注册页和 OAuth about-you 必须复用同一份真正不可变的 `SignupProfile`；不能允许嵌套 `birthday` 字段在对象创建后被修改。
+- OAuth about-you 不能只填一次就假定成功；若页面仍停留在 about-you，应尝试 profile 支持的生日字段顺序，全部失败时返回失败给上层 retry/failure 分类。
 
 ### R6. 验证证据
 
@@ -90,6 +97,7 @@
 - `python -m pytest tests/integration/test_docker_guard.py`
 - `python -m pytest tests/unit/test_runtime_resources.py`（新增后）
 - `python -m pytest tests/unit/test_api_playwright_cleanup.py`（新增或适配后）
+- `python -m pytest tests/unit/test_chatgpt_transport.py`
 - free 注册保护回归：
   - `python -m pytest tests/unit/test_round11_personal_oauth_retry.py`
   - `python -m pytest tests/unit/test_round11_session_token_injection.py`
@@ -106,7 +114,9 @@
 - 实施完成后，Docker 配置具备 init、shared memory、资源边界、healthcheck 和 build args。
 - 资源探针在非 Linux / 无 cgroup 环境中优雅降级，不抛异常。
 - Playwright lifecycle 清理新增测试通过。
+- HTTP transport 异常和 fallback 清理测试通过。
 - free 注册相关回归测试通过，且没有默认启用影响 free 注册主流程的新 transport。
+- `SignupProfile` 嵌套不可变、OAuth about-you 顺序重试、browser fallback cleanup 和 status 快照兜底均有回归测试。
 - 变更说明中明确列出未吸收项和原因。
 
 ## 决策

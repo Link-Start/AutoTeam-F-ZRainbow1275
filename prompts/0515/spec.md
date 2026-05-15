@@ -24,10 +24,10 @@
 ### 2.2 只允许定点修改的高风险文件
 
 - `src/autoteam/api.py`
-  - 只允许增加资源快照字段、Playwright cleanup 调用、executor stop 钩子、health/status 辅助。
+  - 只允许增加资源快照字段、Playwright cleanup 调用、executor stop 钩子、health/status 辅助；资源快照接入必须在 API 边界兜底，不能让 `/api/status` 变成 500。
   - 不允许改变 `/api/tasks/fill` 的 `leave_workspace` 入参和任务调度语义。
 - `src/autoteam/chatgpt_api.py`
-  - 只允许增加 `_launch_browser()` 失败清理、`stop()` 幂等清理、Team API transport 的封装入口。
+  - 只允许增加 `_launch_browser()` 失败清理、`start_with_session()` 浏览器 fallback 失败清理、`stop()` 幂等清理、Team API transport 的封装入口。
   - transport 默认值按母板为 `auto`；不允许改变 free 注册、Personal OAuth、验证码、workspace UI 的浏览器路径。
 - `src/autoteam/config.py`
   - 只允许新增运行时资源阈值配置、HTTP transport 配置。
@@ -91,6 +91,10 @@
 - 任一 close/stop 抛错时只记录 debug，不继续向外抛。
 - `ChatGPTTeamAPI.stop()` 必须在释放后清空对象字段。
 - `ChatGPTTeamAPI._launch_browser()` 在半初始化失败时必须调用 `stop()` 再重新抛原异常。
+- `ChatGPTTeamAPI.start_with_session()` 在浏览器 fallback 已经部分初始化后，若导航、token fetch 或 workspace detect 失败，也必须调用 `stop()` 再重新抛原异常。
+- `manager._complete_registration()`、`manager._register_direct_once()`、`invite.run()`、`codex_auth.login_codex_via_browser()` 不得保留裸 `browser.close()` / `context.close()`；直接注册必须用 `try/finally` 覆盖未知异常路径。
+- Codex OAuth 临时页（silent step-0、workspace page、stage2 fetch/stage2 page）必须使用统一 cleanup helper 关闭单页，避免 page close 异常打断主流程。
+- `SessionCodexAuthFlow.start()` 在 `start_with_session(require_browser=True)` 之后若新建页面、注入 cookie、导航或首轮推进失败，必须 stop `ChatGPTTeamAPI`。
 
 ## 6. transport 契约
 
@@ -99,6 +103,8 @@
 - 默认值对齐母板为 `CHATGPT_API_TRANSPORT=auto`。
 - 只允许用于无需真实浏览器上下文的 ChatGPT backend API 读写。
 - 遇到 HTML challenge、403、401 token missing、结构异常时必须回退浏览器路径。
+- `http_transport.request()` 首次请求或 401 refresh 后的重试请求抛异常时，必须关闭并清空坏 transport，再用保存的 `session_token` 回退浏览器路径。
+- 一旦决定浏览器 fallback，不能继续保留已判定异常的 `http_transport` 让后续 `_api_fetch()` 反复撞同一失败。
 - 不允许用于 free 注册、Personal OAuth、验证码、workspace UI 选择；这些路径必须显式 `require_browser=True` 或自建 Playwright context。
 - 依赖 `curl-cffi` 必须进入 `pyproject.toml` / `uv.lock`，保证 Docker 内默认 `auto` 后真实可用。
 
@@ -120,6 +126,8 @@
 - 不改变 `_run_post_register_oauth(..., leave_workspace=True)` 的 5 次 retry 和 `plan_type=free` 接受条件。
 - 不改变 plan drift 记录、`record_failure` 分类、Personal quota probe 和状态落盘。
 - 不改变 `auths/*-free*.json` 与 Team auth 文件互斥清理策略。
+- `SignupProfile` 必须在注册页与 OAuth about-you 之间保持同一份不可变快照；`birthday` 这种嵌套字段也必须防御性拷贝并拒绝原地修改。
+- OAuth about-you 必须使用该 profile 的生日顺序候选重试；如果提交后仍停留在 about-you，不能继续假装成功进入 consent loop。
 
 任何触碰上述区域，必须先更新本 PRD/spec，并单独列出兼容性证明。
 

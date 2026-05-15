@@ -16,7 +16,7 @@
 - `_cmd_fill_personal(count)`
 - `create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None)`
 - `create_account_direct(mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None)`
-- `_run_post_register_oauth(email, password, mail_client, leave_workspace=False, out_outcome=None, chatgpt_session_token=None)`
+- `_run_post_register_oauth(email, password, mail_client, leave_workspace=False, out_outcome=None, chatgpt_session_token=None, signup_profile=None)`
 - `generate_signup_profile(*, today: date | None = None, rng: random.Random | random.SystemRandom | None = None) -> SignupProfile`
 
 ### 3. Contracts
@@ -32,8 +32,12 @@
   - persist `STATUS_PERSONAL`
 - API-level fill-personal preflight must use the same local Team-seat definition as `manager._count_local_team_seat_accounts()`.
 - Local Team-seat statuses are `STATUS_ACTIVE`, `STATUS_EXHAUSTED`, and `STATUS_AUTH_INVALID`; `STATUS_PERSONAL` is not a Team seat.
-- `SignupProfile` must be a single immutable snapshot passed through registration and OAuth. Its birthday and age must also be self-consistent.
+- `SignupProfile` must be a single immutable snapshot passed through registration and OAuth. Its nested `birthday` mapping must reject in-place mutation and must be defensively copied from constructor input. Generated birthday and age must also be self-consistent.
+- Registration, direct registration, Team OAuth, and Personal OAuth must not use hardcoded fallback identities such as `User`, `1995-06-15`, or age `25` when a `SignupProfile` is available.
+- OAuth about-you must consume the same `SignupProfile`, try the profile's supported birthday field orders, and return failure if the page still remains on about-you after all supported orders. The caller must treat that failure as `bundle=None` so the existing retry/failure-classification policy can handle it.
 - `CHATGPT_API_TRANSPORT` defaults to `auto` for Team backend API reads, matching `D:\Desktop\autoteam-1\AutoTeam`; free registration and Personal OAuth still require a real browser context and must not rely on HTTP-only transport.
+- Direct free-registration setup may use Team backend HTTP transport only before the protected browser/OAuth boundary. The registration page, Team kick, Personal OAuth, about-you, and plan validation path must remain browser-backed or explicitly `require_browser=True`.
+- Direct registration must extract the ChatGPT session token before cleanup on the success path, then pass that token plus the same `SignupProfile` into `_run_post_register_oauth(..., leave_workspace=True)`.
 
 ### 4. Validation & Error Matrix
 
@@ -42,9 +46,14 @@
 | local Team seats >= `TEAM_SUB_ACCOUNT_HARD_CAP` before fill-personal | API returns 409 and does not start a background task |
 | local Team seats include `STATUS_AUTH_INVALID` | Count them as occupied seats |
 | generated birthday implies age outside allowed range | raise `ValueError` during profile generation |
+| caller mutates `profile.birthday["year"]` or updates the birthday mapping | raise `TypeError`; profile remains unchanged |
+| OAuth about-you appears after registration | Fill it from the same `SignupProfile` used for registration |
+| OAuth about-you submit stays on profile page after one birthday order | retry the next supported order from `SignupProfile.positional_birthday_orders()` |
+| OAuth about-you stays on profile page after all supported orders | return `None`/failure to the caller; do not continue into consent loop as if profile succeeded |
 | Personal OAuth gets `plan_type != "free"` or no bundle | retry up to the existing 5-attempt policy, then record plan drift and fail fast |
 | `remove_from_team` fails before Personal OAuth | mark/keep safe local state, record `kick_failed`, and do not run Personal OAuth |
 | `RegisterBlocked` phone/add-phone | terminal failure, record category, delete or quarantine according to existing manager logic |
+| direct registration page/navigation fails before a normal result | release Playwright page/context/browser and return/raise through the existing retry classifier without losing the local `SignupProfile` contract |
 
 ### 5. Good/Base/Bad Cases
 
@@ -57,6 +66,14 @@
 - Profile consistency:
   - `tests/unit/test_round12_s3_cherry_pick.py`
   - assert `profile.age == calculate_age(profile.birth_date, today)`
+  - assert injected RNG makes `generate_signup_profile(today=..., rng=...)` deterministic
+  - assert nested `profile.birthday` mutation raises `TypeError`
+  - assert constructor input is copied so later caller-side dict mutation cannot alter the profile
+- Registration/OAuth profile propagation:
+  - `tests/unit/test_free_registration_hardening.py`
+  - assert OAuth about-you consumes the provided `SignupProfile`
+  - assert OAuth about-you retries birthday orders and reports failure if no order exits the profile page
+  - assert direct registration passes the same `SignupProfile` into `_run_post_register_oauth()`
 - API preflight:
   - `tests/unit/test_free_registration_hardening.py`
   - assert `auth_invalid` contributes to Team-seat hard-cap rejection
