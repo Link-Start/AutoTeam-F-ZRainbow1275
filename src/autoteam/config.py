@@ -23,6 +23,10 @@ def _get_int_env(name: str, default: int) -> int:
     return int(parse_env_value(os.environ.get(name, str(default))))
 
 
+def _get_float_env(name: str, default: float) -> float:
+    return float(parse_env_value(os.environ.get(name, str(default))))
+
+
 def _get_str_env(name: str, default: str = "") -> str:
     value = parse_env_value(os.environ.get(name, default))
     return str(value).strip()
@@ -108,6 +112,41 @@ PLAYWRIGHT_PROXY_SERVER = os.environ.get("PLAYWRIGHT_PROXY_SERVER", "").strip()
 PLAYWRIGHT_PROXY_USERNAME = os.environ.get("PLAYWRIGHT_PROXY_USERNAME", "").strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.environ.get("PLAYWRIGHT_PROXY_PASSWORD", "").strip()
 PLAYWRIGHT_PROXY_BYPASS = os.environ.get("PLAYWRIGHT_PROXY_BYPASS", "").strip()
+PLAYWRIGHT_USER_AGENT = _get_str_env(
+    "PLAYWRIGHT_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+)
+PLAYWRIGHT_LOCALE = _get_str_env("PLAYWRIGHT_LOCALE", "en-US")
+PLAYWRIGHT_TIMEZONE_ID = _get_str_env("PLAYWRIGHT_TIMEZONE_ID", "America/Los_Angeles")
+PLAYWRIGHT_VIEWPORT_WIDTH = _get_int_env("PLAYWRIGHT_VIEWPORT_WIDTH", 1280)
+PLAYWRIGHT_VIEWPORT_HEIGHT = _get_int_env("PLAYWRIGHT_VIEWPORT_HEIGHT", 800)
+PLAYWRIGHT_DEVICE_SCALE_FACTOR = _get_float_env("PLAYWRIGHT_DEVICE_SCALE_FACTOR", 1)
+PLAYWRIGHT_COLOR_SCHEME = _get_str_env("PLAYWRIGHT_COLOR_SCHEME", "light")
+PLAYWRIGHT_DISABLE_WEBRTC_NON_PROXIED_UDP = _get_bool_env("PLAYWRIGHT_DISABLE_WEBRTC_NON_PROXIED_UDP", True)
+
+# Per-account IPv6 proxy pool. Disabled by default so existing local/Docker
+# installs do not mutate host networking unless explicitly configured.
+AUTOTEAM_IPV6_POOL_ENABLED = _get_bool_env(
+    "AUTOTEAM_IPV6_POOL_ENABLED",
+    _get_bool_env("IPV6_ROTATE", False),
+)
+AUTOTEAM_IPV6_POOL_REQUIRED = _get_bool_env("AUTOTEAM_IPV6_POOL_REQUIRED", False)
+IPV6_PREFIX = _get_str_env("IPV6_PREFIX", "")
+IPV6_IFACE = _get_str_env("IPV6_IFACE", "eth0")
+IPV6_PROXY_USE_SUDO = _get_bool_env("IPV6_PROXY_USE_SUDO", False)
+IPV6_PROXY_LISTEN_HOST = _get_str_env("IPV6_PROXY_LISTEN_HOST", "0.0.0.0")
+IPV6_PROXY_LOCAL_HOST = _get_str_env("IPV6_PROXY_LOCAL_HOST", "127.0.0.1")
+IPV6_PROXY_PUBLIC_HOST = _get_str_env("IPV6_PROXY_PUBLIC_HOST", _get_str_env("PUBLIC_IPV4", ""))
+PUBLIC_IPV4 = IPV6_PROXY_PUBLIC_HOST
+IPV6_PROXY_ALLOWED_IPS = _get_str_env(
+    "IPV6_PROXY_ALLOWED_IPS",
+    _get_str_env("PROXY_ALLOWED_IPS", "127.0.0.1"),
+)
+IPV6_PROXY_PORT_START = _get_int_env("IPV6_PROXY_PORT_START", 30000)
+IPV6_PROXY_PORT_END = _get_int_env("IPV6_PROXY_PORT_END", 39999)
+IPV6_PROXY_TTL_SECONDS = _get_int_env("IPV6_PROXY_TTL_SECONDS", 2 * 24 * 3600)
+IPV6_PROXY_POOL_FILE = _get_str_env("IPV6_PROXY_POOL_FILE", str(PROJECT_ROOT / "ipv6_pool.json"))
 
 
 def _format_proxy_host(hostname: str) -> str:
@@ -151,8 +190,8 @@ def get_chatgpt_api_impersonate() -> str:
     return _get_str_env("CHATGPT_API_IMPERSONATE", "chrome136") or "chrome136"
 
 
-def get_chatgpt_http_proxy_url() -> str:
-    proxy_url = _get_str_env("PLAYWRIGHT_PROXY_URL", "")
+def get_chatgpt_http_proxy_url(proxy_url: str | None = None) -> str:
+    proxy_url = str(proxy_url or "").strip() or _get_str_env("PLAYWRIGHT_PROXY_URL", "")
     if proxy_url:
         return proxy_url
 
@@ -180,15 +219,31 @@ def get_chatgpt_http_proxy_url() -> str:
     return proxy
 
 
-def get_playwright_launch_options():
+def get_playwright_launch_options(proxy_url: str | None = None):
     """统一的 Playwright Chromium 启动参数。"""
+    width = max(800, int(PLAYWRIGHT_VIEWPORT_WIDTH or 1280))
+    height = max(600, int(PLAYWRIGHT_VIEWPORT_HEIGHT or 800))
     options = {
         "headless": False,
-        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-background-networking",
+            "--disable-breakpad",
+            "--disable-component-update",
+            "--disable-crash-reporter",
+            "--disable-features=Translate,MediaRouter",
+            f"--lang={PLAYWRIGHT_LOCALE}",
+            f"--window-size={width},{height}",
+        ],
     }
+    if PLAYWRIGHT_DISABLE_WEBRTC_NON_PROXIED_UDP:
+        options["args"].append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
 
     proxy = None
-    if PLAYWRIGHT_PROXY_URL:
+    if proxy_url:
+        proxy = _parse_proxy_url(proxy_url)
+    elif PLAYWRIGHT_PROXY_URL:
         proxy = _parse_proxy_url(PLAYWRIGHT_PROXY_URL)
     elif PLAYWRIGHT_PROXY_SERVER:
         proxy = {"server": PLAYWRIGHT_PROXY_SERVER}
@@ -203,3 +258,24 @@ def get_playwright_launch_options():
         options["proxy"] = proxy
 
     return options
+
+
+def get_playwright_context_options():
+    """Shared browser context fingerprint options for ChatGPT/OAuth/register flows."""
+    width = max(800, int(PLAYWRIGHT_VIEWPORT_WIDTH or 1280))
+    height = max(600, int(PLAYWRIGHT_VIEWPORT_HEIGHT or 800))
+    scale = max(1, float(PLAYWRIGHT_DEVICE_SCALE_FACTOR or 1))
+    color_scheme = PLAYWRIGHT_COLOR_SCHEME if PLAYWRIGHT_COLOR_SCHEME in {"dark", "light", "no-preference"} else "light"
+    language = PLAYWRIGHT_LOCALE.split("-")[0]
+
+    return {
+        "viewport": {"width": width, "height": height},
+        "user_agent": PLAYWRIGHT_USER_AGENT,
+        "locale": PLAYWRIGHT_LOCALE,
+        "timezone_id": PLAYWRIGHT_TIMEZONE_ID,
+        "device_scale_factor": scale,
+        "is_mobile": False,
+        "has_touch": False,
+        "color_scheme": color_scheme,
+        "extra_http_headers": {"Accept-Language": f"{PLAYWRIGHT_LOCALE},{language};q=0.9"},
+    }

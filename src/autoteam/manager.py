@@ -64,7 +64,7 @@ from autoteam.codex_auth import (
     refresh_main_auth_file,
     save_auth_file,
 )
-from autoteam.config import get_playwright_launch_options
+from autoteam.config import get_playwright_context_options, get_playwright_launch_options
 from autoteam.cpa_sync import sync_from_cpa, sync_main_codex_to_cpa, sync_to_cpa
 from autoteam.identity import random_birthday, random_password
 from autoteam.invite import RegisterBlocked  # SPEC-2 shared/add-phone-detection §5 — 5 处 OAuth 调用方 catch
@@ -189,6 +189,64 @@ def _has_auth_file(acc: dict | None) -> bool:
     acc = acc or {}
     auth_file = (acc.get("auth_file") or "").strip()
     return bool(auth_file) and Path(auth_file).exists()
+
+
+def _ensure_account_ipv6_proxy(email: str | None) -> tuple[str, str]:
+    email = _normalized_email(email)
+    if not email:
+        return "", ""
+    required = False
+    try:
+        from autoteam import config as runtime_config
+        from autoteam.ipv6_pool import ipv6_pool
+
+        required = bool(getattr(runtime_config, "AUTOTEAM_IPV6_POOL_REQUIRED", False))
+        proxy_url = ipv6_pool.ensure(email) or ""
+        local_proxy_url = ipv6_pool.get_local_proxy_url(email) or proxy_url
+        if local_proxy_url:
+            logger.info("[IPv6Pool] account %s using proxy %s", email, local_proxy_url)
+            return proxy_url, local_proxy_url
+        if required:
+            raise RuntimeError("IPv6 pool is required but no account proxy was assigned")
+        return "", ""
+    except Exception as exc:
+        if required:
+            logger.error("[IPv6Pool] account proxy required for %s but unavailable: %s", email, exc)
+            raise
+        logger.warning("[IPv6Pool] account proxy unavailable for %s, falling back to direct: %s", email, exc)
+        return "", ""
+
+
+def _release_account_ipv6_proxy(email: str | None) -> None:
+    email = _normalized_email(email)
+    if not email:
+        return
+    try:
+        from autoteam.ipv6_pool import ipv6_pool
+
+        if ipv6_pool.release(email):
+            logger.info("[IPv6Pool] released account proxy: %s", email)
+    except Exception as exc:
+        logger.warning("[IPv6Pool] release failed for %s: %s", email, exc)
+
+
+def _attach_account_proxy_to_bundle(email: str | None, bundle: dict | None, proxy_url: str | None = None) -> None:
+    if not isinstance(bundle, dict):
+        return
+    proxy_url = (proxy_url or "").strip()
+    if not proxy_url:
+        proxy_url, _local_proxy_url = _ensure_account_ipv6_proxy(email)
+    if proxy_url:
+        bundle["proxy_url"] = proxy_url
+
+
+def _login_codex_via_browser_with_proxy(*args, playwright_proxy_url: str | None = None, **kwargs):
+    try:
+        return login_codex_via_browser(*args, playwright_proxy_url=playwright_proxy_url, **kwargs)
+    except TypeError as exc:
+        if "playwright_proxy_url" not in str(exc):
+            raise
+        return login_codex_via_browser(*args, **kwargs)
 
 
 def _pool_active_target(team_target: int) -> int:
@@ -1723,8 +1781,15 @@ def cmd_check(include_standby: bool = False):
             email = acc["email"]
             password = acc.get("password", "")
             logger.info("[%s] 重新 Codex 登录...", email)
-            bundle = login_codex_via_browser(email, password, mail_client=mail_client)
+            auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+            bundle = _login_codex_via_browser_with_proxy(
+                email,
+                password,
+                mail_client=mail_client,
+                playwright_proxy_url=playwright_proxy_url,
+            )
             if bundle:
+                _attach_account_proxy_to_bundle(email, bundle, auth_proxy_url)
                 auth_file = save_auth_file(bundle)
                 update_account(email, auth_file=auth_file)
                 logger.info("[%s] token 已更新", email)
@@ -2111,6 +2176,8 @@ def _run_post_register_oauth(
     out_outcome=None,
     chatgpt_session_token=None,
     signup_profile: SignupProfile | None = None,
+    auth_proxy_url: str | None = None,
+    playwright_proxy_url: str | None = None,
 ):
     """
     注册（加入 Team）成功后统一的收尾流程：
@@ -2230,13 +2297,14 @@ def _run_post_register_oauth(
             # 让 login_codex_via_browser 注入 auth.openai.com cookie,跳过 /log-in 表单
             # (实测刚踢出 Team 的新号在 /log-in 页 Continue 按钮变灰禁用,无法登录)。
             try:
-                bundle = login_codex_via_browser(
+                bundle = _login_codex_via_browser_with_proxy(
                     email,
                     password,
                     mail_client=mail_client,
                     use_personal=True,
                     chatgpt_session_token=chatgpt_session_token,
                     signup_profile=signup_profile,
+                    playwright_proxy_url=playwright_proxy_url,
                 )
             except RegisterBlocked as blocked:
                 # add-phone / duplicate 等异常是 terminal,不重试
@@ -2345,6 +2413,7 @@ def _run_post_register_oauth(
             _record_outcome("plan_unsupported", plan=bundle.get("plan_type"))
             return None
 
+        _attach_account_proxy_to_bundle(email, bundle, auth_proxy_url)
         auth_file = save_auth_file(bundle)
         update_fields = {
             "status": STATUS_PERSONAL,
@@ -2430,7 +2499,13 @@ def _run_post_register_oauth(
 
     # 原有 Team 流程 — SPEC-2 §3.1.2 改造:catch RegisterBlocked + plan_supported 检查 + quota probe
     try:
-        bundle = login_codex_via_browser(email, password, mail_client=mail_client, signup_profile=signup_profile)
+        bundle = _login_codex_via_browser_with_proxy(
+            email,
+            password,
+            mail_client=mail_client,
+            signup_profile=signup_profile,
+            playwright_proxy_url=playwright_proxy_url,
+        )
     except RegisterBlocked as blocked:
         if blocked.is_phone:
             logger.error(
@@ -2641,7 +2716,18 @@ def _resolve_mail_client_or_default(mail_client, acc=None):
     return _get_mail_client_for_account(acc)
 
 
-def _complete_registration(email, password, invite_link, mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None):
+def _complete_registration(
+    email,
+    password,
+    invite_link,
+    mail_client=None,
+    *,
+    leave_workspace=False,
+    out_outcome=None,
+    acc=None,
+    auth_proxy_url: str | None = None,
+    playwright_proxy_url: str | None = None,
+):
     """完成注册 + Codex 登录(从已有邀请链接继续)。out_outcome 透传给 _run_post_register_oauth。
 
     Round 12 S3 cherry-pick (上游 `.upstream/manager.py:1225`): 一次性生成
@@ -2658,6 +2744,16 @@ def _complete_registration(email, password, invite_link, mail_client=None, *, le
     mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
 
     signup_profile = generate_signup_profile()
+    if auth_proxy_url is None and playwright_proxy_url is None:
+        try:
+            auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+        except Exception as exc:
+            logger.warning("[注册] IPv6 代理为必需但不可用，停止注册账号 %s: %s", email, exc)
+            if out_outcome is not None:
+                out_outcome["status"] = "ipv6_proxy_unavailable"
+                out_outcome["reason"] = str(exc)
+                out_outcome["last_email"] = email
+            return None
 
     logger.info("[注册] 开始注册 %s...", email)
     with sync_playwright() as p:
@@ -2665,11 +2761,14 @@ def _complete_registration(email, password, invite_link, mail_client=None, *, le
         context = None
         page = None
         try:
-            browser = p.chromium.launch(**get_playwright_launch_options())
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            )
+            try:
+                launch_kwargs = get_playwright_launch_options(proxy_url=playwright_proxy_url)
+            except TypeError as exc:
+                if "proxy_url" not in str(exc):
+                    raise
+                launch_kwargs = get_playwright_launch_options()
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(**get_playwright_context_options())
             page = context.new_page()
             result, password = register_with_invite(
                 page,
@@ -2684,20 +2783,26 @@ def _complete_registration(email, password, invite_link, mail_client=None, *, le
 
     if not result:
         logger.error("[注册] 注册 %s 失败", email)
+        _release_account_ipv6_proxy(email)
         if out_outcome is not None:
             out_outcome["status"] = "register_failed"
             out_outcome["reason"] = "invite 注册链路失败（register_with_invite 返回 False）"
             out_outcome["last_email"] = email
         return None
 
-    return _run_post_register_oauth(
+    post_result = _run_post_register_oauth(
         email,
         password,
         mail_client,
         leave_workspace=leave_workspace,
         out_outcome=out_outcome,
         signup_profile=signup_profile,
+        auth_proxy_url=auth_proxy_url,
+        playwright_proxy_url=playwright_proxy_url,
     )
+    if not post_result:
+        _release_account_ipv6_proxy(email)
+    return post_result
 
 
 def _check_pending_invites(chatgpt_api, mail_client, *, leave_workspace=False, out_outcome=None):
@@ -3139,7 +3244,14 @@ def _complete_direct_about_you(page, signup_profile: SignupProfile | None = None
     return False
 
 
-def _register_direct_once(mail_client, email, password, cloudmail_account_id=None, signup_profile=None):
+def _register_direct_once(
+    mail_client,
+    email,
+    password,
+    cloudmail_account_id=None,
+    signup_profile=None,
+    playwright_proxy_url: str | None = None,
+):
     """执行一次直接注册，返回是否完成注册并进入 Team。
 
     在邮箱/密码/验证码/about-you 四个提交节点调用 assert_not_blocked，
@@ -3164,14 +3276,16 @@ def _register_direct_once(mail_client, email, password, cloudmail_account_id=Non
             close_playwright_objects(page, context, browser, logger=logger, label="direct-register")
 
         try:
-            launch_kwargs = get_playwright_launch_options()
+            try:
+                launch_kwargs = get_playwright_launch_options(proxy_url=playwright_proxy_url)
+            except TypeError as exc:
+                if "proxy_url" not in str(exc):
+                    raise
+                launch_kwargs = get_playwright_launch_options()
             if sys.platform.startswith("win"):
                 launch_kwargs["slow_mo"] = 100
             browser = p.chromium.launch(**launch_kwargs)
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            )
+            context = browser.new_context(**get_playwright_context_options())
             page = context.new_page()
 
             page.goto(signup_url, wait_until="domcontentloaded", timeout=60000)
@@ -3533,6 +3647,8 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
     account_id, email = mail_client.create_temp_email()
     password = random_password()
     signup_profile = generate_signup_profile()
+    auth_proxy_url = ""
+    playwright_proxy_url = ""
 
     def _record_outcome(status, **extra):
         if out_outcome is not None:
@@ -3550,6 +3666,25 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
             mail_client.delete_account(account_id)
         except Exception as exc:
             logger.warning("[直接注册] 删除 %s 的临时邮箱失败（%s）: %s", reason, email, exc)
+        _release_account_ipv6_proxy(email)
+
+    def _assign_proxy_or_fail(reason):
+        nonlocal auth_proxy_url, playwright_proxy_url
+        try:
+            auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+            return True
+        except Exception as exc:
+            logger.warning("[直接注册] IPv6 代理为必需但不可用，删除临时邮箱 %s: %s", email, exc)
+            _discard_email(reason)
+            record_failure(
+                email,
+                "ipv6_proxy_unavailable",
+                f"IPv6 proxy unavailable: {exc}",
+                register_attempts=register_attempts,
+                duplicate_swaps=duplicate_swaps,
+            )
+            _record_outcome("ipv6_proxy_unavailable", reason=str(exc))
+            return False
 
     # 注册失败（非 duplicate）最多重试 3 次；duplicate 额外独立上限，防止 CloudMail 异常导致无限换邮箱
     success = False
@@ -3558,6 +3693,9 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
     MAX_DUPLICATE_SWAPS = 5
     register_attempts = 0
     duplicate_swaps = 0
+    if not _assign_proxy_or_fail("ipv6_proxy_required_unavailable"):
+        return None
+
     while register_attempts < MAX_REGISTER_ATTEMPTS:
         logger.info(
             "[直接注册] 开始注册尝试: %s（已试 %d/%d，duplicate 换邮箱 %d/%d）",
@@ -3568,13 +3706,25 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
             MAX_DUPLICATE_SWAPS,
         )
         try:
-            success, session_token = _register_direct_once(
-                mail_client,
-                email,
-                password,
-                cloudmail_account_id=account_id,
-                signup_profile=signup_profile,
-            )
+            try:
+                success, session_token = _register_direct_once(
+                    mail_client,
+                    email,
+                    password,
+                    cloudmail_account_id=account_id,
+                    signup_profile=signup_profile,
+                    playwright_proxy_url=playwright_proxy_url,
+                )
+            except TypeError as exc:
+                if "playwright_proxy_url" not in str(exc):
+                    raise
+                success, session_token = _register_direct_once(
+                    mail_client,
+                    email,
+                    password,
+                    cloudmail_account_id=account_id,
+                    signup_profile=signup_profile,
+                )
         except RegisterBlocked as blocked:
             logger.error("[直接注册] %s 被阻断: %s", email, blocked)
             if blocked.is_phone:
@@ -3612,6 +3762,8 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
                 password = random_password()
                 signup_profile = generate_signup_profile()
                 logger.info("[直接注册] 已换新临时邮箱: %s", email)
+                if not _assign_proxy_or_fail("ipv6_proxy_required_unavailable_after_duplicate"):
+                    return None
                 continue
             # 其他阻断按普通失败处理
             success = False
@@ -3669,7 +3821,7 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
 
     add_account(email, password, cloudmail_account_id=account_id, workspace_account_id=get_chatgpt_account_id() or None)
 
-    return _run_post_register_oauth(
+    post_result = _run_post_register_oauth(
         email,
         password,
         mail_client,
@@ -3677,7 +3829,12 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
         out_outcome=out_outcome,
         chatgpt_session_token=session_token,
         signup_profile=signup_profile,
+        auth_proxy_url=auth_proxy_url,
+        playwright_proxy_url=playwright_proxy_url,
     )
+    if not post_result:
+        _release_account_ipv6_proxy(email)
+    return post_result
 
 
 def _create_account_direct_via_rotator(path_rotator, *, leave_workspace=False, out_outcome=None, acc=None):
@@ -3832,7 +3989,13 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             logger.warning("[轮转] OAuth 失败后 kick %s 抛异常(留给下次对账兜底): %s", email, exc)
 
     try:
-        bundle = login_codex_via_browser(email, password, mail_client=mail_client)
+        auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+        bundle = _login_codex_via_browser_with_proxy(
+            email,
+            password,
+            mail_client=mail_client,
+            playwright_proxy_url=playwright_proxy_url,
+        )
     except RegisterBlocked as exc:
         # OAuth 阶段触发 add-phone / 双重验证 / 重复账号风控 — 不可恢复,锁 AUTH_INVALID
         # 而非 STANDBY,避免下一轮 rotate 又选中它死循环。
@@ -3931,6 +4094,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             pass
         return False
 
+    _attach_account_proxy_to_bundle(email, bundle, auth_proxy_url)
     auth_file = save_auth_file(bundle)
 
     # OAuth 成功 plan=team 不等于"账号真的活了"。存在一类竞态:刚 kick 的账号在 OpenAI

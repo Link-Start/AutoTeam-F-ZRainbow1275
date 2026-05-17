@@ -22,13 +22,27 @@ def _headers():
 
 
 def list_cpa_files():
-    """获取 CPA 中所有认证文件"""
-    resp = requests.get(f"{CPA_URL}/v0/management/auth-files", headers=_headers(), timeout=10)
+    """获取 CPA 中所有认证文件。远端异常必须显式失败，不能伪装成空列表。"""
+    try:
+        resp = requests.get(f"{CPA_URL}/v0/management/auth-files", headers=_headers(), timeout=10)
+    except requests.RequestException as exc:
+        logger.error("[CPA] 获取文件列表失败: %s", exc)
+        raise RuntimeError(f"[CPA] auth-files list request failed: {exc}") from exc
+
     if resp.status_code != 200:
-        logger.error("[CPA] 获取文件列表失败: %d", resp.status_code)
-        return []
-    data = resp.json()
-    return data.get("files", [])
+        logger.error("[CPA] 获取文件列表失败: %d %s", resp.status_code, resp.text[:200])
+        raise RuntimeError(f"[CPA] auth-files list failed: HTTP {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        logger.error("[CPA] 获取文件列表返回非 JSON 内容: %s", resp.text[:200])
+        raise RuntimeError("[CPA] auth-files list returned non-JSON response") from exc
+
+    files = data.get("files", [])
+    if not isinstance(files, list):
+        raise RuntimeError("[CPA] auth-files list response missing files list")
+    return files
 
 
 def upload_to_cpa(filepath):
@@ -149,6 +163,50 @@ def _bundle_from_auth_data(auth_data, fallback_name=""):
         "expired": _parse_expired_timestamp(auth_data.get("expired")),
         "last_refresh_ts": _parse_optional_timestamp(auth_data.get("last_refresh")),
     }
+
+
+def _refresh_account_proxy_url_for_upload(acc: dict, path: Path) -> None:
+    email = str(acc.get("email") or "").strip().lower()
+    if not email or path.name.startswith("codex-main-"):
+        return
+    try:
+        from autoteam.admin_state import get_admin_email
+
+        if email == (get_admin_email() or "").strip().lower():
+            return
+    except Exception:
+        pass
+
+    required = False
+    try:
+        from autoteam import config as runtime_config
+        from autoteam.ipv6_pool import ipv6_pool
+
+        required = bool(getattr(runtime_config, "AUTOTEAM_IPV6_POOL_REQUIRED", False))
+        proxy_url = ipv6_pool.ensure(email) or ""
+        if not proxy_url:
+            if required:
+                raise RuntimeError("IPv6 pool is required but no account proxy was assigned")
+            return
+
+        try:
+            auth_data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            if required:
+                raise RuntimeError(f"cannot read auth file for required IPv6 proxy: {path.name}") from exc
+            logger.warning("[CPA] 无法读取 auth_file 以刷新 proxy_url，继续原样上传: %s (%s)", path.name, exc)
+            return
+
+        if auth_data.get("proxy_url") == proxy_url:
+            return
+        auth_data["proxy_url"] = proxy_url
+        write_text(path, json.dumps(auth_data, indent=2, ensure_ascii=False))
+        logger.info("[CPA] 已刷新待同步凭证 proxy_url: %s", email)
+    except Exception as exc:
+        if required:
+            logger.error("[CPA] IPv6 proxy_url 为必需但刷新失败: %s (%s)", email, exc)
+            raise
+        logger.warning("[CPA] IPv6 proxy_url 刷新失败，继续上传原凭证: %s (%s)", email, exc)
 
 
 def _normalized_auth_path(bundle, main=False):
@@ -548,10 +606,14 @@ def sync_to_cpa():
     - CPA 有但本地账号状态已不在上述两种（standby / exhausted / pending 等）→ 从 CPA 删除
     - 仅清理本地 accounts.json 管理过的邮箱，主号和 CPA 手动上传文件不会被删
     """
-    from autoteam.accounts import STATUS_ACTIVE, STATUS_PERSONAL, load_accounts, save_accounts
+    from autoteam.accounts import STATUS_ACTIVE, STATUS_PERSONAL, is_account_disabled, load_accounts, save_accounts
 
     accounts = load_accounts()
-    local_emails = {a["email"].lower() for a in accounts}
+    local_emails = {
+        str(a.get("email") or "").strip().lower()
+        for a in accounts
+        if str(a.get("email") or "").strip()
+    }
     local_duplicates_deleted, accounts_path_repaired = _cleanup_local_duplicates(accounts)
     if accounts_path_repaired:
         save_accounts(accounts)
@@ -573,7 +635,11 @@ def sync_to_cpa():
     files_to_sync = {}
     synced_active = 0
     synced_personal = 0
+    disabled_skipped = 0
     for acc in accounts:
+        if is_account_disabled(acc):
+            disabled_skipped += 1
+            continue
         status = acc.get("status")
         if status not in (STATUS_ACTIVE, STATUS_PERSONAL):
             continue
@@ -583,6 +649,7 @@ def sync_to_cpa():
         path = Path(auth_path)
         if not path.exists():
             continue
+        _refresh_account_proxy_url_for_upload(acc, path)
         files_to_sync[path.name] = path
         if status == STATUS_ACTIVE:
             synced_active += 1
@@ -591,7 +658,7 @@ def sync_to_cpa():
 
     # CPA 认证文件
     cpa_files = list_cpa_files()
-    cpa_names = {f["name"]: f for f in cpa_files}
+    cpa_names = {f["name"]: f for f in cpa_files if f.get("name")}
 
     logger.info(
         "[CPA] 待同步认证文件: %d (Team=%d, Personal=%d), CPA 现有: %d",
@@ -650,6 +717,9 @@ def sync_to_cpa():
     if skipped_protected:
         logger.info("[CPA] 守卫保留 %d 个 CPA 文件(本地仍持有,避免误删 token)", skipped_protected)
 
+    if disabled_skipped:
+        logger.info("[CPA] 跳过 %d 个本地禁用账号", disabled_skipped)
+
     logger.info("[CPA] 同步完成: 上传 %d, 删除 %d, 本地去重 %d", uploaded, deleted, local_duplicates_deleted)
 
     # 最终状态
@@ -660,6 +730,20 @@ def sync_to_cpa():
         len(final_local_managed),
         len(files_to_sync),
     )
+    return {
+        "ok": True,
+        "uploaded": uploaded,
+        "deleted": deleted,
+        "remote_count_before": len(cpa_files),
+        "remote_managed_after": len(final_local_managed),
+        "synced_active": synced_active,
+        "synced_personal": synced_personal,
+        "disabled_skipped": disabled_skipped,
+        "local_duplicates_deleted": local_duplicates_deleted,
+        "delete_guard": {
+            "skipped_protected": skipped_protected,
+        },
+    }
 
 
 def sync_main_codex_to_cpa(filepath):

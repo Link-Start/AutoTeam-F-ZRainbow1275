@@ -34,6 +34,26 @@ def _safe_runtime_resource_snapshot() -> dict:
         return {"error": "runtime_resource_snapshot_failed"}
 
 
+def _safe_ipv6_pool_status() -> dict:
+    try:
+        from autoteam.ipv6_pool import ipv6_pool
+
+        return ipv6_pool.status()
+    except Exception as exc:
+        logger.warning("[IPv6Pool] status unavailable: %s", exc)
+        return {
+            "enabled": False,
+            "required": False,
+            "ok": False,
+            "count": 0,
+            "unhealthy_count": 0,
+            "expired_count": 0,
+            "last_error": str(exc),
+            "preflight": {"ok": False, "errors": ["status_unavailable"], "warnings": []},
+            "entries": [],
+        }
+
+
 # Round 7 P2.4 — FastAPI 现代 lifespan handler 替代已废弃的 @app.on_event。
 # 启动期:修复 auths 认证文件权限 + 启动 _auto_check_loop 后台线程。
 # 停止期:发 _auto_check_stop 信号让线程优雅退出。
@@ -77,6 +97,22 @@ async def app_lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("[启动-retroactive] 后台线程启动失败: %s", exc)
 
+    try:
+        from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
+        from autoteam.ipv6_pool import ipv6_pool
+
+        active_emails = [
+            acc["email"]
+            for acc in load_accounts()
+            if acc.get("status") == STATUS_ACTIVE
+            and acc.get("email")
+            and not _is_main_account_email(acc.get("email"))
+            and not is_account_disabled(acc)
+        ]
+        ipv6_pool.start(active_emails=active_emails)
+    except Exception as exc:
+        logger.warning("[启动] IPv6 代理池启动失败: %s", exc)
+
     thread = threading.Thread(target=_auto_check_loop, daemon=True)
     thread.start()
     try:
@@ -88,6 +124,12 @@ async def app_lifespan(app: FastAPI):
             _pw_executor.stop()
         except Exception as exc:
             logger.warning("[lifespan] stopping Playwright executor failed: %s", exc)
+        try:
+            from autoteam.ipv6_pool import ipv6_pool
+
+            ipv6_pool.stop_all()
+        except Exception as exc:
+            logger.warning("[lifespan] stopping IPv6 proxy pool failed: %s", exc)
 
 
 app = FastAPI(
@@ -680,6 +722,10 @@ class DeleteBatchParams(BaseModel):
     continue_on_error: bool = True  # 部分失败时继续剩余账号,False 则遇错即停
 
 
+class AccountDisableParams(BaseModel):
+    emails: list[str]
+
+
 def _normalized_email(value: str | None) -> str:
     return (value or "").strip().lower()
 
@@ -721,8 +767,12 @@ def _resolve_status_auth_file(acc: dict) -> str:
 
 
 def _display_account_status(acc: dict, quota_snapshot: dict | None = None) -> str:
+    from autoteam.accounts import is_account_disabled
+
     status = acc.get("status", "")
     if not _is_main_account_email(acc.get("email")):
+        if is_account_disabled(acc):
+            return "disabled"
         return status
 
     quota_status = _quota_snapshot_status(quota_snapshot) or _quota_snapshot_status(acc.get("last_quota"))
@@ -736,6 +786,7 @@ def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
     sanitized = {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id")}
     sanitized["is_main_account"] = _is_main_account_email(acc.get("email"))
+    sanitized["raw_status"] = acc.get("status", "")
     sanitized["status"] = _display_account_status(acc, quota_snapshot)
     return sanitized
 
@@ -1688,6 +1739,118 @@ def get_standby():
     return [_sanitize_account(a) for a in accounts]
 
 
+def _toggle_account_disabled(email: str, disabled: bool):
+    from autoteam.accounts import find_account, load_accounts, update_account
+
+    email = _normalized_email(email)
+    if not email:
+        raise HTTPException(status_code=400, detail="请提供有效邮箱")
+    if _is_main_account_email(email):
+        raise HTTPException(status_code=400, detail="主号不允许禁用或启用")
+
+    accounts = load_accounts()
+    acc = find_account(accounts, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    update_account(email, disabled=bool(disabled))
+    refreshed = find_account(load_accounts(), email)
+    action = "禁用" if disabled else "启用"
+    return {
+        "message": f"已{action} {email}",
+        "email": email,
+        "disabled": bool(disabled),
+        "account": _sanitize_account(refreshed or {**acc, "disabled": bool(disabled)}),
+    }
+
+
+def _toggle_accounts_disabled(emails: list[str], disabled: bool):
+    from autoteam.accounts import load_accounts, save_accounts
+
+    normalized_emails = []
+    seen = set()
+    for value in emails or []:
+        email = _normalized_email(value)
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        normalized_emails.append(email)
+
+    if not normalized_emails:
+        raise HTTPException(status_code=400, detail="请至少提供一个有效邮箱")
+
+    accounts = load_accounts()
+    by_email = {_normalized_email(acc.get("email")): acc for acc in accounts if acc.get("email")}
+
+    updated = []
+    unchanged = []
+    missing = []
+    skipped_main = []
+
+    for email in normalized_emails:
+        if _is_main_account_email(email):
+            skipped_main.append(email)
+            continue
+        acc = by_email.get(email)
+        if not acc:
+            missing.append(email)
+            continue
+        if bool(acc.get("disabled", False)) == bool(disabled):
+            unchanged.append(email)
+            continue
+        acc["disabled"] = bool(disabled)
+        updated.append(email)
+
+    if updated:
+        save_accounts(accounts)
+        accounts = load_accounts()
+        by_email = {_normalized_email(acc.get("email")): acc for acc in accounts if acc.get("email")}
+
+    action = "禁用" if disabled else "启用"
+    parts = [f"已{action} {len(updated)} 个账号"]
+    if unchanged:
+        parts.append(f"{len(unchanged)} 个已是目标状态")
+    if skipped_main:
+        parts.append(f"跳过主号 {len(skipped_main)} 个")
+    if missing:
+        parts.append(f"未找到 {len(missing)} 个")
+
+    return {
+        "message": "，".join(parts),
+        "disabled": bool(disabled),
+        "updated_count": len(updated),
+        "updated_emails": updated,
+        "unchanged_emails": unchanged,
+        "skipped_main_accounts": skipped_main,
+        "missing_emails": missing,
+        "accounts": [_sanitize_account(by_email[email]) for email in updated if email in by_email],
+    }
+
+
+@app.post("/api/accounts/bulk/disable")
+def post_bulk_disable_accounts(params: AccountDisableParams):
+    """批量禁用账号：保留本地记录，但自动巡检、轮转和 CPA 同步会跳过。"""
+    return _toggle_accounts_disabled(params.emails, True)
+
+
+@app.post("/api/accounts/bulk/enable")
+def post_bulk_enable_accounts(params: AccountDisableParams):
+    """批量启用账号：恢复参与自动巡检、轮转和 CPA 同步。"""
+    return _toggle_accounts_disabled(params.emails, False)
+
+
+@app.post("/api/accounts/{email}/disable")
+def post_disable_account(email: str):
+    """禁用账号：保留本地记录，但自动巡检、轮转和 CPA 同步会跳过。"""
+    return _toggle_account_disabled(email, True)
+
+
+@app.post("/api/accounts/{email}/enable")
+def post_enable_account(email: str):
+    """启用账号：恢复参与自动巡检、轮转和 CPA 同步。"""
+    return _toggle_account_disabled(email, False)
+
+
 @app.delete("/api/accounts/{email}")
 def delete_account(email: str):
     """删除本地管理账号及其关联资源。"""
@@ -2227,6 +2390,7 @@ def get_status():
         STATUS_PENDING,
         STATUS_PERSONAL,
         STATUS_STANDBY,
+        is_account_disabled,
         load_accounts,
     )
     from autoteam.codex_auth import check_codex_quota, quota_result_quota_info
@@ -2235,6 +2399,8 @@ def get_status():
     quota_cache = {}
 
     for acc in accounts:
+        if not _is_main_account_email(acc.get("email")) and is_account_disabled(acc):
+            continue
         if acc["status"] not in (STATUS_ACTIVE, STATUS_PERSONAL) and not _is_main_account_email(acc.get("email")):
             continue
 
@@ -2266,6 +2432,7 @@ def get_status():
         "personal": sum(1 for a in sanitized_accounts if a["status"] == STATUS_PERSONAL),
         "auth_invalid": sum(1 for a in sanitized_accounts if a["status"] == STATUS_AUTH_INVALID),
         "orphan": sum(1 for a in sanitized_accounts if a["status"] == STATUS_ORPHAN),
+        "disabled": sum(1 for a in sanitized_accounts if a["status"] == "disabled"),
         "total": len(sanitized_accounts),
     }
 
@@ -2274,6 +2441,7 @@ def get_status():
         "summary": summary,
         "quota_cache": quota_cache,
         "runtime_resources": _safe_runtime_resource_snapshot(),
+        "ipv6_pool": _safe_ipv6_pool_status(),
     }
 
 
@@ -3043,7 +3211,7 @@ def _auto_check_team_member_count(timeout_seconds: float = 30, retries: int = 2)
 
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
-    from autoteam.accounts import STATUS_ACTIVE, load_accounts
+    from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
     from autoteam.codex_auth import check_codex_quota
 
     while not _auto_check_stop.is_set():
@@ -3070,6 +3238,7 @@ def _auto_check_loop():
                 for a in accounts
                 if a["status"] == STATUS_ACTIVE
                 and not _is_main_account_email(a.get("email"))
+                and not is_account_disabled(a)
                 and a.get("auth_file")
                 and Path(a["auth_file"]).exists()
             ]
@@ -3084,6 +3253,7 @@ def _auto_check_loop():
             global _auto_fill_last_trigger_ts
             if len(active) < TEAM_SUB_ACCOUNT_HARD_CAP:
                 now_ts = time.time()
+                should_start_auto_fill = False
                 cooldown_remaining = (_auto_fill_last_trigger_ts + _AUTO_FILL_COOLDOWN_SECONDS) - now_ts
                 if cooldown_remaining > 0:
                     logger.info(
@@ -3093,7 +3263,23 @@ def _auto_check_loop():
                         int(cooldown_remaining / 60),
                     )
                     # 冷却期内仍然继续做"低额度替换"(下面的 low_accounts 逻辑),
-                    # 只是不触发全量 cmd_rotate
+                    # 只是不触发全量 cmd_rotate。例外:Team 真实人数不足时必须继续补位,
+                    # 否则 cooldown 会把实际席位缺口拖到下一轮甚至 4h backoff 之后。
+                    actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
+                    if actual_team_count >= TEAM_SUB_ACCOUNT_HARD_CAP + 1:
+                        logger.info(
+                            "[巡检] auto-fill 冷却中且 Team 实际成员数=%d 已满；本轮只保留低额度替换检查",
+                            actual_team_count,
+                        )
+                    elif actual_team_count >= 0:
+                        logger.info(
+                            "[巡检] auto-fill 冷却中但 Team 实际成员不足（%d/%d），继续补位",
+                            actual_team_count,
+                            TEAM_SUB_ACCOUNT_HARD_CAP + 1,
+                        )
+                        should_start_auto_fill = True
+                    else:
+                        logger.info("[巡检] auto-fill 冷却中且 Team 实际成员数未知；本轮不触发全量补位")
                 else:
                     # Round 11 — OAuth 连续失败 backoff:
                     # 最近 2 小时内 master workspace 累积 ≥3 个 auth_invalid 账号 → fill 已稳定失败,
@@ -3140,7 +3326,9 @@ def _auto_check_loop():
                             actual_team_count,
                         )
                         continue
+                    should_start_auto_fill = True
 
+                if should_start_auto_fill:
                     if not _playwright_lock.acquire(blocking=False):
                         logger.info(
                             "[巡检] active=%d < %d 但有任务在跑,本轮先跳过自动补位",

@@ -30,7 +30,14 @@ def _build_session_cookie_pairs(session_token: str) -> list[tuple[str, str]]:
 class CurlCffiChatGPTTransport:
     name = "curl_cffi"
 
-    def __init__(self, *, session_token: str, account_id: str = "", oai_device_id: str = ""):
+    def __init__(
+        self,
+        *,
+        session_token: str,
+        account_id: str = "",
+        oai_device_id: str = "",
+        proxy_url: str = "",
+    ):
         from curl_cffi import requests as curl_requests
 
         self._timeout = get_chatgpt_api_http_timeout()
@@ -43,7 +50,7 @@ class CurlCffiChatGPTTransport:
             }
         )
 
-        proxy_url = get_chatgpt_http_proxy_url()
+        proxy_url = get_chatgpt_http_proxy_url(proxy_url)
         if proxy_url:
             self._session.proxies = {"http": proxy_url, "https": proxy_url}
 
@@ -77,7 +84,13 @@ class CurlCffiChatGPTTransport:
             pass
 
 
-def build_chatgpt_transport(*, session_token: str, account_id: str = "", oai_device_id: str = ""):
+def build_chatgpt_transport(
+    *,
+    session_token: str,
+    account_id: str = "",
+    oai_device_id: str = "",
+    proxy_url: str = "",
+):
     mode = get_chatgpt_api_transport()
     if mode == "playwright":
         return None
@@ -87,6 +100,7 @@ def build_chatgpt_transport(*, session_token: str, account_id: str = "", oai_dev
             session_token=session_token,
             account_id=account_id,
             oai_device_id=oai_device_id,
+            proxy_url=proxy_url,
         )
     except ModuleNotFoundError:
         if mode == "curl_cffi":

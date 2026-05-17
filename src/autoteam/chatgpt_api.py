@@ -13,13 +13,14 @@ from playwright.sync_api import sync_playwright
 
 import autoteam.display  # noqa: F401
 from autoteam.admin_state import (
+    get_admin_email,
     get_admin_session_token,
     get_chatgpt_account_id,
     get_chatgpt_workspace_name,
     update_admin_state,
 )
 from autoteam.chatgpt_transport import build_chatgpt_transport
-from autoteam.config import get_playwright_launch_options
+from autoteam.config import get_playwright_context_options, get_playwright_launch_options
 from autoteam.playwright_lifecycle import close_playwright_objects
 from autoteam.textio import read_text
 
@@ -98,6 +99,8 @@ class ChatGPTTeamAPI:
         self.workspace_options_cache = []
         self.http_transport = None
         self.transport_name = None
+        self.proxy_url = ""
+        self.local_proxy_url = ""
 
     def _visible_locator_in_frames(self, selectors, timeout_ms=5000):
         selector = ", ".join(selectors)
@@ -124,15 +127,55 @@ class ChatGPTTeamAPI:
 
         try:
             self.playwright = sync_playwright().start()
-            self.browser = self.playwright.chromium.launch(**get_playwright_launch_options())
-            self.context = self.browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            )
+            try:
+                launch_options = get_playwright_launch_options(proxy_url=self.local_proxy_url)
+            except TypeError as exc:
+                if "proxy_url" not in str(exc):
+                    raise
+                launch_options = get_playwright_launch_options()
+            self.browser = self.playwright.chromium.launch(**launch_options)
+            self.context = self.browser.new_context(**get_playwright_context_options())
             self.page = self.context.new_page()
         except Exception:
             self.stop()
             raise
+
+    def _ensure_admin_ipv6_proxy(self) -> None:
+        admin_email = (get_admin_email() or "").strip().lower()
+        self.proxy_url = ""
+        self.local_proxy_url = ""
+        if not admin_email:
+            required = False
+            try:
+                from autoteam import config as runtime_config
+
+                required = bool(getattr(runtime_config, "AUTOTEAM_IPV6_POOL_REQUIRED", False))
+            except Exception:
+                pass
+            if required:
+                raise RuntimeError("IPv6 pool is required but admin email is unavailable")
+            return
+
+        required = False
+        try:
+            from autoteam import config as runtime_config
+            from autoteam.ipv6_pool import ipv6_pool
+
+            required = bool(getattr(runtime_config, "AUTOTEAM_IPV6_POOL_REQUIRED", False))
+            self.proxy_url = ipv6_pool.ensure(admin_email) or ""
+            self.local_proxy_url = ipv6_pool.get_local_proxy_url(admin_email) or self.proxy_url
+            if self.local_proxy_url:
+                logger.info("[ChatGPT] admin %s using IPv6 proxy %s", admin_email, self.local_proxy_url)
+                return
+            if required:
+                raise RuntimeError("IPv6 pool is required but no admin proxy was assigned")
+        except Exception as exc:
+            if required:
+                logger.error("[ChatGPT] admin IPv6 proxy required but unavailable: %s", exc)
+                raise
+            self.proxy_url = ""
+            self.local_proxy_url = ""
+            logger.warning("[ChatGPT] admin IPv6 proxy unavailable, falling back to direct: %s", exc)
 
     def _log_login_state(self, label):
         try:
@@ -1216,6 +1259,7 @@ class ChatGPTTeamAPI:
             session_token=session_token,
             account_id=self.account_id,
             oai_device_id=self.oai_device_id,
+            proxy_url=self.local_proxy_url,
         )
         if self.http_transport:
             self.transport_name = getattr(self.http_transport, "name", "curl_cffi")
@@ -1366,6 +1410,7 @@ class ChatGPTTeamAPI:
             raise RuntimeError("缺少 workspace/account ID")
 
         try:
+            self._ensure_admin_ipv6_proxy()
             if not require_browser and self._start_transport_session(session_token):
                 token_source = self._fetch_access_token_via_transport()
                 if token_source:
