@@ -1,4 +1,5 @@
 import json
+import logging
 import threading
 import time
 
@@ -166,6 +167,7 @@ def test_auto_check_cooldown_does_not_delay_real_team_shortage(tmp_path, monkeyp
     monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
     monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr("autoteam.sync_targets.is_sync_target_enabled", lambda _target: False)
     monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 2)
     monkeypatch.setattr(api, "_start_task", fake_start_task)
     monkeypatch.setattr(
@@ -217,6 +219,7 @@ def test_auto_check_cooldown_keeps_full_team_from_refilling(tmp_path, monkeypatc
     monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
     monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr("autoteam.sync_targets.is_sync_target_enabled", lambda _target: False)
     monkeypatch.setattr(api, "_auto_check_team_member_count", fake_team_count)
     monkeypatch.setattr(api, "_start_task", lambda *args, **kwargs: started.append((args, kwargs)))
     monkeypatch.setattr(
@@ -259,6 +262,7 @@ def test_auto_check_cooldown_allows_full_team_blocker_replacement(monkeypatch):
     monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
     monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr("autoteam.sync_targets.is_sync_target_enabled", lambda _target: False)
     monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 3)
     monkeypatch.setattr(api, "_start_task", fake_start_task)
     monkeypatch.setattr(
@@ -289,6 +293,139 @@ def test_auto_check_cooldown_allows_full_team_blocker_replacement(monkeypatch):
     assert params == {"target_seats": 3}
     assert args == (3,)
     assert kwargs == {"background_post_sync": True}
+
+
+def test_auto_check_uses_read_only_cpa_gate_when_team_full_and_no_credentials(monkeypatch, caplog):
+    started = []
+
+    def fake_start_task(command, func, params, *args, **kwargs):
+        started.append((command, params, args, kwargs))
+
+    monkeypatch.setattr(api, "_auto_fill_last_trigger_ts", 0.0)
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr("autoteam.accounts.load_accounts", lambda: [])
+    monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 3)
+    monkeypatch.setattr(api, "_start_task", fake_start_task)
+    monkeypatch.setattr("autoteam.sync_targets.is_sync_target_enabled", lambda target: target == "cpa")
+    monkeypatch.setattr(
+        "autoteam.cliproxy_health.get_cliproxy_health",
+        lambda **_kwargs: {
+            "ok": False,
+            "safe_read_only": True,
+            "management_api": {"ok": True},
+            "provider_auth": {
+                "ok": False,
+                "provider": "codex",
+                "model": "gpt-5.5",
+                "reason": "no_provider_auth",
+                "total": 0,
+                "available": 0,
+                "check_type": "management_metadata",
+                "canary_required": True,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "autoteam.cpa_sync.sync_to_cpa",
+        lambda: (_ for _ in ()).throw(AssertionError("CPA gate must not sync")),
+    )
+    monkeypatch.setattr(
+        "autoteam.cpa_sync.upload_to_cpa",
+        lambda _path: (_ for _ in ()).throw(AssertionError("CPA gate must not upload")),
+    )
+    monkeypatch.setattr(
+        "autoteam.cpa_sync.delete_from_cpa",
+        lambda _name: (_ for _ in ()).throw(AssertionError("CPA gate must not delete")),
+    )
+
+    stop_event = threading.Event()
+    restart_event = threading.Event()
+    wait_calls = {"count": 0}
+
+    def fake_wait(_seconds):
+        wait_calls["count"] += 1
+        return wait_calls["count"] > 1
+
+    monkeypatch.setattr(stop_event, "wait", fake_wait)
+    monkeypatch.setattr(api, "_auto_check_stop", stop_event)
+    monkeypatch.setattr(api, "_auto_check_restart", restart_event)
+
+    with caplog.at_level(logging.INFO):
+        api._auto_check_loop()
+
+    assert len(started) == 1
+    command, params, args, kwargs = started[0]
+    assert command == "auto-fill"
+    assert params == {
+        "target_seats": 3,
+        "trigger": "auto-check",
+        "shortage": 2,
+        "cpa_credential_gate": {
+            "enabled": True,
+            "safe_read_only": True,
+            "management_ok": True,
+            "available": 0,
+            "total": 0,
+            "reason": "no_provider_auth",
+            "zero_available": True,
+        },
+    }
+    assert args == (3,)
+    assert kwargs == {"background_post_sync": True}
+    assert "CPA 可用凭证 gate" in caplog.text
+    assert "CPA 可用凭证为 0/0" in caplog.text
+
+
+def test_auto_check_cpa_gate_does_not_treat_management_failure_as_zero_credentials(monkeypatch, caplog):
+    started = []
+
+    monkeypatch.setattr(api, "_auto_fill_last_trigger_ts", 0.0)
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr("autoteam.accounts.load_accounts", lambda: [])
+    monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 3)
+    monkeypatch.setattr(api, "_start_task", lambda *args, **kwargs: started.append((args, kwargs)))
+    monkeypatch.setattr("autoteam.sync_targets.is_sync_target_enabled", lambda target: target == "cpa")
+    monkeypatch.setattr(
+        "autoteam.cliproxy_health.get_cliproxy_health",
+        lambda **_kwargs: {
+            "ok": False,
+            "safe_read_only": True,
+            "management_api": {"ok": False, "reason": "request_failed"},
+            "provider_auth": {
+                "ok": False,
+                "provider": "codex",
+                "model": "gpt-5.5",
+                "reason": "management_api_unavailable",
+                "total": 0,
+                "available": 0,
+                "check_type": "management_metadata",
+                "canary_required": True,
+            },
+        },
+    )
+
+    stop_event = threading.Event()
+    restart_event = threading.Event()
+    wait_calls = {"count": 0}
+
+    def fake_wait(_seconds):
+        wait_calls["count"] += 1
+        return wait_calls["count"] > 1
+
+    monkeypatch.setattr(stop_event, "wait", fake_wait)
+    monkeypatch.setattr(api, "_auto_check_stop", stop_event)
+    monkeypatch.setattr(api, "_auto_check_restart", restart_event)
+
+    with caplog.at_level(logging.INFO):
+        api._auto_check_loop()
+
+    assert started == []
+    assert "CPA 可用凭证 gate" in caplog.text
+    assert "management_ok=False" in caplog.text
 
 
 def test_sanitize_account_keeps_exportable_main_account_active_without_live_quota(tmp_path, monkeypatch):

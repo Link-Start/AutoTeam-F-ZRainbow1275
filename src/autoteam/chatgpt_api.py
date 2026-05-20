@@ -30,6 +30,48 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 BASE_DIR = PROJECT_ROOT
 SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
 
+_WORKSPACE_IGNORE_LABELS = {
+    "choose a workspace",
+    "select a workspace",
+    "选择一个工作空间",
+    "选择工作空间",
+    "workspace",
+    "terms of use",
+    "privacy policy",
+    "使用条款",
+    "隐私政策",
+}
+_WORKSPACE_FALLBACK_LABELS = (
+    "personal account",
+    "personal",
+    "个人账户",
+    "个人账号",
+    "free",
+    "免费",
+    "new organization",
+    "新组织",
+    "create organization",
+    "创建组织",
+)
+
+
+def _normalize_workspace_label(text: str | None) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _workspace_candidate_kind(text: str | None) -> str | None:
+    """Classify a visible workspace label as preferred, fallback, or noise."""
+    label = _normalize_workspace_label(text)
+    if not label:
+        return None
+
+    lowered = label.lower()
+    if lowered in _WORKSPACE_IGNORE_LABELS or len(label) <= 3:
+        return None
+    if any(key in lowered for key in _WORKSPACE_FALLBACK_LABELS):
+        return "fallback"
+    return "preferred"
+
 
 class ChatGPTTeamAPI:
     """通过浏览器内 fetch 调用 ChatGPT Team 内部 API。"""
@@ -491,18 +533,6 @@ class ChatGPTTeamAPI:
 
         candidates = []
         seen_texts = set()
-        exclude_keywords = (
-            "personal account",
-            "personal",
-            "个人账户",
-            "个人账号",
-            "free",
-            "免费",
-            "new organization",
-            "新组织",
-            "create organization",
-            "创建组织",
-        )
 
         # 先用 JS 从 DOM 提取可见的 workspace 选项（只取叶子级别文本）
         try:
@@ -540,17 +570,16 @@ class ChatGPTTeamAPI:
                 "chatgpt",
             )
             for text in js_candidates or []:
+                text = _normalize_workspace_label(text)
                 if text in seen_texts:
                     continue
-                text_l = text.lower()
                 # 跳过标题类文本
-                if text_l in (k.lower() for k in title_keywords):
+                if text.lower() in (k.lower() for k in title_keywords):
                     continue
-                # 跳过太短的（用户名缩写、头像字母等）
-                if len(text) <= 3:
+                kind = _workspace_candidate_kind(text)
+                if not kind:
                     continue
                 seen_texts.add(text)
-                kind = "fallback" if any(key in text_l for key in exclude_keywords) else "preferred"
                 candidates.append({"id": str(len(candidates)), "label": text, "kind": kind})
         except Exception as e:
             logger.warning("[ChatGPT] JS 提取 workspace 候选失败: %s", e)
@@ -563,14 +592,15 @@ class ChatGPTTeamAPI:
                         try:
                             if not loc.is_visible(timeout=200):
                                 continue
-                            text = loc.inner_text(timeout=500).strip()
+                            text = _normalize_workspace_label(loc.inner_text(timeout=500))
                         except Exception:
                             continue
                         if not text or text in seen_texts or len(text) > 80:
                             continue
+                        kind = _workspace_candidate_kind(text)
+                        if not kind:
+                            continue
                         seen_texts.add(text)
-                        text_l = text.lower()
-                        kind = "fallback" if any(key in text_l for key in exclude_keywords) else "preferred"
                         candidates.append({"id": str(len(candidates)), "label": text, "kind": kind})
                 except Exception:
                     pass
@@ -724,6 +754,49 @@ class ChatGPTTeamAPI:
         logger.warning("[ChatGPT] workspace 点击后仍停留在选择页 | URL=%s", last_url)
         return False
 
+    def _is_chatgpt_ready_url(self):
+        if not self.page:
+            return False
+        url = (self.page.url or "").lower()
+        return "chatgpt.com" in url and "auth" not in url
+
+    def _wait_for_post_workspace_ready(self, timeout=12):
+        deadline = time.time() + timeout
+        last_url = self.page.url if self.page else ""
+        consecutive_chatgpt_ready = 0
+
+        while time.time() < deadline:
+            if not self.page:
+                return False
+            try:
+                self.page.wait_for_load_state("domcontentloaded", timeout=1000)
+            except Exception:
+                pass
+
+            url = (self.page.url or "").lower()
+            if "challenge" in url:
+                self._wait_for_cloudflare()
+
+            session_token = self._extract_session_token()
+            if session_token:
+                return True
+
+            if self._is_chatgpt_ready_url():
+                consecutive_chatgpt_ready += 1
+                if self._body_excerpt(limit=120):
+                    return True
+                if consecutive_chatgpt_ready >= 3:
+                    logger.info("[ChatGPT] workspace 跳转后已到达 ChatGPT 页面，继续后续登录检测")
+                    return True
+            else:
+                consecutive_chatgpt_ready = 0
+
+            last_url = self.page.url
+            time.sleep(0.5)
+
+        logger.warning("[ChatGPT] workspace 跳转后页面仍未稳定 | URL=%s", last_url)
+        return False
+
     def select_workspace_option(self, option_id):
         options = self._list_workspace_options()
         for option in options:
@@ -747,8 +820,12 @@ class ChatGPTTeamAPI:
                 self.page.wait_for_load_state("domcontentloaded", timeout=5000)
             except Exception:
                 pass
+            self._wait_for_post_workspace_ready(timeout=12)
             self.workspace_options_cache = []
             self._log_login_state("选择 workspace 后")
+            if self._is_chatgpt_ready_url():
+                logger.info("[ChatGPT] 选择 workspace 后结果: completed(chatgpt) | detail=None")
+                return {"step": "completed", "detail": None}
             step, detail = self._detect_login_step()
             logger.info("[ChatGPT] 选择 workspace 后结果: %s | detail=%s", step, detail)
             return {"step": step, "detail": detail}

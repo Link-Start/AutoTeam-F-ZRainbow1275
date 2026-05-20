@@ -13,6 +13,7 @@ Authorization: Bearer <API_KEY>
 - `/api/setup/status`
 - `/api/setup/save`
 - `/api/version`
+- `/api/setup/dns/check`(setup 阶段免鉴权;`API_KEY` 已配置时仍要求 Bearer,只读查询)
 - `/api/mail-provider/probe`(setup 阶段免鉴权;`API_KEY` 已配置时仍要求 Bearer,见下文)
 
 ## 即时返回接口
@@ -24,6 +25,7 @@ Authorization: Bearer <API_KEY>
 | GET | `/api/auth/check` | 验证 API Key |
 | GET | `/api/setup/status` | 检查配置是否完整(按 `MAIL_PROVIDER` 动态切换 `optional`) |
 | POST | `/api/setup/save` | 保存初始配置(provider 互斥写盘) |
+| POST | `/api/setup/dns/check` | 只读 DNS 诊断(A/AAAA/CNAME/MX/TXT,不会写 Cloudflare 或 DNS 服务商) |
 | POST | `/api/mail-provider/probe` | 邮箱后端 3 步探测(fingerprint / credentials / domain_ownership) |
 | GET | `/api/version` | 镜像版本指纹（`git_sha` + `build_time`，免鉴权，用于排查 docker 镜像是否过期） |
 | GET | `/api/status` | 账号状态 + 实时额度 |
@@ -123,11 +125,14 @@ Authorization: Bearer <API_KEY>
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/main-codex/status` | 同步状态 |
-| POST | `/api/main-codex/start` | 开始同步 |
+| GET | `/api/main-codex/status` | 登录/同步状态，包含 `action` |
+| POST | `/api/main-codex/start` | 开始登录并同步到已启用的 CPA/Sub2API 目标；未启用目标时返回 `400` |
+| POST | `/api/main-codex/login` | 只登录并保存本地主号 Codex 认证文件，不同步远端 |
 | POST | `/api/main-codex/password` | 提交密码 |
 | POST | `/api/main-codex/code` | 提交验证码 |
 | POST | `/api/main-codex/cancel` | 取消同步 |
+| POST | `/api/main-codex/delete-remote-files` | 删除已启用远端中的主号 Codex 认证文件 |
+| POST | `/api/main-codex/delete-cpa` | 兼容旧接口：同 `/api/main-codex/delete-remote-files` |
 
 ## 手动 OAuth 导入
 
@@ -152,6 +157,55 @@ Authorization: Bearer <API_KEY>
 | `account` | 完成后导入的账号信息 |
 
 ## 初始配置 API
+
+### `POST /api/setup/dns/check`
+
+只读 DNS 诊断端点,用于检查邮箱域名、OpenAI 域名验证 TXT、SPF、MX 等记录是否已经在公网 DNS 生效。该端点只通过公共 DNS-over-HTTPS 查询,不会读取 Cloudflare token,不会调用 DNS 服务商写接口,也不会创建、更新或删除记录。
+
+鉴权策略与 `/api/mail-provider/probe` 一致:setup 阶段免 Bearer;一旦 `API_KEY` 已配置,必须带 `Authorization: Bearer <API_KEY>`。
+
+请求体可以使用内置字段,也可以直接传 `records`:
+
+```json
+{
+  "domain": "example.com",
+  "mail_host": "mail.example.com",
+  "mail_ip": "203.0.113.10",
+  "mx_target": "mail.example.com",
+  "spf_value": "v=spf1 include:_spf.example.com ~all",
+  "openai_domain_verification": "openai-domain-verification=abc",
+  "records": [
+    {
+      "type": "TXT",
+      "name": "example.com",
+      "expected": "openai-domain-verification=abc"
+    }
+  ]
+}
+```
+
+响应示例:
+
+```json
+{
+  "ok": false,
+  "domain": "example.com",
+  "all_ok": false,
+  "safe_read_only": true,
+  "checks": [
+    {
+      "type": "TXT",
+      "name": "example.com",
+      "expected": "openai-domain-verification=abc",
+      "observed": [],
+      "ok": false,
+      "error": null
+    }
+  ],
+  "error_code": null,
+  "message": null
+}
+```
 
 ### `POST /api/mail-provider/probe`
 

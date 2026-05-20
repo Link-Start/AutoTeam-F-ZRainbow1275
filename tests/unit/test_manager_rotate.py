@@ -174,3 +174,109 @@ def test_cmd_rotate_removes_replaceable_blocker_before_creating_replacement(monk
 
     assert events.index(("remove", "blocked@example.com")) < events.index(("create", None))
     assert ("update", "blocked@example.com", manager.STATUS_STANDBY, "missing_auth") in events
+
+
+def test_cmd_rotate_target2_refills_after_exhausted_removal_despite_transient_overcount(tmp_path, monkeypatch):
+    import autoteam.config as config
+
+    chatgpt = _FakeChatGPT()
+    old_auth = tmp_path / "old.json"
+    standby_auth = tmp_path / "standby.json"
+    old_auth.write_text('{"access_token": "old-token"}', encoding="utf-8")
+    standby_auth.write_text('{"access_token": "standby-token"}', encoding="utf-8")
+
+    state = {
+        "team_count": 2,
+        "accounts": [
+            {
+                "email": "old@example.com",
+                "status": manager.STATUS_EXHAUSTED,
+                "auth_file": str(old_auth),
+                "last_quota": {"primary_pct": 100, "primary_resets_at": 1_700_001_000},
+            },
+            {
+                "email": "standby@example.com",
+                "status": manager.STATUS_STANDBY,
+                "auth_file": str(standby_auth),
+                "last_quota": {"primary_pct": 10, "primary_resets_at": 1_700_000_000},
+            },
+        ],
+    }
+    counts = iter([2, 3, 2])
+    events = []
+
+    def fake_load_accounts():
+        return [dict(acc) for acc in state["accounts"]]
+
+    def fake_update(email, **kwargs):
+        events.append(("update", email, kwargs.get("status"), kwargs.get("_reason")))
+        for acc in state["accounts"]:
+            if acc["email"] == email:
+                acc.update(kwargs)
+                return
+
+    def fake_count(_chatgpt):
+        count = next(counts)
+        events.append(("count", count))
+        return count
+
+    def fake_wait(_chatgpt, **kwargs):
+        events.append(("wait_capacity", kwargs["removed_email"], kwargs["target"]))
+        return 3, False
+
+    def fake_remove(_chatgpt, email, *, return_status=False, **_kwargs):
+        events.append(("remove", email, return_status))
+        state["team_count"] -= 1
+        return "removed" if return_status else True
+
+    def fake_quota(token, *args, **kwargs):
+        events.append(("quota", token))
+        if token == "old-token":
+            return (
+                "exhausted",
+                {"quota_info": {"primary_pct": 100, "weekly_pct": 100}, "resets_at": 1_700_001_000},
+            )
+        return "ok", {"primary_pct": 10, "weekly_pct": 10}
+
+    def fake_reinvite(_chatgpt, _mail, acc):
+        events.append(("reinvite", acc["email"]))
+        state["team_count"] += 1
+        fake_update(acc["email"], status=manager.STATUS_ACTIVE, last_active_at=1_700_000_000)
+        return True
+
+    monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
+    monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "load_accounts", fake_load_accounts)
+    monkeypatch.setattr(manager, "update_account", fake_update)
+    monkeypatch.setattr(manager, "get_team_member_count", fake_count)
+    monkeypatch.setattr(manager, "_wait_for_remote_capacity_after_removal", fake_wait)
+    monkeypatch.setattr(
+        manager,
+        "get_standby_accounts",
+        lambda: [dict(acc) for acc in state["accounts"] if acc["status"] == manager.STATUS_STANDBY],
+    )
+    monkeypatch.setattr(manager, "check_codex_quota", fake_quota)
+    monkeypatch.setattr(manager, "reinvite_account", fake_reinvite)
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("should reuse standby after removing exhausted blocker, not create before remove")
+        ),
+    )
+    monkeypatch.setattr(manager, "remove_from_team", fake_remove)
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync_to_cpa", None)))
+
+    manager.cmd_rotate(target_seats=2)
+
+    assert events.index(("remove", "old@example.com", True)) < events.index(("reinvite", "standby@example.com"))
+    assert ("count", 3) in events
+    assert events.count(("remove", "old@example.com", True)) == 1
+    assert state["team_count"] == 2
+    assert next(acc for acc in state["accounts"] if acc["email"] == "old@example.com")["status"] == manager.STATUS_STANDBY
+    assert next(acc for acc in state["accounts"] if acc["email"] == "standby@example.com")[
+        "status"
+    ] == manager.STATUS_ACTIVE

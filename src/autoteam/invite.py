@@ -50,6 +50,20 @@ logger = logging.getLogger(__name__)
 
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
 SCREENSHOT_DIR = "screenshots"
+INVITE_CODE_SELECTORS = [
+    'input[name="code"]',
+    'input[autocomplete="one-time-code"]',
+    'input[autocomplete*="one-time-code" i]',
+    'input[placeholder*="code" i]',
+    'input[placeholder*="验证码" i]',
+    'input[placeholder*="verification" i]',
+    'input[aria-label*="code" i]',
+    'input[aria-label*="verification" i]',
+    'input[inputmode="numeric"]',
+    'input[type="text"]',
+]
+INVITE_MULTI_CODE_SELECTOR = 'input[maxlength="1"]'
+INVITE_CODE_RENDER_TIMEOUT = 25
 INVITE_BLANK_PAGE_RECOVERY_ATTEMPTS = max(0, int(os.environ.get("INVITE_BLANK_PAGE_RECOVERY_ATTEMPTS", "2")))
 INVITE_BLANK_PAGE_RECOVERY_WAIT = max(0.0, float(os.environ.get("INVITE_BLANK_PAGE_RECOVERY_WAIT", "3")))
 
@@ -244,6 +258,211 @@ def find_visible(page, selectors, label="元素", timeout=3000):
     return None
 
 
+def _first_visible_editable_locator(page, selectors, timeout=800):
+    candidates = selectors if isinstance(selectors, (list, tuple)) else [selectors]
+    for selector in candidates:
+        try:
+            locator = page.locator(selector).first
+            if not locator.is_visible(timeout=timeout):
+                continue
+            if locator.is_editable(timeout=timeout):
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+def _visible_single_char_code_inputs(page, timeout=300):
+    try:
+        visible_inputs = []
+        for locator in page.locator(INVITE_MULTI_CODE_SELECTOR).all():
+            try:
+                if locator.is_visible(timeout=timeout) and locator.is_editable(timeout=timeout):
+                    visible_inputs.append(locator)
+            except Exception:
+                continue
+        if len(visible_inputs) >= 4:
+            return visible_inputs
+    except Exception:
+        pass
+    return []
+
+
+def _input_attr(locator, name):
+    try:
+        value = locator.get_attribute(name)
+    except Exception:
+        return ""
+    return (value or "").strip()
+
+
+def _visible_input_summary(page, limit=8):
+    summary = []
+    try:
+        inputs = page.locator("input").all()
+    except Exception:
+        return summary
+
+    for locator in inputs:
+        try:
+            if not locator.is_visible(timeout=300):
+                continue
+            if not locator.is_editable(timeout=300):
+                continue
+        except Exception:
+            continue
+
+        summary.append(
+            {
+                "type": _input_attr(locator, "type"),
+                "name": _input_attr(locator, "name"),
+                "placeholder": _input_attr(locator, "placeholder"),
+                "aria_label": _input_attr(locator, "aria-label"),
+                "autocomplete": _input_attr(locator, "autocomplete"),
+                "inputmode": _input_attr(locator, "inputmode"),
+                "maxlength": _input_attr(locator, "maxlength"),
+            }
+        )
+        if len(summary) >= limit:
+            break
+    return summary
+
+
+def _detect_invite_register_step(page):
+    url = (getattr(page, "url", "") or "").lower()
+    body = _page_excerpt(page).lower()
+
+    if any(token in url for token in ("challenge", "captcha", "human")):
+        return "blocked"
+    if any(token in body for token in ("verify you are human", "captcha", "human verification")):
+        return "blocked"
+    if any(token in url for token in ("phone", "sms", "mobile")):
+        return "phone_verification"
+    if any(token in body for token in ("phone number", "mobile number", "sms verification")):
+        return "phone_verification"
+    if "about-you" in url or "complete-profile" in url or "profile" in url:
+        return "about_you"
+    if _visible_single_char_code_inputs(page, timeout=300):
+        return "code"
+    if _first_visible_editable_locator(page, INVITE_CODE_SELECTORS, timeout=300):
+        return "code"
+    if any(token in url for token in ("email-verification", "verification", "verify", "otp")):
+        return "code"
+    try:
+        if page.locator('input[name="name"], [role="spinbutton"]').first.is_visible(timeout=300):
+            return "about_you"
+    except Exception:
+        pass
+    if any(token in body for token in ("join workspace", "accept invite", "welcome", "workspace")):
+        return "about_you"
+    if "chatgpt.com" in url and "auth" not in url:
+        return "completed"
+    if any(token in body for token in ("code", "verification", "one-time code", "otp")):
+        return "code"
+    return "unknown"
+
+
+def _wait_for_invite_code_target(page, timeout=INVITE_CODE_RENDER_TIMEOUT):
+    deadline = time.time() + max(0.0, float(timeout))
+
+    while time.time() < deadline:
+        split_inputs = _visible_single_char_code_inputs(page, timeout=300)
+        if split_inputs:
+            return {
+                "mode": "split",
+                "target": split_inputs,
+                "url": page.url,
+                "body": _page_excerpt(page),
+                "inputs": _visible_input_summary(page),
+            }
+
+        code_input = _first_visible_editable_locator(page, INVITE_CODE_SELECTORS, timeout=300)
+        if code_input:
+            return {
+                "mode": "single",
+                "target": code_input,
+                "url": page.url,
+                "body": _page_excerpt(page),
+                "inputs": _visible_input_summary(page),
+            }
+
+        step = _detect_invite_register_step(page)
+        if step != "code":
+            return {
+                "mode": "advanced",
+                "step": step,
+                "url": page.url,
+                "body": _page_excerpt(page),
+                "inputs": _visible_input_summary(page),
+            }
+
+        time.sleep(0.5)
+
+    step = _detect_invite_register_step(page)
+    if step != "code":
+        return {
+            "mode": "advanced",
+            "step": step,
+            "url": page.url,
+            "body": _page_excerpt(page),
+            "inputs": _visible_input_summary(page),
+        }
+    return {
+        "mode": "timeout",
+        "step": "code",
+        "url": page.url,
+        "body": _page_excerpt(page),
+        "inputs": _visible_input_summary(page),
+    }
+
+
+def _wait_for_invite_step_change(page, current_step, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        step = _detect_invite_register_step(page)
+        if step != current_step:
+            return step
+        time.sleep(0.5)
+    return _detect_invite_register_step(page)
+
+
+def _submit_invite_verification_code(page, code_target, verification_code):
+    mode = (code_target or {}).get("mode")
+    target = (code_target or {}).get("target")
+    submit_field = None
+    current_step = _detect_invite_register_step(page)
+
+    if mode == "split" and isinstance(target, list):
+        for i, char in enumerate(verification_code):
+            if i >= len(target):
+                break
+            target[i].fill(char)
+            time.sleep(0.1)
+        if target:
+            submit_field = target[0]
+    elif mode == "single" and target:
+        target.fill(verification_code)
+        submit_field = target
+    else:
+        return _detect_invite_register_step(page)
+
+    time.sleep(0.5)
+    if submit_field is not None:
+        find_and_click(
+            page,
+            [
+                'button:has-text("Continue")',
+                'button:has-text("Verify")',
+                'button:has-text("Submit")',
+                'button:has-text("Confirm")',
+                'button:has-text("继续")',
+                'button[type="submit"]',
+            ],
+            "确认按钮",
+        )
+    return _wait_for_invite_step_change(page, current_step, timeout=20)
+
+
 def wait_for_cloudflare(page, max_wait=60):
     for i in range(max_wait // 5):
         html = page.content()[:2000].lower()
@@ -393,48 +612,46 @@ def register_with_invite(page, invite_link, email, mail_client, password=None, s
     logger.info("[注册] 输入验证码: %s", verification_code)
     screenshot(page, "reg_05_before_code.png")
 
-    # 检查是否是多个单字符输入框
-    single_inputs = page.locator('input[maxlength="1"]').all()
-    if len(single_inputs) >= 4:
-        logger.debug("[注册] 检测到 %d 个单字符输入框", len(single_inputs))
-        for i, char in enumerate(verification_code):
-            if i < len(single_inputs):
-                single_inputs[i].fill(char)
-                time.sleep(0.2)
-    else:
-        code_input = find_visible(
-            page,
-            [
-                'input[name="code"]',
-                'input[placeholder*="code" i]',
-                'input[placeholder*="验证" i]',
-                'input[type="text"]',
-                'input[inputmode="numeric"]',
-            ],
-            "验证码输入框",
-        )
-        if code_input:
-            code_input.fill(verification_code)
+    logger.info("[注册] 等待验证码输入框渲染...")
+    code_target_result = _wait_for_invite_code_target(page, timeout=INVITE_CODE_RENDER_TIMEOUT)
+    mode = code_target_result.get("mode")
+    code_target = None
+    if mode in {"single", "split"}:
+        code_target = code_target_result
+        logger.info("[注册] 验证码输入框已就绪（mode=%s）", mode)
+    elif mode == "advanced":
+        step = code_target_result.get("step")
+        if step in {"about_you", "completed"}:
+            logger.info(
+                "[注册] 验证码页等待期间流程已推进到 %s | URL: %s",
+                step,
+                code_target_result.get("url") or page.url,
+            )
         else:
-            logger.warning("[注册] 未找到验证码输入框")
+            logger.warning(
+                "[注册] 等待验证码输入框期间页面切换到 %s，暂停注册 | URL: %s | body=%s | inputs=%s",
+                step,
+                code_target_result.get("url") or page.url,
+                code_target_result.get("body", ""),
+                code_target_result.get("inputs", []),
+            )
             screenshot(page, "reg_05_no_code_input.png")
             return False, password
+    else:
+        logger.warning(
+            "[注册] 未找到验证码输入框 | 类型=code_input_timeout | URL=%s | 阶段=%s | body=%s | inputs=%s",
+            code_target_result.get("url") or page.url,
+            code_target_result.get("step", "code"),
+            code_target_result.get("body", ""),
+            code_target_result.get("inputs", []),
+        )
+        screenshot(page, "reg_05_no_code_input.png")
+        return False, password
 
-    time.sleep(1)
+    if code_target:
+        next_step = _submit_invite_verification_code(page, code_target, verification_code)
+        logger.info("[注册] 验证码提交后状态: %s | URL: %s", next_step, page.url)
 
-    # 点击确认
-    find_and_click(
-        page,
-        [
-            'button:has-text("Continue")',
-            'button:has-text("Verify")',
-            'button:has-text("Submit")',
-            'button[type="submit"]',
-        ],
-        "确认按钮",
-    )
-
-    time.sleep(8)
     screenshot(page, "reg_06_after_code.png")
     logger.info("[注册] 当前 URL: %s", page.url)
     assert_not_blocked(page, "code_submit")

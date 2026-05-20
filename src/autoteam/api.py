@@ -89,6 +89,22 @@ def _safe_multi_master_status() -> dict:
         return {"enabled": False, "owner_count": 0, "owners": [], "error": str(exc)}
 
 
+def _require_sync_target_configs(action_label: str):
+    """Require at least one fully configured enabled remote sync target."""
+    from autoteam.sync_targets import get_enabled_sync_targets, get_missing_target_configs
+
+    enabled_targets = get_enabled_sync_targets()
+    if not enabled_targets:
+        raise HTTPException(
+            status_code=400, detail=f"{action_label} 前请先在配置面板启用至少一个远端同步目标（CPA 或 Sub2API）"
+        )
+
+    missing = get_missing_target_configs(enabled_targets)
+    if missing:
+        fields = "、".join(f"{key}（{label}）" for key, label in missing)
+        raise HTTPException(status_code=400, detail=f"{action_label} 前请先在配置面板填写：{fields}")
+
+
 # Round 7 P2.4 — FastAPI 现代 lifespan handler 替代已废弃的 @app.on_event。
 # 启动期:修复 auths 认证文件权限 + 启动 _auto_check_loop 后台线程。
 # 停止期:发 _auto_check_stop 信号让线程优雅退出。
@@ -209,6 +225,7 @@ _AUTH_SKIP_PATHS = {
     "/api/setup/status",
     "/api/setup/save",
     "/api/version",
+    "/api/setup/dns/check",  # Read-only setup diagnostic; route enforces Bearer once API_KEY exists.
     "/api/mail-provider/probe",  # SPEC-1 §3.5 — 条件鉴权:API_KEY 配置后路由内强制 Bearer
 }
 
@@ -326,6 +343,46 @@ class MailProviderProbeResponse(BaseModel):
     leaked_probe: dict | None = None
 
 
+class DNSRecordCheck(BaseModel):
+    type: Literal["A", "AAAA", "CNAME", "MX", "TXT"]
+    name: str = Field(..., min_length=1, max_length=253)
+    expected: str = Field(..., min_length=1, max_length=2048)
+
+
+class DNSDiagnosticRequest(BaseModel):
+    domain: str = ""
+    mail_host: str = ""
+    mail_ip: str = ""
+    mx_target: str = ""
+    spf_value: str = ""
+    openai_domain_verification: str = ""
+    records: list[DNSRecordCheck] = Field(default_factory=list)
+
+    @field_validator("domain", "mail_host", "mx_target")
+    @classmethod
+    def _normalize_dns_name(cls, v: str) -> str:
+        return (v or "").strip().lstrip("@").rstrip(".").lower()
+
+
+class DNSCheckResponse(BaseModel):
+    type: Literal["A", "AAAA", "CNAME", "MX", "TXT"]
+    name: str
+    expected: str
+    observed: list[str] = Field(default_factory=list)
+    ok: bool
+    error: str | None = None
+
+
+class DNSDiagnosticResponse(BaseModel):
+    ok: bool
+    domain: str = ""
+    checks: list[DNSCheckResponse] = Field(default_factory=list)
+    all_ok: bool = False
+    safe_read_only: bool = True
+    error_code: str | None = None
+    message: str | None = None
+
+
 _CF_MAIL_KEYS = {"CLOUDMAIL_BASE_URL", "CLOUDMAIL_PASSWORD", "CLOUDMAIL_DOMAIN"}
 _MAILLAB_KEYS = {"MAILLAB_API_URL", "MAILLAB_USERNAME", "MAILLAB_PASSWORD", "MAILLAB_DOMAIN"}
 
@@ -437,14 +494,8 @@ def _enforce_probe_rate_limit(request: Request, max_per_min: int = 60):
         bucket.append(now)
 
 
-@app.post("/api/mail-provider/probe", response_model=MailProviderProbeResponse)
-def post_mail_provider_probe(req: MailProviderProbeRequest, request: Request):
-    """SPEC-1 §3.5 — 三步分阶段:fingerprint → credentials → domain_ownership。
-
-    鉴权策略:
-      - API_KEY 未配置(setup 阶段):放行,但走 IP 速率限制
-      - API_KEY 已配置:强制 Bearer(_AUTH_SKIP_PATHS 已加白,这里手工二次校验)
-    """
+def _enforce_setup_probe_access(request: Request):
+    """Setup diagnostics are open before API_KEY exists and Bearer-gated after setup."""
     from autoteam.config import API_KEY as _key
 
     if _key:
@@ -453,6 +504,17 @@ def post_mail_provider_probe(req: MailProviderProbeRequest, request: Request):
             raise HTTPException(status_code=401, detail="API_KEY 已配置,请提供 Bearer token")
     else:
         _enforce_probe_rate_limit(request)
+
+
+@app.post("/api/mail-provider/probe", response_model=MailProviderProbeResponse)
+def post_mail_provider_probe(req: MailProviderProbeRequest, request: Request):
+    """SPEC-1 §3.5 — 三步分阶段:fingerprint → credentials → domain_ownership。
+
+    鉴权策略:
+      - API_KEY 未配置(setup 阶段):放行,但走 IP 速率限制
+      - API_KEY 已配置:强制 Bearer(_AUTH_SKIP_PATHS 已加白,这里手工二次校验)
+    """
+    _enforce_setup_probe_access(request)
 
     from autoteam.mail import probe as mail_probe
 
@@ -504,6 +566,27 @@ def post_mail_provider_probe(req: MailProviderProbeRequest, request: Request):
     return MailProviderProbeResponse(**payload)
 
 
+@app.post("/api/setup/dns/check", response_model=DNSDiagnosticResponse)
+def post_setup_dns_check(req: DNSDiagnosticRequest, request: Request):
+    """Read-only DNS diagnostics for setup/domain verification records."""
+    _enforce_setup_probe_access(request)
+
+    from autoteam import dns_diagnostics
+
+    admin_payload = req.model_dump(exclude={"records"})
+    admin_payload["email_domain"] = admin_payload.pop("domain", "")
+    extra_checks = [record.model_dump() for record in req.records]
+    try:
+        result = dns_diagnostics.check_admin_dns(admin_payload, extra_checks=extra_checks)
+    except dns_diagnostics.DNSDiagnosticError as exc:
+        return DNSDiagnosticResponse(ok=False, error_code="INVALID_REQUEST", message=str(exc))
+    except Exception as exc:  # noqa: BLE001 - endpoint must not expose stack traces during setup
+        logger.exception("[dns] setup DNS check failed: %s", exc)
+        return DNSDiagnosticResponse(ok=False, error_code="UNKNOWN", message=str(exc))
+
+    return DNSDiagnosticResponse(ok=bool(result.get("all_ok")), **result)
+
+
 # ---------------------------------------------------------------------------
 # 后台任务管理
 # ---------------------------------------------------------------------------
@@ -515,6 +598,7 @@ _admin_login_api = None
 _admin_login_step: str | None = None
 _main_codex_flow = None
 _main_codex_step: str | None = None
+_main_codex_action: str | None = None
 _manual_account_flow = None
 MAX_TASK_HISTORY = 50
 
@@ -603,11 +687,12 @@ def _current_busy_detail(default_message: str):
         }
 
     if _main_codex_flow:
+        command = "main-codex-login" if _main_codex_action == "login" else "main-codex-sync"
         return {
             "message": default_message,
             "running_task": {
-                "task_id": "main-codex-sync",
-                "command": "main-codex-sync",
+                "task_id": command,
+                "command": command,
                 "started_at": None,
             },
         }
@@ -1080,6 +1165,7 @@ def _main_codex_status():
     return {
         "in_progress": _main_codex_flow is not None,
         "step": _main_codex_step,
+        "action": _main_codex_action,
     }
 
 
@@ -1130,7 +1216,7 @@ def _finish_admin_login(completed: dict):
                 logger.warning("[API] 管理员登录完成，但刷新主号认证文件失败: %s", exc)
         if _playwright_lock.locked():
             _playwright_lock.release()
-    return {"status": "completed", "admin": _admin_status(), "info": info}
+    return {"status": "completed", "admin": _admin_status(), "codex": _main_codex_status(), "info": info}
 
 
 def _set_pending_admin_login(api, step):
@@ -1140,9 +1226,10 @@ def _set_pending_admin_login(api, step):
     return {"status": step, "admin": _admin_status()}
 
 
-def _finish_main_codex_sync():
-    global _main_codex_flow, _main_codex_step
+def _finish_main_codex_flow():
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     flow = _main_codex_flow
+    action = _main_codex_action or "sync"
     try:
         info = _pw_executor.run(flow.complete)
     finally:
@@ -1153,17 +1240,22 @@ def _finish_main_codex_sync():
                 pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
-    from autoteam.sync_targets import describe_sync_targets, get_enabled_sync_targets
 
-    enabled_targets = get_enabled_sync_targets()
-    target_label = describe_sync_targets(enabled_targets)
-    message = (
-        f"主号 Codex 已同步到 {target_label}"
-        if enabled_targets
-        else "主号 Codex 已保存，本轮未启用远端同步目标"
-    )
+    if action == "login":
+        message = "主号 Codex 已登录"
+    else:
+        from autoteam.sync_targets import describe_sync_targets, get_enabled_sync_targets
+
+        enabled_targets = get_enabled_sync_targets()
+        target_label = describe_sync_targets(enabled_targets)
+        message = (
+            f"主号 Codex 已同步到 {target_label}"
+            if enabled_targets
+            else "主号 Codex 已保存，本轮未启用远端同步目标"
+        )
     return {
         "status": "completed",
         "message": message,
@@ -1172,11 +1264,20 @@ def _finish_main_codex_sync():
     }
 
 
-def _set_pending_main_codex_sync(flow, step):
-    global _main_codex_flow, _main_codex_step
+def _finish_main_codex_sync():
+    return _finish_main_codex_flow()
+
+
+def _set_pending_main_codex_flow(flow, step, action):
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     _main_codex_flow = flow
     _main_codex_step = step
+    _main_codex_action = action
     return {"status": step, "codex": _main_codex_status()}
+
+
+def _set_pending_main_codex_sync(flow, step):
+    return _set_pending_main_codex_flow(flow, step, "sync")
 
 
 def _finish_manual_account_flow(result: dict):
@@ -1759,10 +1860,8 @@ def post_admin_logout():
     return {"message": "管理员登录态已清除", "admin": _admin_status()}
 
 
-@app.post("/api/main-codex/start")
-def post_main_codex_start():
-    """开始主号 Codex 登录并同步到 CPA。"""
-    global _main_codex_flow, _main_codex_step
+def _clear_active_main_codex_flow():
+    global _main_codex_flow, _main_codex_step, _main_codex_action
 
     if _main_codex_flow:
         try:
@@ -1771,31 +1870,61 @@ def post_main_codex_start():
             pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
+
+
+def _start_main_codex_flow(action="sync"):
+    from autoteam.codex_auth import MainCodexLoginFlow, MainCodexSyncFlow
+
+    flow_cls = MainCodexSyncFlow if action == "sync" else MainCodexLoginFlow
+
+    def _do_start():
+        flow = flow_cls()
+        try:
+            result = flow.start()
+        except Exception:
+            try:
+                flow.stop()
+            except Exception:
+                pass
+            raise
+        return flow, result
+
+    flow, result = _pw_executor.run(_do_start)
+    step = result["step"]
+    if step == "completed":
+        _set_pending_main_codex_flow(flow, step, action)
+        return step, _finish_main_codex_flow()
+    if step in ("password_required", "code_required"):
+        return step, _set_pending_main_codex_flow(flow, step, action)
+
+    _pw_executor.run(flow.stop)
+    raise RuntimeError(result.get("detail") or "无法识别主号 Codex 登录步骤")
+
+
+@app.post("/api/main-codex/start")
+def post_main_codex_start():
+    """开始主号 Codex 登录并同步到已启用远端。"""
+    _clear_active_main_codex_flow()
+    _require_sync_target_configs("同步主号 Codex")
 
     from autoteam.codex_auth import get_saved_main_auth_file
     from autoteam.sync_targets import (
         describe_sync_targets,
         get_enabled_sync_targets,
-    )
-    from autoteam.sync_targets import (
-        sync_main_codex_to_configured_targets as sync_main_codex_to_cpa,
+        sync_main_codex_to_configured_targets,
     )
 
     saved_auth_file = get_saved_main_auth_file()
     if saved_auth_file:
-        sync_main_codex_to_cpa(saved_auth_file)
+        sync_main_codex_to_configured_targets(saved_auth_file)
         enabled_targets = get_enabled_sync_targets()
         target_label = describe_sync_targets(enabled_targets)
-        message = (
-            f"主号 Codex 已同步到 {target_label}"
-            if enabled_targets
-            else "主号 Codex 已保存，本轮未启用远端同步目标"
-        )
         return {
             "status": "completed",
-            "message": message,
+            "message": f"主号 Codex 已同步到 {target_label}",
             "codex": _main_codex_status(),
             "info": {"auth_file": saved_auth_file},
         }
@@ -1803,26 +1932,32 @@ def post_main_codex_start():
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(
             status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再同步主号 Codex")
+    )
+
+    try:
+        _step, result = _start_main_codex_flow(action="sync")
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/main-codex/login")
+def post_main_codex_login():
+    """开始主号 Codex 登录，仅保存本地认证文件。"""
+    _clear_active_main_codex_flow()
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再登录主号 Codex")
         )
 
     try:
-        from autoteam.codex_auth import MainCodexSyncFlow
-
-        def _do_start():
-            flow = MainCodexSyncFlow()
-            result = flow.start()
-            return flow, result
-
-        flow, result = _pw_executor.run(_do_start)
-        step = result["step"]
-        if step == "completed":
-            _main_codex_flow = flow
-            return _finish_main_codex_sync()
-        if step in ("password_required", "code_required"):
-            return _set_pending_main_codex_sync(flow, step)
-        _pw_executor.run(flow.stop)
-        _playwright_lock.release()
-        raise HTTPException(status_code=400, detail=result.get("detail") or "无法识别主号 Codex 登录步骤")
+        _step, result = _start_main_codex_flow(action="login")
+        return result
     except HTTPException:
         raise
     except Exception as exc:
@@ -1834,7 +1969,7 @@ def post_main_codex_start():
 @app.post("/api/main-codex/password")
 def post_main_codex_password(params: AdminPasswordParams):
     """提交主号 Codex 登录密码。"""
-    global _main_codex_flow, _main_codex_step
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     if not _main_codex_flow or _main_codex_step != "password_required":
         raise HTTPException(status_code=409, detail="当前没有等待密码的主号 Codex 登录流程")
 
@@ -1856,6 +1991,7 @@ def post_main_codex_password(params: AdminPasswordParams):
             pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1864,7 +2000,7 @@ def post_main_codex_password(params: AdminPasswordParams):
 @app.post("/api/main-codex/code")
 def post_main_codex_code(params: AdminCodeParams):
     """提交主号 Codex 登录验证码。"""
-    global _main_codex_flow, _main_codex_step
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     if not _main_codex_flow or _main_codex_step != "code_required":
         raise HTTPException(status_code=409, detail="当前没有等待验证码的主号 Codex 登录流程")
 
@@ -1886,6 +2022,7 @@ def post_main_codex_code(params: AdminCodeParams):
             pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1894,7 +2031,7 @@ def post_main_codex_code(params: AdminCodeParams):
 @app.post("/api/main-codex/cancel")
 def post_main_codex_cancel():
     """取消主号 Codex 登录流程。"""
-    global _main_codex_flow, _main_codex_step
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     if _main_codex_flow:
         try:
             _pw_executor.run(_main_codex_flow.stop)
@@ -1902,9 +2039,52 @@ def post_main_codex_cancel():
             pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
     return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
+
+
+def _delete_main_codex_from_enabled_targets():
+    from autoteam.sync_targets import (
+        delete_main_codex_from_configured_targets,
+        describe_sync_targets,
+        get_enabled_sync_targets,
+    )
+
+    _require_sync_target_configs("删除主号 Codex 远端文件")
+
+    enabled_targets = get_enabled_sync_targets()
+    results = delete_main_codex_from_configured_targets()
+    deleted: list[str] = []
+    total_count = 0
+
+    for target in enabled_targets:
+        target_result = results.get(target) or {}
+        target_deleted = [str(item) for item in (target_result.get("deleted") or [])]
+        deleted.extend(target_deleted)
+        try:
+            total_count += int(target_result.get("count", len(target_deleted)) or 0)
+        except (TypeError, ValueError):
+            total_count += len(target_deleted)
+
+    return {
+        "message": f"已从 {describe_sync_targets(enabled_targets)} 删除 {total_count} 个主号认证文件",
+        "deleted": deleted,
+        "results": results,
+    }
+
+
+@app.post("/api/main-codex/delete-remote-files")
+def post_main_codex_delete_remote_files():
+    """删除已启用远端中已上传的主号 Codex 认证文件。"""
+    return _delete_main_codex_from_enabled_targets()
+
+
+@app.post("/api/main-codex/delete-cpa")
+def post_main_codex_delete_cpa():
+    """兼容旧接口：删除已启用远端中的主号 Codex 认证文件。"""
+    return _delete_main_codex_from_enabled_targets()
 
 
 @app.post("/api/manual-account/start")
@@ -2920,7 +3100,13 @@ def get_team_members():
     try:
 
         def _fetch_team_members():
-            from autoteam.account_ops import fetch_team_state
+            from autoteam.account_ops import (
+                fetch_team_state,
+                team_invite_email,
+                team_member_email,
+                team_member_role,
+                team_member_user_id,
+            )
             from autoteam.accounts import load_accounts
             from autoteam.chatgpt_api import ChatGPTTeamAPI
 
@@ -2932,18 +3118,18 @@ def get_team_members():
 
                 result = []
                 for m in members:
-                    email = (m.get("email") or "").lower()
+                    email = team_member_email(m)
                     result.append(
                         {
-                            "email": m.get("email", ""),
-                            "role": m.get("role", ""),
-                            "user_id": m.get("user_id") or m.get("id", ""),
+                            "email": email,
+                            "role": team_member_role(m) or "",
+                            "user_id": team_member_user_id(m) or "",
                             "is_local": email in local_emails,
                             "type": "member",
                         }
                     )
                 for inv in invites:
-                    email = (inv.get("email_address") or inv.get("email") or "").lower()
+                    email = team_invite_email(inv)
                     result.append(
                         {
                             "email": email,
@@ -3275,6 +3461,15 @@ def post_cleanup(params: CleanupParams = CleanupParams()):
     return task
 
 
+@app.post("/api/tasks/reset-quota", status_code=202)
+def post_reset_quota():
+    """清空本地额度恢复记录，并恢复 exhausted 账号为可检查状态（后台执行）"""
+    from autoteam.manager import cmd_reset_quota_recovery
+
+    task = _start_task("reset-quota", cmd_reset_quota_recovery, {})
+    return task
+
+
 @app.get("/api/tasks")
 def get_tasks():
     """查看所有任务"""
@@ -3557,6 +3752,85 @@ def _auto_check_team_member_count(timeout_seconds: float = 30, retries: int = 2)
             return -1
 
 
+def _collect_cpa_credential_gate() -> dict:
+    """Read-only CPA provider-auth gate for auto-check decisions."""
+    try:
+        from autoteam.sync_targets import SYNC_TARGET_CPA, is_sync_target_enabled
+
+        enabled = is_sync_target_enabled(SYNC_TARGET_CPA)
+    except Exception as exc:
+        logger.warning("[巡检] CPA 可用凭证 gate 配置检查失败: %s", exc)
+        return {
+            "enabled": False,
+            "safe_read_only": True,
+            "management_ok": False,
+            "available": None,
+            "total": None,
+            "reason": "config_check_failed",
+            "zero_available": False,
+            "error": str(exc),
+        }
+
+    if not enabled:
+        return {
+            "enabled": False,
+            "safe_read_only": True,
+            "management_ok": False,
+            "available": None,
+            "total": None,
+            "reason": "cpa_sync_disabled",
+            "zero_available": False,
+        }
+
+    try:
+        from autoteam.cliproxy_health import get_cliproxy_health
+
+        health = get_cliproxy_health(cache_ttl=0.0, force_refresh=True)
+    except Exception as exc:
+        logger.warning("[巡检] CPA 可用凭证 gate 只读检查失败: %s", exc)
+        return {
+            "enabled": True,
+            "safe_read_only": True,
+            "management_ok": False,
+            "available": None,
+            "total": None,
+            "reason": "health_check_exception",
+            "zero_available": False,
+            "error": str(exc),
+        }
+
+    management_api = health.get("management_api") if isinstance(health, dict) else {}
+    provider_auth = health.get("provider_auth") if isinstance(health, dict) else {}
+    management_ok = bool(isinstance(management_api, dict) and management_api.get("ok"))
+    safe_read_only = bool(isinstance(health, dict) and health.get("safe_read_only", True))
+    if not isinstance(provider_auth, dict):
+        provider_auth = {}
+
+    try:
+        available = int(provider_auth.get("available") or 0)
+    except (TypeError, ValueError):
+        available = 0
+    try:
+        total = int(provider_auth.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+
+    reason = str(
+        provider_auth.get("reason")
+        or (management_api.get("reason") if isinstance(management_api, dict) else "")
+        or "unknown"
+    )
+    return {
+        "enabled": True,
+        "safe_read_only": safe_read_only,
+        "management_ok": management_ok,
+        "available": available,
+        "total": total,
+        "reason": reason,
+        "zero_available": management_ok and available <= 0,
+    }
+
+
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
@@ -3608,6 +3882,16 @@ def _auto_check_loop():
             except Exception as exc:
                 logger.warning("[巡检] 本地占席 blocker 分类失败: %s", exc)
                 replaceable_blockers = []
+            cpa_credential_gate = _collect_cpa_credential_gate()
+            if cpa_credential_gate.get("enabled"):
+                logger.info(
+                    "[巡检] CPA 可用凭证 gate: management_ok=%s available=%s/%s reason=%s safe_read_only=%s",
+                    cpa_credential_gate.get("management_ok"),
+                    cpa_credential_gate.get("available"),
+                    cpa_credential_gate.get("total"),
+                    cpa_credential_gate.get("reason"),
+                    cpa_credential_gate.get("safe_read_only"),
+                )
 
             # Watchdog:active 账号数 < 子号目标时自动补位。
             # 之前的 `if not active: continue` 在 active 全 kick 进 standby
@@ -3638,6 +3922,14 @@ def _auto_check_loop():
                                 ", ".join(
                                     f"{item['email']}({item['reason']})" for item in replaceable_blockers[:5]
                                 ),
+                            )
+                            should_start_auto_fill = True
+                        elif cpa_credential_gate.get("zero_available"):
+                            logger.warning(
+                                "[巡检] auto-fill 冷却中但 Team 已满、本地 active=%d/%d，且 CPA 可用凭证为 0/%s，继续补位",
+                                len(active),
+                                sub_account_target,
+                                cpa_credential_gate.get("total"),
                             )
                             should_start_auto_fill = True
                         else:
@@ -3702,6 +3994,13 @@ def _auto_check_loop():
                                     f"{item['email']}({item['reason']})" for item in replaceable_blockers[:5]
                                 ),
                             )
+                        elif cpa_credential_gate.get("zero_available"):
+                            logger.warning(
+                                "[巡检] Team 已满但本地 active=%d/%d，且 CPA 可用凭证为 0/%s，触发 auto-fill 补位",
+                                len(active),
+                                sub_account_target,
+                                cpa_credential_gate.get("total"),
+                            )
                         else:
                             logger.info(
                                 "[巡检] 本地 active=%d < %d,但 Team 实际成员数=%d 已满；先跳过 auto-fill,等待同步/对账稳定",
@@ -3729,10 +4028,19 @@ def _auto_check_loop():
                     from autoteam.manager import cmd_rotate
 
                     try:
+                        task_params = {"target_seats": target_seats}
+                        if cpa_credential_gate.get("enabled"):
+                            task_params.update(
+                                {
+                                    "trigger": "auto-check",
+                                    "shortage": max(0, sub_account_target - len(active)),
+                                    "cpa_credential_gate": cpa_credential_gate,
+                                }
+                            )
                         _start_task(
                             "auto-fill",
                             cmd_rotate,
-                            {"target_seats": target_seats},
+                            task_params,
                             target_seats,
                             background_post_sync=True,
                         )

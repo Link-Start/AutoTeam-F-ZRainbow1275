@@ -10,6 +10,7 @@ Verifies the ✓ paste / ⚠ adapt items from the S0 diff report
 4. _release_auth_repair_team_seat
 5. _record_auth_repair_failure (3 branches: add_phone soft retry / hard pause / decay)
 6. _auth_repair_skip_reason / _auth_repair_state_suffix / _auth_repair_reset
+7. _login_codex_with_result result-shape and retry guard
 
 All status writes route through update_account → default_machine.transition,
 so we mock that boundary, not OpenAI APIs.
@@ -339,6 +340,11 @@ class TestAuthRepairHelpers:
     def test_error_label_maps_known_types(self):
         assert manager_mod._auth_repair_error_label("add_phone") == "手机号验证"
         assert manager_mod._auth_repair_error_label("human_verification") == "人机验证"
+        assert manager_mod._auth_repair_error_label("oauth_timeout") == "OAuth 授权页超时"
+        assert manager_mod._auth_repair_error_label("unsupported_region") == "出口地区不被 OAuth 接受"
+        assert manager_mod._oauth_retry_delay_seconds("oauth_timeout") == 8
+        assert manager_mod._oauth_retry_delay_seconds("account_selection") == 6
+        assert manager_mod._oauth_retry_delay_seconds("custom_x") == 0
         # Unknown returns the input string as-is
         assert manager_mod._auth_repair_error_label("custom_x") == "custom_x"
         assert manager_mod._auth_repair_error_label(None) == "未知错误"
@@ -386,6 +392,175 @@ class TestAuthRepairSkipReason:
 
     def test_none_acc_returns_none(self):
         assert manager_mod._auth_repair_skip_reason(None) is None
+
+
+class TestLoginCodexWithResult:
+    def test_retries_retryable_failures_within_same_round(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def fake_login(email, password, mail_client=None, return_result=False):
+            assert email == "user@example.com"
+            assert password == ""
+            assert mail_client is None
+            assert return_result is True
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                return {
+                    "ok": False,
+                    "bundle": None,
+                    "error_type": "auth_code_missing",
+                    "error_detail": "未获取到 auth code",
+                    "retryable": True,
+                }
+            return {
+                "ok": True,
+                "bundle": {"email": email, "plan_type": "team"},
+                "error_type": None,
+                "error_detail": None,
+                "retryable": False,
+            }
+
+        monkeypatch.setattr(manager_mod, "login_codex_via_browser", fake_login)
+
+        result = manager_mod._login_codex_with_result("user@example.com", "", max_attempts=3)
+
+        assert attempts["count"] == 3
+        assert result["ok"] is True
+        assert result["bundle"]["plan_type"] == "team"
+        assert result["attempts"] == 3
+
+    @pytest.mark.parametrize("error_type", ["add_phone", "email_verification", "login_state_lost"])
+    def test_single_attempt_failure_types_do_not_same_round_retry(self, monkeypatch, error_type):
+        attempts = {"count": 0}
+
+        def fake_login(email, password, mail_client=None, return_result=False):
+            assert return_result is True
+            attempts["count"] += 1
+            return {
+                "ok": False,
+                "bundle": None,
+                "error_type": error_type,
+                "error_detail": "terminal for this round",
+                "retryable": True,
+            }
+
+        monkeypatch.setattr(manager_mod, "login_codex_via_browser", fake_login)
+
+        result = manager_mod._login_codex_with_result("user@example.com", "", max_attempts=3)
+
+        assert attempts["count"] == 1
+        assert result["ok"] is False
+        assert result["error_type"] == error_type
+        assert result["attempts"] == 1
+
+    def test_rejects_non_team_bundle(self, monkeypatch):
+        def fake_login(email, password, mail_client=None, return_result=False):
+            assert return_result is True
+            return {
+                "ok": True,
+                "bundle": {"email": email, "plan_type": "free"},
+                "error_type": None,
+                "error_detail": None,
+                "retryable": False,
+            }
+
+        monkeypatch.setattr(manager_mod, "login_codex_via_browser", fake_login)
+
+        result = manager_mod._login_codex_with_result("user@example.com", "", max_attempts=1)
+
+        assert result["ok"] is False
+        assert result["bundle"] is None
+        assert result["error_type"] == "non_team_plan"
+        assert result["attempts"] == 1
+
+
+class TestCmdCheckAuthRepairEntry:
+    def test_preserves_historical_low_quota_on_network_error_for_remove_first(self, tmp_path, monkeypatch):
+        auth_file = tmp_path / "codex-low@example.com-team.json"
+        auth_file.write_text('{"access_token": "token"}', encoding="utf-8")
+        account = {
+            "email": "low@example.com",
+            "status": "active",
+            "auth_file": str(auth_file),
+            "mail_provider": "cloudmail",
+            "mail_account_id": 123,
+            "last_quota": {
+                "primary_pct": 95,
+                "primary_resets_at": 2_000,
+                "weekly_pct": 1,
+                "weekly_resets_at": 0,
+            },
+        }
+        preserved = []
+        updates = []
+
+        monkeypatch.setattr(manager_mod, "_reconcile_team_members", lambda: {})
+        monkeypatch.setattr(manager_mod.time, "time", lambda: 1_000)
+        monkeypatch.setattr(manager_mod, "load_accounts", lambda: [dict(account)])
+        monkeypatch.setattr(manager_mod, "get_mail_domain", lambda: "example.com")
+        monkeypatch.setattr(manager_mod, "_is_main_account_email", lambda _email: False)
+        monkeypatch.setattr(manager_mod, "_check_and_refresh", lambda _acc: ("network_error", None))
+        monkeypatch.setattr(manager_mod, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
+
+        exhausted = manager_mod.cmd_check(preserve_low_active=True, preserved_low_accounts=preserved)
+
+        assert exhausted == []
+        assert preserved == [
+            {
+                "email": "low@example.com",
+                "remaining": 5,
+                "quota": account["last_quota"],
+            }
+        ]
+        assert updates == []
+
+    def test_force_auth_repair_ignores_cooldown_for_auth_pending(self, monkeypatch):
+        class FakeMailClient:
+            provider_name = "cloudmail"
+
+        calls = []
+        monkeypatch.setattr(manager_mod, "_reconcile_team_members", lambda: {})
+        monkeypatch.setattr(
+            manager_mod,
+            "load_accounts",
+            lambda: [
+                {
+                    "email": "pending@example.com",
+                    "status": "auth_pending",
+                    "password": "",
+                    "auth_file": None,
+                    "mail_provider": "cloudmail",
+                    "auth_retry_count": 2,
+                    "auth_last_error": "auth_code_missing",
+                    "auth_retry_after": 1_700_000_600,
+                    "auth_retry_paused": False,
+                }
+            ],
+        )
+        monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
+        monkeypatch.setattr(manager_mod, "_is_main_account_email", lambda _email: False)
+        monkeypatch.setattr(manager_mod, "get_mail_domain", lambda: "@example.com")
+        monkeypatch.setattr(manager_mod, "_get_account_mail_client", lambda _acc: FakeMailClient())
+        monkeypatch.setattr(manager_mod, "_ensure_account_ipv6_proxy", lambda _email: ("", ""))
+        monkeypatch.setattr(manager_mod, "is_token_pair_invalidated", lambda _auth_file: False)
+        monkeypatch.setattr(manager_mod, "update_account", lambda *args, **kwargs: None)
+        monkeypatch.setattr(manager_mod, "_record_auth_repair_failure", lambda *args, **kwargs: {})
+
+        def fake_login(email, password, mail_client=None):
+            calls.append((email, password, mail_client.provider_name))
+            return {
+                "ok": False,
+                "bundle": None,
+                "error_type": "auth_code_missing",
+                "error_detail": "未获取到 auth code",
+                "retryable": True,
+            }
+
+        monkeypatch.setattr(manager_mod, "_login_codex_with_result", fake_login)
+
+        manager_mod.cmd_check(force_auth_repair=True)
+
+        assert calls == [("pending@example.com", "", "cloudmail")]
 
 
 # ===========================================================================
@@ -502,6 +677,104 @@ class TestRecordAuthRepairFailure:
         assert result["auth_retry_paused"] is True
         assert result["release_attempted"] is True
         assert result["status"] == accounts_mod.STATUS_STANDBY
+        acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
+        assert acc["disabled"] is True
+        assert acc["reuse_disabled"] is True
+        assert acc["retired_reason"] == "auth_repair_failed:add_phone"
+
+    def test_repeated_email_verification_releases_and_disables(
+        self, seeded_account, monkeypatch
+    ):
+        """email_verification exhausts retry budget → release seat and disable reuse."""
+        monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
+        monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
+        accounts_mod.update_account(
+            seeded_account,
+            auth_retry_count=2,
+            auth_last_error="email_verification",
+        )
+        monkeypatch.setattr(manager_mod, "_auth_repair_retry_delays", lambda: (120, 240, 360))
+        monkeypatch.setattr(manager_mod, "_release_auth_repair_team_seat", lambda email, **kw: "removed")
+
+        result = manager_mod._record_auth_repair_failure(
+            seeded_account,
+            error_type="email_verification",
+            error_detail="卡在邮箱验证码页",
+        )
+
+        assert result["auth_retry_count"] == 3
+        assert result["auth_retry_paused"] is True
+        assert result["auth_retry_after"] is None
+        assert result["release_attempted"] is True
+        assert result["seat_released"] is True
+        assert result["status"] == accounts_mod.STATUS_STANDBY
+        acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
+        assert acc["disabled"] is True
+        assert acc["reuse_disabled"] is True
+        assert acc["retired_at"] == 1_700_000_000
+        assert acc["retired_reason"] == "auth_repair_failed:email_verification"
+
+    def test_login_state_lost_releases_missing_auth_and_disables(
+        self, seeded_account, monkeypatch
+    ):
+        """login_state_lost without local auth is a Team blocker when skip-reuse is enabled."""
+        monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
+        monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
+        monkeypatch.setattr(manager_mod, "_release_auth_repair_team_seat", lambda email, **kw: "removed")
+
+        result = manager_mod._record_auth_repair_failure(
+            seeded_account,
+            error_type="login_state_lost",
+            error_detail="登录态丢失",
+        )
+
+        assert result["auth_retry_count"] == 1
+        assert result["auth_retry_paused"] is True
+        assert result["auth_retry_after"] is None
+        assert result["release_attempted"] is True
+        assert result["seat_released"] is True
+        assert result["protected_local_credential"] is False
+        assert result["status"] == accounts_mod.STATUS_STANDBY
+        acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
+        assert acc["disabled"] is True
+        assert acc["retired_reason"] == "auth_repair_failed:login_state_lost"
+
+    def test_login_state_lost_preserves_protected_local_credential(
+        self, isolated_accounts, tmp_path, monkeypatch
+    ):
+        """login_state_lost must not release a manually protected local auth file."""
+        auth_file = tmp_path / "manual-seat.json"
+        auth_file.write_text("{}", encoding="utf-8")
+        accounts_mod.add_account("manual@example.com", "pwd")
+        accounts_mod.update_account(
+            "manual@example.com",
+            status=accounts_mod.STATUS_AUTH_INVALID,
+            auth_file=str(auth_file),
+            protect_team_seat=True,
+        )
+        monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
+        monkeypatch.setattr(
+            manager_mod,
+            "_release_auth_repair_team_seat",
+            lambda email, **kw: (_ for _ in ()).throw(AssertionError("protected seat should not be released")),
+        )
+
+        result = manager_mod._record_auth_repair_failure(
+            "manual@example.com",
+            error_type="login_state_lost",
+            error_detail="login state lost",
+        )
+
+        assert result["auth_retry_count"] == 1
+        assert result["auth_retry_paused"] is True
+        assert result["auth_retry_after"] is None
+        assert result["release_attempted"] is False
+        assert result["seat_released"] is False
+        assert result["protected_local_credential"] is True
+        assert result["status"] == accounts_mod.STATUS_AUTH_INVALID
+        acc = accounts_mod.find_account(accounts_mod.load_accounts(), "manual@example.com")
+        assert acc["disabled"] is False
+        assert acc.get("retired_reason") is None
 
     def test_failure_when_not_in_team_lands_standby(
         self, seeded_account, monkeypatch

@@ -32,13 +32,21 @@ from autoteam.mail.base import (
 logger = logging.getLogger(__name__)
 
 
+def normalize_cloudflare_temp_email_base_url(value: str | None) -> str:
+    """Normalize a cf_temp_email base URL without changing the provider package shape."""
+    base_url = (value or "").strip().rstrip("/")
+    if base_url.lower().endswith("/admin"):
+        base_url = base_url[:-6].rstrip("/")
+    return base_url
+
+
 class CfTempEmailClient(MailProvider):
     """dreamhunter2333/cloudflare_temp_email 后端客户端。"""
 
     provider_name = "CloudMail"
 
     def __init__(self):
-        self.base_url = (CLOUDMAIL_BASE_URL or "").rstrip("/")
+        self.base_url = normalize_cloudflare_temp_email_base_url(CLOUDMAIL_BASE_URL)
         self.admin_password = CLOUDMAIL_PASSWORD
         self.session = requests.Session()
         # 占位符,为兼容旧代码 `self.token`

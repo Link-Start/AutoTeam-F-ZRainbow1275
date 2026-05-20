@@ -40,6 +40,7 @@
 - `CHATGPT_API_TRANSPORT` defaults to `auto` for Team backend API reads, matching `D:\Desktop\autoteam-1\AutoTeam`; free registration and Personal OAuth still require a real browser context and must not rely on HTTP-only transport.
 - Direct free-registration setup may use Team backend HTTP transport only before the protected browser/OAuth boundary. The registration page, Team kick, Personal OAuth, about-you, and plan validation path must remain browser-backed or explicitly `require_browser=True`.
 - Direct registration must extract the ChatGPT session token before cleanup on the success path, then pass that token plus the same `SignupProfile` into `_run_post_register_oauth(..., leave_workspace=True)`.
+- Legacy `autoteam.cloudflare_temp_email` imports may remain available as a compatibility facade, but the source of truth stays in `autoteam.mail.cf_temp_email`. AI-extract metadata on mail payloads should be preferred before falling back to subject/body parsing.
 
 ### 4. Validation & Error Matrix
 
@@ -84,6 +85,7 @@
   - `tests/unit/test_round11_session_token_injection.py`
   - `tests/unit/test_round12_s4_register_dual_path.py`
   - `tests/unit/test_manager_fill.py`
+  - `tests/unit/test_cloudmail.py`
 
 ### 7. Wrong vs Correct
 
@@ -125,6 +127,10 @@ Keep the API entrypoint and manager entrypoint aligned so unsafe fill-personal w
 - `create_account_direct(..., parallel=None)`.
 - `create_new_account(..., parallel=None)`.
 - `cmd_fill(..., direct_parallel=None)`.
+- `_wait_for_direct_code_target(page, timeout=_DIRECT_CODE_RENDER_TIMEOUT) -> dict`.
+- `_submit_direct_verification_code(page, code_target, verification_code) -> str`.
+- `_wait_for_invite_code_target(page, timeout=INVITE_CODE_RENDER_TIMEOUT) -> dict`.
+- `_submit_invite_verification_code(page, code_target, verification_code) -> str`.
 - `_validate_managed_account_operational(email, *, threshold: int, stage_label="[轮转验收]", chatgpt_api=None) -> bool`.
 
 ### 3. Contracts
@@ -133,6 +139,15 @@ Keep the API entrypoint and manager entrypoint aligned so unsafe fill-personal w
 - Direct signup race must run independent signup-only workers. Only the winner is persisted with `add_account()` and passed into `_run_post_register_oauth()`.
 - Loser workers that successfully reached Team must be removed from Team, have their temporary mailbox discarded, and have account-scoped IPv6 proxy state released.
 - The same `SignupProfile` used by a winning signup worker must be passed into post-registration OAuth.
+- `SignupProfile`'s public shape is the current immutable mapping snapshot:
+  `SignupProfile(full_name, birthday, age=...)`. Do not add the target repo's
+  older positional `SignupProfile("Name", year, month, day, age)` constructor
+  back into current code just to satisfy target-only test shape; it weakens the
+  immutable birthday contract and obscures browser-form string fields.
+- Direct and invite email-verification pages must support both delayed
+  single-character split inputs and ordinary single code inputs. Wait helpers
+  should return structured modes (`split`, `single`, `advanced`, `timeout`) so
+  callers can distinguish "input not rendered yet" from "page already advanced".
 - `cmd_fill(..., direct_parallel=N)` must pass `N` into `create_new_account(..., parallel=N)`. Multi-master worker budgets must not remain display-only metadata.
 - New managed children created by fill/rotate must pass remote member presence, local auth file, and Codex quota checks before counting as filled.
 - If a new child fails validation, release the remote Team seat and mark the local row back to standby with a diagnostic reason.
@@ -148,6 +163,8 @@ Keep the API entrypoint and manager entrypoint aligned so unsafe fill-personal w
 | Browser process count exceeds max live threshold | Downgrade direct signup race to `1` |
 | A race worker fails registration | Clean up its temporary mailbox through the existing failure path |
 | A non-winning race worker succeeds | Remove it from Team, delete its mailbox, and release its proxy |
+| Email verification renders six one-character inputs after a delay | Wait until the split inputs are visible/editable, fill one character per input, then wait for the step to advance |
+| Invite verification remains on a code URL but no code input appears | Log `code_input_timeout` with URL, step, page excerpt, and visible input summary, then stop that registration attempt |
 | Winning child lacks local auth file | Do not count it as filled; release/mark standby |
 | Winning child is absent from remote Team member list | Do not count it as filled; release/mark standby |
 | Winning child quota is below threshold or auth fails | Do not count it as filled; release/mark standby |
@@ -168,6 +185,10 @@ Keep the API entrypoint and manager entrypoint aligned so unsafe fill-personal w
 - `tests/unit/test_free_registration_hardening.py`
   - direct signup race starts multiple signup workers and persists only the winner.
   - high memory or high browser-live runtime snapshots downgrade parallel to `1`.
+- `tests/unit/test_workspace_oauth_parity.py`
+  - delayed split-code helpers return a `split` target for direct and invite flows.
+  - direct split-code submit fills one character per input and waits for the page
+    step to advance.
 - `tests/unit/test_multi_master.py`
   - owner worker passes `direct_parallel` into `cmd_fill`.
 - `tests/unit/test_manager_fill.py`
