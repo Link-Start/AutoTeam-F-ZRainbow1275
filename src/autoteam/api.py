@@ -948,6 +948,14 @@ def _log_task_runtime_validation(command: str) -> dict | None:
         if quota_ok < pool_target:
             followup_reasons.append(f"quota_ok={quota_ok}/{pool_target}")
 
+        cpa_credential_gate = _collect_cpa_credential_gate()
+        if cpa_credential_gate.get("enabled"):
+            validation["cpa_credential_gate"] = cpa_credential_gate
+            validation["provider_auth_available"] = cpa_credential_gate.get("available")
+            if _cpa_provider_auth_below_pool_target(cpa_credential_gate, pool_target):
+                available = int(cpa_credential_gate.get("available") or 0)
+                followup_reasons.append(f"provider_auth_available={available}/{pool_target}")
+
         if hard_reasons:
             validation.update(
                 {
@@ -3819,6 +3827,35 @@ def _run_playwright_probe(*args: str, timeout_seconds: float = 30) -> dict:
     return _parse_playwright_probe_stdout(stdout) if stdout else {}
 
 
+class _TeamMemberCount(int):
+    def __new__(cls, count: int, *, invites: int = 0, occupancy: int | None = None):
+        obj = int.__new__(cls, count)
+        obj.invites = max(0, int(invites or 0))
+        obj.occupancy = int(occupancy) if occupancy is not None else int(count) + obj.invites
+        return obj
+
+
+def _team_member_invite_count(team_count) -> int:
+    try:
+        return max(0, int(getattr(team_count, "invites", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _team_member_occupancy(team_count) -> int:
+    try:
+        count = int(team_count)
+    except (TypeError, ValueError):
+        return -1
+    if count < 0:
+        return -1
+    try:
+        occupancy = int(team_count.occupancy)
+    except (AttributeError, TypeError, ValueError):
+        occupancy = count + _team_member_invite_count(team_count)
+    return max(count, occupancy)
+
+
 def _auto_check_team_member_count(timeout_seconds: float = 30, retries: int = 2) -> int:
     """Return Team member count via a killable subprocess probe; -1 means unknown."""
 
@@ -3841,7 +3878,10 @@ def _auto_check_team_member_count(timeout_seconds: float = 30, retries: int = 2)
             return -1
 
         try:
-            return int(result.get("count", -1))
+            count = int(result.get("count", -1))
+            invites = int(result.get("invites", 0) or 0)
+            occupancy = int(result.get("occupancy", count + invites if count >= 0 else -1))
+            return _TeamMemberCount(count, invites=invites, occupancy=occupancy)
         except Exception:
             return -1
 
@@ -3921,8 +3961,21 @@ def _collect_cpa_credential_gate() -> dict:
         "available": available,
         "total": total,
         "reason": reason,
-        "zero_available": management_ok and available <= 0,
+        "zero_available": safe_read_only and management_ok and available <= 0,
     }
+
+
+def _cpa_provider_auth_below_pool_target(gate: dict | None, pool_target: int) -> bool:
+    if not isinstance(gate, dict):
+        return False
+    if not gate.get("enabled") or not gate.get("safe_read_only") or not gate.get("management_ok"):
+        return False
+    try:
+        available = int(gate.get("available"))
+        target = max(1, int(pool_target))
+    except (TypeError, ValueError):
+        return False
+    return available < target
 
 
 def _auto_check_loop():
@@ -3991,6 +4044,43 @@ def _auto_check_loop():
                     cpa_credential_gate.get("safe_read_only"),
                 )
 
+            provider_auth_below_target = _cpa_provider_auth_below_pool_target(cpa_credential_gate, sub_account_target)
+            actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
+            actual_invite_count = _team_member_invite_count(actual_team_count)
+            actual_team_occupancy = _team_member_occupancy(actual_team_count)
+
+            if actual_team_occupancy > target_seats:
+                if not _playwright_lock.acquire(blocking=False):
+                    logger.info("[巡检] Team 远端占用超出目标，但有任务在跑，本轮跳过自动清理")
+                    continue
+                _playwright_lock.release()
+
+                logger.warning(
+                    "[巡检] Team 远端占用超出目标: members=%d invites=%d total=%d/%d，触发自动清理",
+                    int(actual_team_count),
+                    actual_invite_count,
+                    actual_team_occupancy,
+                    target_seats,
+                )
+                from autoteam.manager import cmd_cleanup
+
+                try:
+                    _start_task(
+                        "auto-cleanup",
+                        cmd_cleanup,
+                        {
+                            "max_seats": target_seats,
+                            "trigger": "auto-check",
+                            "team_count": int(actual_team_count),
+                            "invite_count": actual_invite_count,
+                            "team_occupancy": actual_team_occupancy,
+                        },
+                        target_seats,
+                    )
+                except Exception as e:
+                    logger.error("[巡检] 自动清理失败: %s", e)
+                continue
+
             # Watchdog:active 账号数 < 子号目标时自动补位。
             # 之前的 `if not active: continue` 在 active 全 kick 进 standby
             # 之后会让 Team 永远萎缩。但触发频率必须节制 —— OpenAI 对短时间内反复
@@ -4011,7 +4101,6 @@ def _auto_check_loop():
                     # 冷却期内仍然继续做"低额度替换"(下面的 low_accounts 逻辑),
                     # 只是不触发全量 cmd_rotate。例外:Team 真实人数不足时必须继续补位,
                     # 否则 cooldown 会把实际席位缺口拖到下一轮甚至 4h backoff 之后。
-                    actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
                     if actual_team_count >= target_seats:
                         if replaceable_blockers:
                             logger.warning(
@@ -4028,6 +4117,16 @@ def _auto_check_loop():
                                 len(active),
                                 sub_account_target,
                                 cpa_credential_gate.get("total"),
+                            )
+                            should_start_auto_fill = True
+                        elif provider_auth_below_target:
+                            logger.warning(
+                                "[巡检] auto-fill 冷却中但 CPA/CLIProxy provider-auth 可用凭证低水位: "
+                                "available=%s/%d local_active=%d/%d，继续补位/同步",
+                                cpa_credential_gate.get("available"),
+                                sub_account_target,
+                                len(active),
+                                sub_account_target,
                             )
                             should_start_auto_fill = True
                         else:
@@ -4081,7 +4180,6 @@ def _auto_check_loop():
                     if backoff_triggered:
                         continue
 
-                    actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
                     if actual_team_count >= target_seats:
                         if replaceable_blockers:
                             logger.warning(
@@ -4098,6 +4196,15 @@ def _auto_check_loop():
                                 len(active),
                                 sub_account_target,
                                 cpa_credential_gate.get("total"),
+                            )
+                        elif provider_auth_below_target:
+                            logger.warning(
+                                "[巡检] Team 已满且 CPA/CLIProxy provider-auth 可用凭证低水位: "
+                                "available=%s/%d local_active=%d/%d，触发 auto-fill 补位/同步",
+                                cpa_credential_gate.get("available"),
+                                sub_account_target,
+                                len(active),
+                                sub_account_target,
                             )
                         else:
                             logger.info(
@@ -4128,11 +4235,21 @@ def _auto_check_loop():
                     try:
                         task_params = {"target_seats": target_seats}
                         if cpa_credential_gate.get("enabled"):
+                            try:
+                                provider_available = int(cpa_credential_gate.get("available") or 0)
+                            except (TypeError, ValueError):
+                                provider_available = 0
                             task_params.update(
                                 {
                                     "trigger": "auto-check",
-                                    "shortage": max(0, sub_account_target - len(active)),
+                                    "shortage": max(
+                                        0,
+                                        sub_account_target - min(len(active), provider_available),
+                                    ),
                                     "cpa_credential_gate": cpa_credential_gate,
+                                    "provider_auth_below_target": provider_auth_below_target,
+                                    "provider_auth_available": cpa_credential_gate.get("available"),
+                                    "provider_auth_target": sub_account_target,
                                 }
                             )
                         _start_task(
@@ -4213,6 +4330,52 @@ def _auto_check_loop():
                     )
                 except Exception as e:
                     logger.error("[巡检] 即时替换启动失败: %s", e)
+            elif provider_auth_below_target and actual_team_count >= target_seats:
+                try:
+                    provider_available = int(cpa_credential_gate.get("available") or 0)
+                except (TypeError, ValueError):
+                    provider_available = 0
+                shortage = max(1, sub_account_target - min(len(active), provider_available))
+
+                if not _playwright_lock.acquire(blocking=False):
+                    logger.info("[巡检] CPA/CLIProxy provider-auth 低水位，但有任务在跑，本轮跳过预防性轮转")
+                    continue
+                _playwright_lock.release()
+
+                logger.warning(
+                    "[巡检] CPA/CLIProxy provider-auth 可用凭证低水位: "
+                    "available=%d/%d local_active=%d/%d; trigger preventive auto-rotate/sync",
+                    provider_available,
+                    sub_account_target,
+                    len(active),
+                    sub_account_target,
+                )
+                from autoteam.manager import cmd_rotate
+
+                try:
+                    _start_task(
+                        "auto-rotate",
+                        cmd_rotate,
+                        {
+                            "target": target_seats,
+                            "trigger": "auto-check",
+                            "shortage": shortage,
+                            "low_accounts": 0,
+                            "cpa_credential_gate": cpa_credential_gate,
+                            "provider_auth_below_target": True,
+                            "provider_auth_available": cpa_credential_gate.get("available"),
+                            "provider_auth_target": sub_account_target,
+                        },
+                        target_seats,
+                        background_post_sync=True,
+                    )
+                except Exception as e:
+                    logger.error("[巡检] provider-auth 低水位自动轮转失败: %s", e)
+            elif provider_auth_below_target:
+                logger.info(
+                    "[巡检] CPA/CLIProxy provider-auth 低水位，但 Team 实际成员数=%s 未满或未知，本轮不做预防性轮转",
+                    actual_team_count if actual_team_count >= 0 else "unknown",
+                )
             else:
                 logger.info("[巡检] 额度正常，无需替换")
 

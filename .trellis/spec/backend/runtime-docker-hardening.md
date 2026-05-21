@@ -29,6 +29,9 @@
 - `_record_task_progress(task: dict, stage: str, now: float | None = None) -> None`
 - `close_playwright_objects(page=None, context=None, browser=None, playwright=None, *, logger=None, label="playwright") -> None`
 - `python -m autoteam.playwright_probe team-member-count`
+- `_TeamMemberCount(int)` with `.invites` and `.occupancy`
+- `_team_member_invite_count(team_count) -> int`
+- `_team_member_occupancy(team_count) -> int`
 - `ChatGPTTeamAPI.start_with_session(session_token, account_id, workspace_name="", require_browser=False)`
 - `ChatGPTTeamAPI.stop() -> None`
 - `MainCodexLoginFlow.complete() -> dict`
@@ -47,6 +50,7 @@
 - `get_chatgpt_http_proxy_url(proxy_url: str | None = None) -> str`
 - `get_cliproxy_health() -> dict[str, Any]`
 - `_collect_cpa_credential_gate() -> dict[str, Any]`
+- `_cpa_provider_auth_below_pool_target(gate: dict | None, pool_target: int) -> bool`
 - `_auth_repair_error_label(error_type: str | None) -> str`
 - `_oauth_retry_delay_seconds(error_type: str | None) -> int`
 - `_login_codex_with_result(email, password, *, mail_client=None, max_attempts=3, signup_profile=None, pre_signed_in_cookies=None, playwright_proxy_url=None) -> dict`
@@ -83,6 +87,9 @@
 - `/api/status` may include `runtime_resources`, but resource collection must never block or fail the status response.
 - `/api/status?fast=true` is the polling-safe status path. It must skip live Codex quota checks, keep the ordinary account/status summary shape, use a bounded CLIProxy health read, and return `status_mode.fast=true` with `live_quota=false`.
 - Background Team member count probes must run in a killable subprocess and return unknown (`-1`) on timeout/failure.
+- `python -m autoteam.playwright_probe team-member-count` must return `count`, `invites`, and `occupancy=count+invites` when Team state is readable. `_auto_check_team_member_count()` must preserve `int` compatibility while carrying invite/occupancy metadata through `_TeamMemberCount`.
+- Auto-check must treat pending Team invites as remote seat occupancy. If `members + invites > target_seats`, it should trigger `auto-cleanup` with diagnostic params `team_count`, `invite_count`, and `team_occupancy`; it must not treat unknown pending invites as safe-delete evidence.
+- Auto-check remains a single-main flow: `target_seats` is the total Team cap for one owner/main plus managed children, and provider-auth low-watermark targets only the managed-child pool (`target_seats - 1`). This contract must not enable or depend on multi-owner scheduling.
 - `ChatGPTTeamAPI.start_with_session()` must call `stop()` if the browser fallback path fails after partial initialization, not only when `_launch_browser()` itself fails.
 - `ChatGPTTeamAPI.start_with_session()` must also call `stop()` when HTTP transport startup succeeds but later workspace detection or admin-state persistence fails.
 - Direct HTTP API fetches must close and clear the bad `http_transport` before browser fallback when the transport raises, returns HTML/challenge, or fails again after a 401-triggered token refresh retry.
@@ -127,7 +134,10 @@
 - `/api/status` may include `cliproxy` and `rotation_validation`. These fields are additive and must not remove or rename existing status fields.
 - `cliproxy` health must stay read-only. It may read CLIProxyAPI management metadata (`/v0/management/auth-files`) and provider availability counts, but must never call sync/upload/delete/refresh endpoints.
 - Auto-check may use CLIProxyAPI provider-auth metadata only as a read-only CPA credential gate. The gate is enabled only when CPA sync is configured/enabled, must call `get_cliproxy_health(..., force_refresh=True)` without sync/upload/delete side effects, and may treat provider auth as zero only when `management_ok=true` and `available <= 0`.
+- Provider-auth low-watermark is a proactive signal, not only a zero-credential signal. When the gate is enabled, `safe_read_only=true`, `management_ok=true`, and `provider_auth.available < pool_active_target`, auto-check may trigger `auto-rotate` / sync with params `provider_auth_below_target`, `provider_auth_available`, and `provider_auth_target`; post-task runtime validation should degrade with `provider_auth_available=<available>/<target>`.
 - When Team is full but local active child count is below the target and the CPA credential gate reports zero available credentials, auto-check may trigger the normal `auto-fill` / `cmd_rotate(..., background_post_sync=True)` path. This is a replacement/fill decision, not a remote CPA mutation.
+- `zero_available` and provider-auth low-watermark must require `safe_read_only=true`. A management failure, malformed response, or non-read-only health check is unknown and must not trigger replacement.
+- Remote capacity preflight for direct registration may use `members+invites` only after `ChatGPTTeamAPI` is actually ready. Dynamic mock/duck attributes must not be allowed to spoof readiness; if `start()` returns without a ready browser/http transport, skip the remote preflight rather than calling Team APIs on an unusable session.
 - `rotation_validation` must distinguish `ok`, `degraded`, and hard `failed` results. Hard post-task validation failure may convert a superficially completed mutation task into `failed`; degraded results keep operation success visible and expose cooldown/follow-up metadata.
 - `sync_to_cpa()` must refresh `proxy_url` in auth JSON for active/personal, non-disabled local accounts before upload. In required mode refresh failure must fail the sync; in non-required mode it may warn and upload the existing file.
 
@@ -143,6 +153,8 @@
 | `_launch_browser()` partially initializes then fails | Call `stop()` and re-raise the original exception |
 | `start_with_session(..., require_browser=True)` or browser fallback starts Playwright then fails during navigation/token/workspace setup | Call `stop()` and re-raise the original exception |
 | probe subprocess timeout | Kill the process group/tree and treat count as unknown |
+| Team probe returns members and pending invites | Preserve `count`, `invites`, and `occupancy`; use occupancy for over-target cleanup |
+| Team probe returns `count=3, invites=1, occupancy=4` for target 3 | Trigger `auto-cleanup` and include `invite_count=1`, `team_occupancy=4` in task params |
 | `curl_cffi` missing or transport init fails | Return `None`; continue with Playwright |
 | transport returns HTML/challenge/401 token missing | Fall back to Playwright API fetch |
 | `ChatGPTTeamAPI.start()` succeeds via HTTP transport only | Cleanup and reuse checks must use `is_started()` / `_chatgpt_session_ready()`, not `browser` alone |
@@ -167,7 +179,10 @@
 | CLIProxyAPI auth-file payload is malformed | Return provider/management diagnostic fields; do not treat it as an empty healthy provider set |
 | CPA sync target is disabled | `_collect_cpa_credential_gate()` returns `enabled=false`; auto-check behavior is unchanged |
 | CPA sync target is enabled and CLIProxyAPI management reports `available=0` with `management_ok=true` | Gate returns `zero_available=true`; a full Team with too few local active children may trigger `auto-fill` |
+| CPA sync target is enabled and CLIProxyAPI management reports `available=1` while `pool_active_target=2` | Gate remains non-zero but below target; auto-check may trigger preventive `auto-rotate` / sync and runtime validation degrades |
 | CLIProxyAPI management check fails | Gate returns `management_ok=false`, `zero_available=false`; do not interpret this as no credentials |
+| CLIProxyAPI health is not confirmed read-only | Do not treat `available=0` or below-target as actionable rotation evidence |
+| `ChatGPTTeamAPI.start()` returns but no browser/http transport is ready | Do not fetch Team members/invites; keep direct registration fallback behavior |
 | post-task remote sync fails after API-driven rotate | Log a warning, keep the local rotation result, and leave task completion unblocked |
 | post-task runtime validation is degraded | Keep the task completed, record reasons and cooldown/follow-up metadata |
 | post-task runtime validation is a hard failure | Convert the task to `failed` with a business reason |
@@ -220,6 +235,11 @@
   - Auto-check skips expensive probes while a task is active.
   - Full Team + local active shortage + `management_ok=true` + `available=0` triggers `auto-fill` without sync/upload/delete.
   - Management failure with `available=0` does not trigger replacement.
+  - Provider-auth `available < pool_active_target` triggers preventive `auto-rotate` / sync with provider-auth task params.
+  - Runtime validation degrades when provider-auth is below target.
+  - Non-read-only CLIProxy health does not produce `zero_available` or below-target action.
+  - Pending invites count toward remote occupancy and over-target occupancy triggers `auto-cleanup`.
+  - `_auto_check_team_member_count()` preserves `int` compatibility while carrying invite/occupancy metadata.
 - Rotate deferred post-sync and validation plumbing: `tests/unit/test_manager_rotate.py` and `tests/unit/test_api_status.py`
 - IPv6 pool/proxy persistence and strict required-mode behavior: `tests/unit/test_ipv6_pool.py`
 - IPv6 status and status-failure boundary: `tests/unit/test_api_status.py`

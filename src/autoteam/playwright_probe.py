@@ -15,13 +15,16 @@ logging.basicConfig(level=logging.WARNING)
 
 
 def _probe_team_member_count() -> dict[str, int]:
+    from autoteam.account_ops import fetch_team_state
     from autoteam.chatgpt_api import ChatGPTTeamAPI
-    from autoteam.manager import get_team_member_count
 
     chatgpt = ChatGPTTeamAPI()
     try:
         chatgpt.start()
-        return {"count": int(get_team_member_count(chatgpt))}
+        members, invites = fetch_team_state(chatgpt)
+        count = len(members)
+        invite_count = len(invites)
+        return {"count": count, "invites": invite_count, "occupancy": count + invite_count}
     finally:
         chatgpt.stop()
 

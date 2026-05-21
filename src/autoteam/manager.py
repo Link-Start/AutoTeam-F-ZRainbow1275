@@ -275,12 +275,7 @@ def _chatgpt_session_ready(chatgpt_api) -> bool:
     """
     if not chatgpt_api:
         return False
-    is_started = getattr(chatgpt_api, "is_started", None)
-    if callable(is_started):
-        try:
-            return bool(is_started())
-        except Exception:
-            pass
+
     def _declared_attr(name: str):
         # Avoid MagicMock/duck objects becoming "ready" via dynamic __getattr__.
         try:
@@ -292,6 +287,13 @@ def _chatgpt_session_ready(chatgpt_api) -> bool:
         if hasattr(type(chatgpt_api), name):
             return getattr(chatgpt_api, name, None)
         return None
+
+    is_started = _declared_attr("is_started")
+    if callable(is_started):
+        try:
+            return bool(is_started())
+        except Exception:
+            pass
 
     return bool(_declared_attr("browser") or _declared_attr("http_transport"))
 
@@ -2935,6 +2937,9 @@ def _prepare_remote_capacity_for_new_seat(chatgpt_api, *, stage_label: str = "[�
         return True
     if not _chatgpt_session_ready(chatgpt_api):
         chatgpt_api.start()
+    if not _chatgpt_session_ready(chatgpt_api):
+        logger.warning("%s 无可用 Team API session，跳过远端席位预检", stage_label)
+        return True
     if _has_remote_capacity_for_new_seat(chatgpt_api, stage_label=stage_label):
         return True
     _cancel_stale_pending_invites_for_capacity(chatgpt_api, stage_label=stage_label)
