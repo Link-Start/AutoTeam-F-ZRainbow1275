@@ -37,6 +37,7 @@
 - `SignupProfile` must be a single immutable snapshot passed through registration and OAuth. Its nested `birthday` mapping must reject in-place mutation and must be defensively copied from constructor input. Generated birthday and age must also be self-consistent.
 - Registration, direct registration, Team OAuth, and Personal OAuth must not use hardcoded fallback identities such as `User`, `1995-06-15`, or age `25` when a `SignupProfile` is available.
 - OAuth about-you must consume the same `SignupProfile`, try the profile's supported birthday field orders, and return failure if the page still remains on about-you after all supported orders. The caller must treat that failure as `bundle=None` so the existing retry/failure-classification policy can handle it.
+- Team registration is successful only after Codex OAuth returns a ready credential bundle and `_run_post_register_oauth(...)` persists an active credential state. A Team-joined account with `bundle=None` must be marked `STATUS_AUTH_INVALID`, have the Team seat kicked/released through the existing failure path, record `team_auth_missing`, and return `None` to callers so fill/rotate/direct registration do not count it as usable.
 - `CHATGPT_API_TRANSPORT` defaults to `auto` for Team backend API reads, matching `D:\Desktop\autoteam-1\AutoTeam`; free registration and Personal OAuth still require a real browser context and must not rely on HTTP-only transport.
 - Direct free-registration setup may use Team backend HTTP transport only before the protected browser/OAuth boundary. The registration page, Team kick, Personal OAuth, about-you, and plan validation path must remain browser-backed or explicitly `require_browser=True`.
 - Direct registration must extract the ChatGPT session token before cleanup on the success path, then pass that token plus the same `SignupProfile` into `_run_post_register_oauth(..., leave_workspace=True)`.
@@ -55,6 +56,7 @@
 | OAuth about-you stays on profile page after all supported orders | return `None`/failure to the caller; do not continue into consent loop as if profile succeeded |
 | Personal OAuth gets `plan_type != "free"` or no bundle | retry up to the existing 5-attempt policy, then record plan drift and fail fast |
 | `remove_from_team` fails before Personal OAuth | mark/keep safe local state, record `kick_failed`, and do not run Personal OAuth |
+| Team post-registration OAuth returns no bundle | mark `STATUS_AUTH_INVALID`, kick/release the Team seat, record `team_auth_missing`, return `None`, and do not count the account as produced |
 | `RegisterBlocked` phone/add-phone | terminal failure, record category, delete or quarantine according to existing manager logic |
 | direct registration page/navigation fails before a normal result | release Playwright page/context/browser and return/raise through the existing retry classifier without losing the local `SignupProfile` contract |
 
@@ -77,6 +79,11 @@
   - assert OAuth about-you consumes the provided `SignupProfile`
   - assert OAuth about-you retries birthday orders and reports failure if no order exits the profile page
   - assert direct registration passes the same `SignupProfile` into `_run_post_register_oauth()`
+  - assert direct registration returns `None` and releases the account proxy when post-registration OAuth is not credential-ready
+- Team OAuth bundle-missing regression:
+  - `tests/unit/test_round11_oauth_failure_backoff.py`
+  - `tests/unit/test_round11_oauth_failure_kick_ws.py`
+  - assert Team `bundle=None` keeps `STATUS_AUTH_INVALID` / `team_auth_missing` diagnostics but returns `None`
 - API preflight:
   - `tests/unit/test_free_registration_hardening.py`
   - assert `auth_invalid` contributes to Team-seat hard-cap rejection
