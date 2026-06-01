@@ -1,0 +1,9 @@
+{"file": ".trellis/tasks/06-01-master-cancel-register-storm/research/master-health-fp.md", "reason": "R1 根因:_classify_l1 单字段误判→三字段 AND 判定,含 file:line、夹具、不变量 M-I18"}
+{"file": ".trellis/tasks/06-01-master-cancel-register-storm/research/oauth-codex.md", "reason": "R2/R6:prompt=consent→login 回归对齐 autoteam-1 + consent loop 自恢复/ session bundle fallback 移植清单"}
+{"file": ".trellis/tasks/06-01-master-cancel-register-storm/research/register-storm-gate.md", "reason": "R3:create_account_direct(5417)/_cmd_fill_personal(7400)/_replace_single(6000) 前置 cache-only 双闸,含伪代码与契约"}
+{"file": ".trellis/tasks/06-01-master-cancel-register-storm/research/retry-delay.md", "reason": "R4/R5:_call_login 不吞 RegisterBlocked + 退避 24h 封顶 + interval 入口防爆,含分支决策与边界测试点"}
+{"file": "prompts/0426/spec/shared/master-subscription-health.md", "reason": "R1 master_health 既有契约/不变量(M-I3/M-I7),三字段判定需对齐并 append M-I18"}
+{"file": ".trellis/spec/backend/free-registration-hardening.md", "reason": "R3/R4 注册流程硬化既有约定(failure 分类、outcome 透传)"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "R4 RegisterBlocked→error_type 映射与异常处理风格"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "R4 中文标签(手机号验证 vs 登录异常)+ 闸日志风格"}
+{"file": ".trellis/spec/backend/index.md", "reason": "backend Pre-Development Checklist + Quality 基线"}

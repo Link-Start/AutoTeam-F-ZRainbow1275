@@ -86,6 +86,9 @@ def test_grace_period_returns_healthy_subscription_grace(tmp_path):
             "structure": "workspace",
             "current_user_role": "account-owner",
             "eligible_for_auto_reactivation": True,
+            # Round 12(M-I18)— grace/cancelled 仅在"真停用"三字段联合下成立
+            "is_deactivated": True,
+            "has_active_subscription": False,
         },
     ])
 
@@ -117,6 +120,9 @@ def test_grace_expired_falls_back_subscription_cancelled(tmp_path):
             "structure": "workspace",
             "current_user_role": "account-owner",
             "eligible_for_auto_reactivation": True,
+            # Round 12(M-I18)— grace/cancelled 仅在"真停用"三字段联合下成立
+            "is_deactivated": True,
+            "has_active_subscription": False,
         },
     ])
 
@@ -139,6 +145,9 @@ def test_no_admin_id_token_falls_back_subscription_cancelled(tmp_path):
             "structure": "workspace",
             "current_user_role": "account-owner",
             "eligible_for_auto_reactivation": True,
+            # Round 12(M-I18)— grace/cancelled 仅在"真停用"三字段联合下成立
+            "is_deactivated": True,
+            "has_active_subscription": False,
         },
     ])
 
@@ -195,6 +204,9 @@ def test_m_i3_guard_allows_subscription_grace_in_cache(tmp_path):
             "structure": "workspace",
             "current_user_role": "account-owner",
             "eligible_for_auto_reactivation": True,
+            # Round 12(M-I18)— grace/cancelled 仅在"真停用"三字段联合下成立
+            "is_deactivated": True,
+            "has_active_subscription": False,
         },
     ])
     # 第一次:实测,写 cache
@@ -384,6 +396,9 @@ def test_classify_l1_grace_via_chatgpt_api_access_token(tmp_path):
                 "structure": "workspace",
                 "current_user_role": "account-owner",
                 "eligible_for_auto_reactivation": True,
+                # Round 12(M-I18)— grace/cancelled 仅在"真停用"三字段联合下成立
+                "is_deactivated": True,
+                "has_active_subscription": False,
             },
         ],
         access_token=web_jwt,
@@ -503,6 +518,9 @@ def test_classify_l1_grace_via_plan_type_fallback_when_grace_until_missing(tmp_p
                 "structure": "workspace",
                 "current_user_role": "account-owner",
                 "eligible_for_auto_reactivation": True,
+                # Round 12(M-I18)— grace/cancelled 仅在"真停用"三字段联合下成立
+                "is_deactivated": True,
+                "has_active_subscription": False,
             },
         ],
         access_token=web_jwt,
@@ -545,6 +563,9 @@ def test_classify_l1_cancelled_when_plan_type_free_fallback(tmp_path):
                 "structure": "workspace",
                 "current_user_role": "account-owner",
                 "eligible_for_auto_reactivation": True,
+                # Round 12(M-I18)— grace/cancelled 仅在"真停用"三字段联合下成立
+                "is_deactivated": True,
+                "has_active_subscription": False,
             },
         ],
         access_token=web_jwt,

@@ -339,6 +339,8 @@ if not healthy:
 - **M-I8**:M-T1 / M-T2 触发位点的 `record_failure` 必须使用 category=`master_subscription_degraded`(spec-2 v1.5 register_failures schema 新增枚举);`stage` 必须明确 OAuth 分支(team/personal),便于日后按分支统计命中率
 - **M-I9**:reason=`subscription_cancelled` 是**唯一**触发 fail-fast 的分支;其他 5 个 reason 都走"保守放行 + 记录"路径(避免一次抖动让所有 fill 全瘫)
 - **M-I10**:M-T5 reconcile 入口若 master 不健康,**禁止**执行 KICK / state flip 改写动作;只允许 read-only 扫描和日志输出 — 防止误踢真活号
+- **M-I18(Round 12 task 06-01 BREAKING 收紧)**:`reason == "subscription_cancelled"` 要求 `/backend-api/accounts` 目标项**三字段联合**指向真停用:`eligible_for_auto_reactivation is True` **且** `is_deactivated is True` **且** `has_active_subscription is False`;否则(eligible-only / `is_deactivated` 缺失或 False / `has_active_subscription` 非 False)一律判 `active`(healthy=True)。`subscription_grace` 与 hard `subscription_cancelled` 的 JWT 区分(grace_until / chatgpt_plan_type fallback)**仅在三字段判定成立后**执行。**废止 v1.0~v1.4 的"单字段 `eligible_for_auto_reactivation is True` 即 cancelled"** —— 该字段对**健康/活跃**工作区在某些生命周期阶段也会为 true(语义是"符合自动重激活条件",不蕴含"已取消"),且 Round 11 的 JWT grace fallback 在 admin 重登后 token 退化时整体失效(task 06-01 现场误判 → 注册 fail-fast 风暴)。本不变量与 §5.2 FP-A 预留的"补充判定条件"一致。字段缺失时偏向 active(由注册后兜底闸 + plan_drift 接住真降级),与 autoteam-1 无闸基线行为对齐。
+- **M-I19(Round 12 task 06-01)**:admin 重新登录(`api.py` cmd_admin_login 完成)后必须 `master_health.invalidate_cache(account_id)`,因主号 token 刚变、旧 health 判定可能完全失效;把假阳性锁定窗口从 `cache_ttl`(默认 5min)压到 0。`invalidate_cache` 永不抛异常(M-I1 守恒延伸)。
 
 ---
 

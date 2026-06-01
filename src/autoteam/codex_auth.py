@@ -22,7 +22,11 @@ from autoteam.admin_state import (
     get_chatgpt_workspace_name,
 )
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
-from autoteam.config import get_playwright_context_options, get_playwright_launch_options
+from autoteam.config import (
+    get_codex_authorize_prompt,
+    get_playwright_context_options,
+    get_playwright_launch_options,
+)
 from autoteam.invite import (  # SPEC-2 shared/add-phone-detection §3 — OAuth 流程复用
     RegisterBlocked,
     assert_not_blocked,
@@ -292,6 +296,11 @@ def _screenshot(page, name):
 
 
 def _build_auth_url(code_challenge, state):
+    # Round 12 task 06-01 — 对齐 autoteam-1 / CPA 的可用授权链接:
+    # prompt=login + id_token_add_organizations=true + codex_cli_simplified_flow=true。
+    # 实验确认 prompt=consent 会复用刚建会话走到 /add-phone;prompt=login 则强制 /log-in,
+    # 配合已建立的 ChatGPT/IdP 会话即可 SSO 通过、不再命中 add-phone。
+    # prompt 可经 env CODEX_AUTHORIZE_PROMPT 回退到 consent。
     params = {
         "client_id": CODEX_CLIENT_ID,
         "response_type": "code",
@@ -300,7 +309,9 @@ def _build_auth_url(code_challenge, state):
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
-        "prompt": "consent",
+        "prompt": get_codex_authorize_prompt(),
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
     }
     return f"{CODEX_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
@@ -2664,6 +2675,17 @@ def login_codex_via_browser(
             except Exception as exc:
                 logger.warning("[Codex] 导航回 auth_url 失败: %s,consent loop 仍尝试", exc)
 
+        # Round 12 task 06-01(R6)— consent loop 自恢复计数器 + OTP 去重集。
+        # 把已存在但**未接线**的 _recover_oauth_timeout_page / _recover_oauth_no_valid_organizations_page /
+        # _is_oauth_login_challenge_page 接进循环(对齐 autoteam-1):OpenAI 给出软错误页(操作超时 /
+        # no_valid_organizations)或把流程弹回 /log-in 时,站内自恢复各最多 2 次,而非直接断流、白等 callback
+        # (现场 bf7be99f48 即"已确认账号选择 → 32s 后未获取到 auth code")。各 helper 都有页面/URL 守卫,
+        # 不命中即 no-op(行为同现状),命中才挽救瞬时失败。
+        oauth_timeout_recoveries = 0
+        no_valid_org_recoveries = 0
+        login_challenge_recoveries = 0
+        _used_email_ids: set[int] = set()
+
         # 处理多个授权/同意页面（可能有多步）
         for step in range(10):
             if auth_code:
@@ -2674,6 +2696,34 @@ def login_codex_via_browser(
             assert_not_blocked(page, f"oauth_consent_{step}")
 
             _screenshot(page, f"codex_04_step{step + 1}_before.png")
+
+            # Round 12(R6)— 站内自恢复:软错误页 / 登录态丢失 各最多 2 次后才放弃
+            if oauth_timeout_recoveries < 2 and _recover_oauth_timeout_page(page):
+                oauth_timeout_recoveries += 1
+                logger.info("[Codex] OAuth 超时页已站内重试 (%d/2)", oauth_timeout_recoveries)
+                continue
+            if no_valid_org_recoveries < 2 and _recover_oauth_no_valid_organizations_page(page):
+                no_valid_org_recoveries += 1
+                logger.info("[Codex] no_valid_organizations 已站内重试 (%d/2)", no_valid_org_recoveries)
+                continue
+            if login_challenge_recoveries < 2 and _is_oauth_login_challenge_page(page):
+                login_challenge_recoveries += 1
+                logger.info(
+                    "[Codex] OAuth 被弹回 /log-in,重新登录并 replay auth_url (%d/2)",
+                    login_challenge_recoveries,
+                )
+                try:
+                    _complete_oauth_login_challenge(
+                        page, email, password, mail_client, _email_id_before_login, _used_email_ids
+                    )
+                    if _wait_for_oauth_challenge_progress(page, timeout=10):
+                        continue
+                    page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(3)
+                    _screenshot(page, f"codex_04_login_challenge_replay_{login_challenge_recoveries}.png")
+                except Exception as _lc_exc:
+                    logger.warning("[Codex] login challenge 自恢复异常: %s,继续 consent loop", _lc_exc)
+                continue
 
             try:
                 if _is_choose_account_page(page):

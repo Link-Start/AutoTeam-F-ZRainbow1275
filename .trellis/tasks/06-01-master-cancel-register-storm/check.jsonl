@@ -1,0 +1,7 @@
+{"file": ".trellis/tasks/06-01-master-cancel-register-storm/research/master-health-fp.md", "reason": "核验 R1 三字段 AND + 现场夹具 AC1 + admin 重登 cache invalidate"}
+{"file": ".trellis/tasks/06-01-master-cancel-register-storm/research/oauth-codex.md", "reason": "核验 R2 prompt=login + 新参数 AC2;R6 consent loop 自恢复移植完整性"}
+{"file": ".trellis/tasks/06-01-master-cancel-register-storm/research/register-storm-gate.md", "reason": "核验 R3 双闸契约:只拦 subscription_cancelled、默认 cache、保留兜底闸、create_temp_email 未被调用 AC3"}
+{"file": ".trellis/tasks/06-01-master-cancel-register-storm/research/retry-delay.md", "reason": "核验 R4 retryable=False 立即 break AC4 + R5 24h 封顶 AC5"}
+{"file": "prompts/0426/spec/shared/master-subscription-health.md", "reason": "核验 master_health 不变量未被破坏(M-I1/M-I3),新增 M-I18 一致"}
+{"file": ".trellis/spec/backend/index.md", "reason": "backend Quality Check 清单"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "跨层数据流核验(classify→manager 闸→api→前端展示)"}

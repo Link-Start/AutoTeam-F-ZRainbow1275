@@ -226,6 +226,18 @@ def _parse_proxy_url(proxy_url: str):
     return proxy
 
 
+def get_codex_authorize_prompt() -> str:
+    """Codex OAuth authorize 的 prompt 取值(对齐 autoteam-1)。
+
+    默认 `login`(对齐 CPA 的可用授权链接,已验证不再命中 /add-phone);
+    设为 `consent` 可回退到旧行为。Round 12 task 06-01:本地此前硬编码 `consent`,
+    是 add-phone 高发的直接根因 —— 实验确认 prompt=consent 会复用刚建会话走到 /add-phone,
+    prompt=login 则强制 /log-in,配合已建立的 ChatGPT/IdP 会话即可 SSO 通过。
+    """
+    value = _get_str_env("CODEX_AUTHORIZE_PROMPT", "login").lower()
+    return value or "login"
+
+
 def get_chatgpt_api_transport() -> str:
     # Match autoteam-1: Team backend API reads may use HTTP-first transport by default.
     # Browser/OAuth flows must opt out with require_browser=True at the call site.

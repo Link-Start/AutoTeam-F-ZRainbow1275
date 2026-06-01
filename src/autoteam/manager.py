@@ -744,10 +744,28 @@ def _auth_repair_reset_fields() -> dict:
     }
 
 
+# Round 12 task 06-01(R5/BUG#2)— 自动修复退避的全局硬上限。
+# 现场出现"约 360018 分钟后重试"(≈250 天):退避 = interval × 倍数 / 2^idx,而 interval 来自
+# 可被 UI/env 写入的 `_auto_check_config["interval"]`,既无 ceiling 也无入口校验,一旦被脏值污染
+# (或 add_phone_max_retries 调大)delay 直接爆。封顶 24h:超过 24h 的"自动修复冷却"等价于放弃,
+# 运维应直接看 paused 状态,而非看到一个 250 天的荒谬倒计时。
+_AUTH_RETRY_DELAY_MAX_SECONDS = 24 * 3600
+
+
+def _clamp_retry_delay(seconds) -> int:
+    """把单档 retry 延迟夹到 [60s, 24h];非法/超大值都被收敛(R5)。"""
+    try:
+        secs = int(seconds)
+    except (TypeError, ValueError):
+        secs = 60
+    return max(60, min(secs, _AUTH_RETRY_DELAY_MAX_SECONDS))
+
+
 def _auth_repair_retry_delays() -> tuple[int, int, int]:
     """衰退式 retry_after 三档延迟(上游 `.upstream/manager.py:208`).
 
     返回 (2x, 4x, 6x) * AUTO_CHECK_INTERVAL,常用 5min 间隔时为 (10min, 20min, 30min).
+    每档经 _clamp_retry_delay 封顶 24h(R5),防 interval 被污染时退避爆炸。
     """
     from autoteam.config import AUTO_CHECK_INTERVAL
 
@@ -760,7 +778,11 @@ def _auth_repair_retry_delays() -> tuple[int, int, int]:
         pass
 
     interval = max(60, int(interval))
-    return (interval * 2, interval * 4, interval * 6)
+    return (
+        _clamp_retry_delay(interval * 2),
+        _clamp_retry_delay(interval * 4),
+        _clamp_retry_delay(interval * 6),
+    )
 
 
 def _auth_repair_retry_add_phone_enabled() -> bool:
@@ -817,7 +839,8 @@ def _auth_repair_add_phone_retry_delays(max_retries: int | None = None) -> tuple
     retries = _auth_repair_add_phone_max_retries() if max_retries is None else max_retries
     interval = max(60, int(interval))
     retries = max(1, int(retries))
-    return tuple(interval * (2**idx) for idx in range(retries))
+    # R5 — 每档封顶 24h:max_retries 调大时 2^idx 增长极快,无 ceiling 会爆(BUG#2)
+    return tuple(_clamp_retry_delay(interval * (2**idx)) for idx in range(retries))
 
 
 def _auth_repair_error_label(error_type: str | None) -> str:
@@ -1167,6 +1190,25 @@ def _login_codex_with_result(
                 mail_client=mail_client,
                 return_result=True,
             )
+        except RegisterBlocked as blocked:
+            # Round 12 task 06-01(R4/BUG#1)— 别把 add-phone/duplicate 风控信号吞成 generic
+            # "exception":(1)保留 add_phone 信号,让 _record_auth_repair_failure 走对分支
+            # (指数退避/暂停 vs 衰退式);(2)retryable=False → 外层 attempt loop 立即 break,
+            # 不白跑满 max_attempts(每次都开浏览器走到 add-phone 才发现,极度浪费 — 现场连跑 3 次);
+            # (3)UI/日志正确显示"手机号验证"而非"登录异常"。
+            if blocked.is_phone:
+                error_type = "add_phone"
+            elif blocked.is_duplicate:
+                error_type = "duplicate_email"
+            else:
+                error_type = "human_verification"
+            return {
+                "ok": False,
+                "bundle": None,
+                "error_type": error_type,
+                "error_detail": f"OAuth 阻断: {blocked.reason or error_type} (step={blocked.step})",
+                "retryable": False,
+            }
         except Exception as exc:
             return {
                 "ok": False,
@@ -5608,6 +5650,50 @@ def create_new_account(
 
     Round 12 S4: `mail_client` 改为可选 — 缺省时按 acc 路由 / 走 get_mail_client()。
     """
+    # Round 12 task 06-01(R3 register-storm-gate)— 母号健康前置短路(cache-only,~0 RTT)。
+    # create_new_account 是所有注册入口(免费号批 / 巡检 auto-fill+replace / 手动 add / replace /
+    # fill-personal)与两种模式(direct / invite)的唯一汇聚点。此前 master 真降级时,每个入口都要
+    # 建临时邮箱 + 跑完整浏览器注册,直到 _run_post_register_oauth 的兜底闸才 fail-fast → 白烧
+    # CloudMail+浏览器+OpenAI 速率(见 resource/日志(1).md 风暴)。这里在任何邮箱/浏览器开销之前
+    # 先用 cache 预检:仅拦 subscription_cancelled;其他 reason(network_error/auth_invalid/
+    # workspace_missing/role_not_owner)一律放行(与注册后兜底闸语义一致,且兼容 R1 误判修复 —
+    # R1 修好后 cache 不再被错打 cancelled,本闸自然放行)。保留注册后兜底闸构成 defense-in-depth 双闸。
+    try:
+        from autoteam.master_health import is_master_subscription_healthy
+
+        if chatgpt_api is not None and _chatgpt_session_ready(chatgpt_api):
+            # 复用 live session(cache 命中 0 HTTP;未命中用现成 session 实测,不额外开浏览器)
+            _gate_healthy, _gate_reason, _gate_ev = is_master_subscription_healthy(chatgpt_api)
+        else:
+            # 无 live session(纯 direct 路径):只查 cache,不为预检付浏览器 warmup;
+            # cache 未命中 → probe 内部 network_error → 放行,交给注册后兜底闸。
+            _gate_probe = ChatGPTTeamAPI()
+            _gate_healthy, _gate_reason, _gate_ev = is_master_subscription_healthy(_gate_probe)
+    except Exception as _gate_exc:
+        logger.warning("[创建前置闸] master health probe 异常 %s,放行", _gate_exc)
+        _gate_healthy, _gate_reason, _gate_ev = True, "active", {}
+
+    if not _gate_healthy and _gate_reason == "subscription_cancelled":
+        logger.error(
+            "[创建前置闸] master 母号订阅 cancelled(cache_hit=%s),不建邮箱不开浏览器,fail-fast",
+            (_gate_ev or {}).get("cache_hit"),
+        )
+        record_failure(
+            "", MASTER_SUBSCRIPTION_DEGRADED,
+            "master subscription cancelled (pre-register gate)",
+            stage="create_new_account_pre_register_gate",
+            master_account_id=(_gate_ev or {}).get("account_id"),
+            master_role=(_gate_ev or {}).get("current_user_role"),
+        )
+        if out_outcome is not None:
+            out_outcome.clear()
+            out_outcome.update(
+                status="master_degraded",
+                email="",
+                reason="master subscription cancelled (pre-register)",
+            )
+        return None
+
     mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
     try:
         from autoteam.config import ROTATE_SKIP_REUSE

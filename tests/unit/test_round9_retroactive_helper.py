@@ -165,7 +165,8 @@ def test_master_cancelled_grace_period_marks_grace(tmp_path, grace_jwt_future):
 
     api = _StubAPI([
         {"id": "test-master", "structure": "workspace",
-         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True},
+         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True,
+         "is_deactivated": True, "has_active_subscription": False},
     ])
     auth_file = _make_auth_file(tmp_path, "auth1.json", grace_jwt_future)
     _seed_accounts([
@@ -195,7 +196,8 @@ def test_master_cancelled_grace_expired_marks_standby(tmp_path, grace_jwt_past):
 
     api = _StubAPI([
         {"id": "test-master", "structure": "workspace",
-         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True},
+         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True,
+         "is_deactivated": True, "has_active_subscription": False},
     ])
     auth_file = _make_auth_file(tmp_path, "auth1.json", grace_jwt_past)
     _seed_accounts([
@@ -222,7 +224,8 @@ def test_grace_account_expired_demotes_to_standby(tmp_path, grace_jwt_past):
 
     api = _StubAPI([
         {"id": "test-master", "structure": "workspace",
-         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True},
+         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True,
+         "is_deactivated": True, "has_active_subscription": False},
     ])
 
     expired_ts = time.time() - 100  # past
@@ -278,7 +281,8 @@ def test_helper_dry_run_does_not_persist(tmp_path, grace_jwt_future):
 
     api = _StubAPI([
         {"id": "test-master", "structure": "workspace",
-         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True},
+         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True,
+         "is_deactivated": True, "has_active_subscription": False},
     ])
     auth_file = _make_auth_file(tmp_path, "auth1.json", grace_jwt_future)
     _seed_accounts([
@@ -305,7 +309,8 @@ def test_helper_workspace_mismatch_skipped(tmp_path, grace_jwt_future):
 
     api = _StubAPI([
         {"id": "test-master", "structure": "workspace",
-         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True},
+         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True,
+         "is_deactivated": True, "has_active_subscription": False},
     ])
     auth_file = _make_auth_file(tmp_path, "auth1.json", grace_jwt_future)
     _seed_accounts([
@@ -331,7 +336,8 @@ def test_helper_jwt_decode_failure_silent(tmp_path):
 
     api = _StubAPI([
         {"id": "test-master", "structure": "workspace",
-         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True},
+         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True,
+         "is_deactivated": True, "has_active_subscription": False},
     ])
     p = tmp_path / "auth_no_id.json"
     p.write_text(json.dumps({"type": "codex", "access_token": "ACC"}))  # 没 id_token
@@ -371,7 +377,8 @@ def test_round8_wrapper_back_compat(tmp_path, grace_jwt_future):
 
     api = _StubAPI([
         {"id": "test-master", "structure": "workspace",
-         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True},
+         "current_user_role": "account-owner", "eligible_for_auto_reactivation": True,
+         "is_deactivated": True, "has_active_subscription": False},
     ])
     auth_file = _make_auth_file(tmp_path, "auth1.json", grace_jwt_future)
     _seed_accounts([

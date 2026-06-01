@@ -1300,6 +1300,14 @@ def _finish_admin_login(completed: dict):
         _admin_login_api = None
         _admin_login_step = None
         if info and info.get("session_token") and info.get("account_id"):
+            # Round 12(R1b)— admin 刚重登,主号 token 已变,旧 master_health 判定可能完全失效;
+            # 失效该母号 cache,强制下次 probe 走 L1 实测,避免陈旧/误判 cancelled 锁定 5 分钟。
+            try:
+                from autoteam.master_health import invalidate_cache
+
+                invalidate_cache(info.get("account_id"))
+            except Exception as exc:
+                logger.warning("[API] master_health cache 失效失败(忽略): %s", exc)
             try:
                 from autoteam.codex_auth import refresh_main_auth_file
 
@@ -4424,10 +4432,16 @@ def get_auto_check_config():
     return _auto_check_config.copy()
 
 
+_AUTO_CHECK_INTERVAL_MAX = 24 * 3600  # 24h — R5 入口防爆上限
+
+
 @app.put("/api/config/auto-check")
 def set_auto_check_config(cfg: AutoCheckConfig):
     """修改巡检配置（运行时生效）"""
-    _auto_check_config["interval"] = max(60, cfg.interval)  # 最少 1 分钟
+    # Round 12 task 06-01(R5/BUG#2)— interval 既是巡检间隔,也是 auth-repair 退避基数
+    # (_auth_repair_retry_delays = interval × 2/4/6)。入口加 ceiling,防 UI/API 写入超大值
+    # 污染 retry_after 造成"约 360018 分钟后重试"。最少 1 分钟,最多 24h。
+    _auto_check_config["interval"] = max(60, min(_AUTO_CHECK_INTERVAL_MAX, cfg.interval))
     _auto_check_config["target_seats"] = max(1, min(3, cfg.target_seats))
     _auto_check_config["threshold"] = max(1, min(100, cfg.threshold))
     _auto_check_config["min_low"] = max(1, cfg.min_low)

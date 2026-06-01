@@ -76,8 +76,13 @@ def test_master_subscription_active_when_eligible_false():
     assert evidence.get("current_user_role") == "account-owner"
 
 
-def test_master_subscription_cancelled_when_eligible_true():
-    """spec §3.2 — eligible_for_auto_reactivation is True → subscription_cancelled。"""
+def test_master_subscription_cancelled_when_truly_deactivated():
+    """Round 12(M-I18)— eligible ∧ is_deactivated ∧ has_active_subscription is False
+    且无 grace/付费 plan_type fallback → subscription_cancelled。
+
+    注:单字段 eligible_for_auto_reactivation=True 不再充分判 cancelled(见
+    test_master_subscription_eligible_only_is_active),必须三字段联合。
+    """
     from autoteam.master_health import is_master_subscription_healthy
 
     api = _FakeChatGPTAPI({
@@ -87,13 +92,39 @@ def test_master_subscription_cancelled_when_eligible_true():
                 "structure": "workspace",
                 "current_user_role": "account-owner",
                 "eligible_for_auto_reactivation": True,
-                "plan_type": "team",
+                "is_deactivated": True,
+                "has_active_subscription": False,
             }
         ]),
     })
     healthy, reason, evidence = is_master_subscription_healthy(api, cache_ttl=0)
     assert healthy is False
     assert reason == "subscription_cancelled"
+
+
+def test_master_subscription_eligible_only_is_active():
+    """Round 12(M-I18)回归 — 健康母号被 OpenAI 置 eligible_for_auto_reactivation=True
+    但 is_deactivated=False(权益仍在)→ active,不再误判 cancelled。
+
+    对应 task 06-01 现场:母号实际未 cancel,却因单字段判定被报"订阅已 cancel"。
+    """
+    from autoteam.master_health import is_master_subscription_healthy
+
+    api = _FakeChatGPTAPI({
+        "/backend-api/accounts": _make_accounts_response([
+            {
+                "id": "test-master",
+                "structure": "workspace",
+                "current_user_role": "account-owner",
+                "eligible_for_auto_reactivation": True,
+                "is_deactivated": False,
+                "has_active_subscription": True,
+            }
+        ]),
+    })
+    healthy, reason, evidence = is_master_subscription_healthy(api, cache_ttl=0)
+    assert healthy is True
+    assert reason == "active"
 
 
 def test_master_subscription_eligible_truthy_string_does_not_trigger_cancel():
@@ -290,8 +321,10 @@ def test_master_subscription_invariant_m_i3_healthy_iff_active():
 
     # 各种 not_active reason 必 unhealthy
     for cancel_items in [
+        # Round 12(M-I18)— 真停用需三字段联合才判 cancelled
         [{"id": "test-master", "current_user_role": "account-owner",
-          "eligible_for_auto_reactivation": True}],
+          "eligible_for_auto_reactivation": True,
+          "is_deactivated": True, "has_active_subscription": False}],
         [],  # workspace_missing
         [{"id": "test-master", "current_user_role": "member"}],  # role_not_owner
     ]:

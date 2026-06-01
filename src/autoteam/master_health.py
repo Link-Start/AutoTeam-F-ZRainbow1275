@@ -52,6 +52,9 @@ _RAW_ITEM_PERSIST_KEYS = (
     "structure",
     "current_user_role",
     "eligible_for_auto_reactivation",
+    # Round 12(M-I18)— 三字段联合判定 cancelled 所需,落盘用于诊断
+    "is_deactivated",
+    "has_active_subscription",
     "name",
     "workspace_name",
     "plan",
@@ -122,6 +125,30 @@ def _save_cache(data: dict) -> None:
             pass
     except Exception as exc:
         logger.warning("[master_health] cache 写入失败: %s", exc)
+
+
+def invalidate_cache(account_id: str | None = None) -> None:
+    """Round 12(R1b)— 失效 master_health cache。
+
+    account_id=None → 清空整张 cache;否则只删该 account_id 的项。
+    用途:admin 重新登录后,主号 token 刚变、旧 health 判定可能完全失效(见 task 06-01
+    现场:admin 重登 → 可用 token 退化 → 误判 cancelled),强制下次 probe 走 L1 实测而非
+    陈旧 cache,把假阳性锁定窗口从 cache_ttl(默认 5min)压到 0。永不抛异常(M-I1 守恒延伸)。
+    """
+    try:
+        with _LOCK:
+            data = _load_cache()
+            cache = data.get("cache") or {}
+            if account_id is None:
+                if cache:
+                    data["cache"] = {}
+                    _save_cache(data)
+            elif account_id in cache:
+                cache.pop(account_id, None)
+                data["cache"] = cache
+                _save_cache(data)
+    except Exception as exc:
+        logger.warning("[master_health] invalidate_cache 失败: %s", exc)
 
 
 def _redact_raw_item(item: Any) -> dict:
@@ -237,8 +264,20 @@ def _classify_l1(
         }
 
     # spec M-I7 — 严格 is True
-    if target.get("eligible_for_auto_reactivation") is True:
-        # Round 11 — grace 期判定:JWT chatgpt_subscription_active_until 仍未过期 → healthy=True
+    eligible = target.get("eligible_for_auto_reactivation") is True
+    is_deactivated = target.get("is_deactivated") is True
+    has_active_subscription = target.get("has_active_subscription")  # True / False / None(缺失)
+
+    # Round 12 修复(M-I18)— 单字段 eligible_for_auto_reactivation=True **不足以**判 cancelled。
+    # OpenAI 后端对**健康/活跃**工作区在某些生命周期阶段也会把该字段置 true(语义是"符合
+    # 自动重激活条件",不蕴含"已取消")。仅当三字段联合指向真停用才进入 grace/cancelled 判定:
+    #   eligible ∧ is_deactivated ∧ (has_active_subscription is False)
+    # 否则(eligible-only / is_deactivated 缺失或 False / has_active 非 False)一律 active。
+    # 背景:task 06-01 现场 master 实际未 cancel,但 admin 重登后可用 token 退化成不含
+    # chatgpt_plan_type 的 web access_token,Round 11 的 JWT grace fallback 整体失效 → 单字段
+    # 误判 cancelled → 注册全程 fail-fast 风暴。三字段 AND 与 token 路径解耦,从源头消除误判。
+    if eligible and is_deactivated and has_active_subscription is False:
+        # 真停用 — 再用 admin id_token JWT 区分 grace(仍可生产子号)vs hard cancelled
         grace_until = extract_grace_until_from_jwt(id_token) if id_token else None
         if grace_until and grace_until > time.time():
             return True, "subscription_grace", {
@@ -247,8 +286,7 @@ def _classify_l1(
                 "grace_until": grace_until,
                 "grace_remain_seconds": grace_until - time.time(),
             }
-        # Round 11 二轮 — grace_until 解不出(web session JWT 路径,只含 chatgpt_plan_type
-        # 而无 chatgpt_subscription_active_until):用 chatgpt_plan_type fallback
+        # web session JWT 路径只含 chatgpt_plan_type 无 chatgpt_subscription_active_until:
         # 当前权益仍为付费层 → 视为 grace 期内 healthy=True
         plan_type = extract_plan_type_from_jwt(id_token) if id_token else None
         _PAID_PLAN_TYPES = ("team", "business", "enterprise", "edu")
@@ -264,11 +302,17 @@ def _classify_l1(
             "raw_item": target,
             "grace_until": grace_until,  # 可能 None / 已过期
             "plan_type_jwt": plan_type,  # 可能 "free" / None
+            "is_deactivated": is_deactivated,
+            "has_active_subscription": has_active_subscription,
         }
 
     return True, "active", {
         "current_user_role": role,
         "raw_item": target,
+        # 诊断:eligible 为 true 但未达三字段 cancel 阈值(健康母号的常见形态)
+        "eligible_for_auto_reactivation": eligible,
+        "is_deactivated": is_deactivated,
+        "has_active_subscription": has_active_subscription,
     }
 
 
