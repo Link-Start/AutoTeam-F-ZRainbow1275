@@ -154,6 +154,28 @@ def normalize_email_addr(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _metadata_ai_extract_result(email_data: dict, expected_type: str) -> str | None:
+    metadata = email_data.get("metadata")
+    if metadata is None:
+        metadata = email_data.get("sourceMeta")
+    if not metadata:
+        return None
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            return None
+    if not isinstance(metadata, dict):
+        return None
+    ai_extract = metadata.get("ai_extract")
+    if not isinstance(ai_extract, dict):
+        return None
+    if ai_extract.get("type") != expected_type:
+        return None
+    result = str(ai_extract.get("result") or "").strip()
+    return result or None
+
+
 # ----------------------------------------------------------------------- ABC
 
 
@@ -232,11 +254,19 @@ class MailProvider(ABC):
     # ---- OTP / 邀请链接（共用实现，纯文本） ----
     def extract_verification_code(self, email_data: dict) -> str | None:
         """从邮件正文中提取 6 位验证码。"""
+        ai_result = _metadata_ai_extract_result(email_data, "auth_code")
+        if ai_result:
+            return ai_result
+
         sources: list[str] = []
 
         plain_text = str(email_data.get("text") or "").strip()
         if plain_text:
             sources.append(plain_text)
+
+        subject = str(email_data.get("subject") or "").strip()
+        if subject and subject not in sources:
+            sources.append(subject)
 
         html_text = html_to_visible_text(email_data.get("content"))
         if html_text and html_text not in sources:
@@ -251,6 +281,10 @@ class MailProvider(ABC):
 
     def extract_invite_link(self, email_data: dict) -> str | None:
         """从 OpenAI 邀请邮件中提取邀请链接。"""
+        ai_result = _metadata_ai_extract_result(email_data, "auth_link")
+        if ai_result:
+            return ai_result
+
         html_body = email_data.get("content", "") or ""
         text = email_data.get("text", "") or ""
 

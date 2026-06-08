@@ -2,7 +2,183 @@
 
 本文档记录 AutoTeam-F 相对上游 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的差异以及版本演进。日期采用 ISO 8601。
 
+## [Unreleased] — 2026-04-30
+
+### ⚠️ Upstream-break:ChatGPT 改了免费号 workspace 注册逻辑,当前 fork 已无可靠免费号获取途径
+
+> Round 11 真号自验阶段(`prompts/0426/verify/round11-review-report.md` AC7)实地复现:**OpenAI 后端调整了 personal/free workspace 的选择与 plan 下发逻辑** — 旧路径"邀请进 Team → 主号 kick → personal OAuth → 拿 `plan_type=free` bundle"在 5 次外层重试 + `oauth_workspace.ensure_personal_workspace_selected` 主动 POST `/api/accounts/workspace/select` + session_token 注入跳过 /log-in 三层加固后**仍无法稳定拿到 free plan**:bundle.plan_type 现总是回落到 `team`,而 `default_workspace_id` 即便 select 成功也不再切回 Personal,后端最终一致性窗口被收紧。
+>
+> 表象:点 Web 面板"生成免费号"会跑完整套注册→踢出→OAuth,最终 5 次重试全部拿到 plan_type=team,record_failure 写 `OAUTH_PLAN_DRIFT_PERSISTENT`,账号被标 STANDBY 留池。无 token 损失但**也拿不到任何可用的 free 子号**。
+>
+> 影响范围:README 标 🆕 的 **"生产免费号(Personal)"** 整条链路当前**事实失效**,需等 OpenAI 后端再次变更或社区给出新绕过路径。Team 子号注册不受影响。
+>
+> 已留底层钩子:`src/autoteam/oauth_workspace.py` / `manager._run_post_register_oauth` 5 次重试 + session_token 注入 + plan_drift 累计的代码全部保留,后续如发现新路径直接复用即可。
+
+### Round 11:Master Grace 真 healthy + 子号实时探活 + cheap_codex_smoke 模型分级
+
+> 起因:Round 8 spec 把 `eligible_for_auto_reactivation=true` 等价于"period 已过 + 必拿 free",这是错的。用户实证 grace 期内 ChatGPT 网页 team 权限仍可用 → master_health 应判 `subscription_grace`(healthy=True),而 Round 9 的 GRACE 子号状态机漏改了这个 master_health 守恒位 → 入口 `api.py:2491` / `manager.py:1590, 1819` 一律 503 fail-fast,grace 期母号仍能用但 fork 拒新 invite。本轮 Approach A:不动 fail-fast 入口,只扩 `_classify_l1` 把 grace 拆出来。
+
+- **feat(master-health): `subscription_grace` healthy=True 状态** — `master_health.py:_classify_l1` 加 `id_token` 参数,从 `accounts/codex-main-*.json` 最近修改文件读 admin id_token,`extract_grace_until_from_jwt` 解出 grace_until;`eligible_for_auto_reactivation is True` 时分两支:`grace_until > now` → `(True, "subscription_grace", {grace_until, grace_remain_seconds})`;否则 → `(False, "subscription_cancelled", ...)`。M-I3 守卫 + 缓存命中 + 实时探活双侧守卫扩 `healthy_reasons = ("active", "subscription_grace")`;`_apply_master_degraded_classification` 撤回路径触发条件由 `reason == "active"` 扩为 `reason in ("active", "subscription_grace")`,对齐 §4.6 联动表 L-2/L-5。
+- **feat(realtime-probe): 子号实时探活按钮** — `api.py:1839` 新增 `POST /api/accounts/{email}/probe`,并行 `check_codex_quota` + `cheap_codex_smoke`,落 `last_quota_check_at` + `last_quota`,**不修改 status**(RT-I1)。`Dashboard.vue:144` 每行 AtButton(canProbe 守卫)调 `probeAccount(email)`,toast.success/warn/info 三态显示 + emit refresh。
+- **feat(codex-smoke): 真实对话内容验证** — `cheap_codex_smoke(access_token, account_id=None, *, model="gpt-5", max_output_tokens=64)` 加 model + max_output_tokens 参数;`_cheap_codex_smoke_network` 读完整 SSE 流累积 `output_text.delta` + 见到 `response.completed` 时停止读流并解析 `usage.output_tokens`;返回 `("alive", {"model", "response_text", "raw_event", "tokens"})` dict 替代旧 str。
+- **feat(api): `GET /api/accounts/{email}/models`** — 用 access_token 调 `chatgpt.com/backend-api/models`;401/403 透传 401;timeout → 503;其他 5xx/4xx → 502。
+- **fix(chatgpt_api): `_api_fetch` header sanitize** — Layer 1 ISO-8859-1 round-trip 清洗 + None skip + bytes decode + Layer 2 `logger.warning` 诊断。独立 P0 阻塞修复,实测过程中发现的 admin 重登路径 bug。
+- **fix(round-10): 主号 Codex OAuth via session_token 落登录页修复** — 之前提交 `2525f56`,本轮在 spec 里同步落地 `prompts/0426/spec/shared/oauth-subprocess-timeout.md` + 测试 `tests/unit/test_round11_session_token_injection.py`。
+- **frontend(banner+card): grace 黄色 + 倒计时** — `useStatus.js:masterHealthSeverity()` `subscription_grace → 'warning'`;`MasterHealthBanner.vue` 文案 "母号订阅在 grace 期 · 仍可正常使用" + effectiveGraceUntil computed 优先用 evidence.grace_until 显示倒计时;`PoolHealthCard.vue` masterTone 加 grace 橙色 + "Grace 期内" 标签。
+- **spec 升级**:`master-subscription-health.md` v1.1 → **v1.2**(新增 §14 subscription_grace + 9 子节 + M-I14/15/16);`account-state-machine.md` v2.0 → **v2.1**(新增 §4.6 母号×子号 GRACE 联动表 L-1~L-10);`realtime-probe.md` **新建 v1.0**(308 行,RT-I1~I9);`spec-2-account-lifecycle.md` v1.6 → **v1.7**;`oauth-workspace-selection.md` 微调对齐 grace。
+- **测试**:Round 11 新增 26 cases(8 grace + 6 smoke + 8 probe + 4 header sanitize),`pytest tests/unit -q` → **256 passed**,`ruff check src tests/unit prompts` → **All checks passed**。
+- **AC7 BLOCKED**:真号注册自验在第 5 次重试仍拿 plan_type=team 时定位到上面 ⚠️ upstream-break,作为本 Round 的硬发现写入 CHANGELOG + README,代码修复无指向。
+
+## [Unreleased] — 2026-04-26
+
+### docker-guard:镜像守卫四道防线(SPEC-3)
+
+> 起因:issue #3 的 `list_accounts` ImportError 代码层已修(commit cf2f7d3),但用户 docker 容器没重建仍报错。本轮落地"防回归 + 用户操作 SOP + 镜像可观察性"。
+
+- **feat(docker): entrypoint self-check** — `docker-entrypoint.sh` 在 `exec uv run autoteam` 前增加白名单 import 自检(`autoteam.api.app` + `autoteam.accounts` 9 个对外契约符号 + `autoteam.manager.sync_account_states` 共 11 项),失败即 `exit 1` 触发 docker `restart: unless-stopped` 的 crash-loop;失败提示文案直接给出 rebuild 命令。
+- **feat(docker): 镜像 git-sha 指纹** — `Dockerfile` 增 `ARG GIT_SHA` / `ARG BUILD_TIME`,落到 `LABEL org.opencontainers.image.revision/created` + `ENV AUTOTEAM_GIT_SHA/BUILD_TIME`;`docker-compose.yml` 用 `${GIT_SHA:-unknown}` 降级,不传 build-arg 也能跑。
+- **feat(api): `/api/version` 端点** — `src/autoteam/api.py` 新增免鉴权 `GET /api/version`,返回 `{git_sha, build_time}`,`_AUTH_SKIP_PATHS` 已加白名单;Pydantic `VersionResponse` 模型,与 OpenAPI/Swagger 集成。
+- **feat(lint): ruff F401/F811/F821 守卫** — `pyproject.toml` 新增 `[tool.ruff.lint]` 段,只启三条零误报规则;`.pre-commit-config.yaml` 接入同规则,堵住 typo 类 ImportError 在 commit 前。
+- **docs(docker): rebuild SOP** — `docs/docker.md` 增加"代码更新后的 rebuild SOP"+"版本验证"+"启动期 self-check"+"故障排查"+"lint 守卫"五个章节;`docs/api.md` 把 `/api/version` 加入即时返回接口表与免鉴权清单。
+
+### playwright-hardening:async/sync 一致性硬化(SPEC-4)
+
+> 起因:issue #5 用户报告"playwright 中大量 async 函数里误用 sync API"。研究阶段对全项目 5 处 `sync_playwright` 调用点 + 1 处 `async def` 完整审计后**结论反转** — 0 处实际混用、5 处全部位于 sync `def` + 经由 `_PlaywrightExecutor` 单例 + 专用 worker 线程串行,严格符合 Playwright 官方推荐模式。用户决定走 hardening only,落 3 道防线杜绝未来回归。
+
+- **feat(guard): 新增 `src/autoteam/_playwright_guard.py`** — 单一信源(SSOT)模块:9 个 sync 白名单符号 `ALLOWED_SYNC_NAMES`(sync_playwright/Playwright/Browser/BrowserContext/BrowserType/Page/Locator/Error/TimeoutError)+ `FORBIDDEN_MODULES={"playwright.async_api"}` + `EXEMPTION_MARKER="autoteam: allow-async-playwright"` + `assert_sync_context()` 函数(在 asyncio loop 内调用立即抛 `RuntimeError`,异常消息含 thread 名 + loop_id 便于诊断)。
+- **feat(api): `_PlaywrightExecutor` 双入口 guard** — `api.py` 在 `run_with_timeout` 主线程入口 + `_worker` 专用线程入口分别调 `assert_sync_context()`,防止未来某次重构把 sync_playwright 误植入 async 上下文(撞 Playwright 内部 "Sync API inside asyncio loop" 静默失败)。
+- **refactor(manager): 函数内 import 上提** — `manager.py:_complete_registration` / `_register_direct_once` 两处 `from playwright.sync_api import sync_playwright` 上提至模块顶层(全仓 sync_api import 现在统一在 4 个文件的模块顶层 + manager.py 1 处)。
+- **test(static): AST 守卫 + 反例验证** — `tests/static/test_playwright_hygiene.py` 4 个测试:① 禁止 `from playwright.async_api`;② `async def` 函数体内不允许任何 playwright 符号;③ `playwright.sync_api` 导入仅限白名单 9 符号;④ 豁免登记表 `expected_exempt = set()` 当前期望 0 个豁免。`tests/static/test_playwright_hygiene_negative.py` 5 个反例验证守卫真能拦下违规模式。
+- **test(unit): runtime guard 验证** — `tests/unit/test_playwright_guard.py` 3 个测试:① 普通线程放行;② `asyncio.run()` 内调用必抛;③ 异常消息含 `thread=` + `loop_id=0x...`。
+- **chore(pytest): testpaths 显式列入 tests/static** — `pyproject.toml` `[tool.pytest.ini_options]` 把 `tests/static` / `tests/unit` / `tests/integration` 全部显式列入 `testpaths`,避免未来 collect-only 配置误排除静态守卫。
+
+> SPEC-4 范围严格限定 hardening only,**不动业务逻辑**:`chatgpt_api.py` / `codex_auth.py` / `invite.py` / 5 处 `with sync_playwright() as p:` 块本体一行未改。
+
 ## [Unreleased] — 2026-04-25
+
+### invite-hardening round-3:母号切换鲁棒性 + exhausted 自愈 + CPA 删除守卫
+
+> 用户实测后报告 4 个问题:① "生成免费号"按钮 HTTP 500 ② exhausted 5h 重置后未回血到 active ③ 母号被吊销切换新号后,旧 workspace 留下的子号被错刷成 standby + CPA 文件被批量误删 ④ README 关于 personal 号牵连失效的结论错误。本轮逐一修复,全部为本地行为变更,不动 API/UI 协议。
+
+- **fix(api): `list_accounts` → `load_accounts`** — `api.py:post_fill` 在 `leave_workspace=True` 分支误写成 `from autoteam.accounts import list_accounts`(实际函数名 `load_accounts`),导致点 Web 面板"生成免费号"按钮直接 ImportError → 500 → 前端 toast"服务器返回了非 JSON 响应"。单点改名修复。
+- **feat(check): exhausted 自愈** — `cmd_check` 新增"复测重置时间已过的 exhausted 账号"分支:遍历 `STATUS_EXHAUSTED` 且 `quota_resets_at <= now` 的账号,调一次 `_check_and_refresh`,返回 `ok` 且 5h 剩余 ≥ 阈值 → **直接 promote 回 `STATUS_ACTIVE`**(同时清 `quota_exhausted_at` / `quota_resets_at`),省一次"kick → standby → re-invite"的 Playwright 全流程。`exhausted` 仍 `auth_error` → 标 `AUTH_INVALID`;仍 `exhausted` → 刷 `quota_resets_at`;`network_error` → 保持原状下一轮再试。
+- **feat(accounts): `workspace_account_id` 字段(母号切换防错杀)** — `accounts.json` 每条记录新增 `workspace_account_id` 字段,记录该号被邀请时所属的 ChatGPT Team workspace `account_id`。`add_account()` 接受新参数;`invite.py` / `manager._run_post_register_oauth` / `manual_account.py` / `manager.create_account_direct` / `manager.cmd_check` pending→active / `_reconcile_team_members` pending→active+standby→active / `cmd_replace_one` 旧号恢复 / api `post-login` Team 补登都把当前 `get_chatgpt_account_id()` 写入。
+- **fix(sync): sync_account_states 不再把"前母号留下号"误标 standby** — 之前 `sync_account_states` 看到 `acc.status==active` 但 `email ∉ team_emails` 就一刀刷成 standby,**完全忽略**这可能是母号切换导致 workspace 整个换了。结果:用户切换母号一瞬间,本地全部 active 子号被错刷 standby,接着 `sync_to_cpa` 把它们的 CPA 文件全删了(实测损失:319 个文件里 0 个匹配本地 4 个号,全军覆没)。新逻辑:`acc.workspace_account_id` 与当前 `account_id` 都存在且不同 → **保留 active 不 flip**,WARN log 提示用户;legacy 记录(无 `workspace_account_id`)走原行为以保持兼容。
+- **fix(cpa_sync): 删 CPA 文件前的本地 auth_file 守卫** — `sync_to_cpa()` 删除 CPA 文件前增加一道闸:若该 email 在本地 `accounts.json` 仍持有 **同名** `auth_file` 物理文件 → 跳过删除,WARN "本地仍持有同名 auth_file 物理文件,等下一轮状态稳定后再处理"。即使 sync_account_states 之外的某条路径错误把 status 改成非 active/personal,这层防御兜住"实物 token 不会被瞬时状态误判抹掉"。
+- **fix(docs): README 撤回错误"已知限制"** — 删除"母号 Team workspace 被吊销时,从该母号衍生(经 Team 邀请 → leave_workspace → personal OAuth)出来的 free plan personal 号会一起失效"这条小节。实测:`d5a9830dc1@icoulsy.asia` 的 token 完全有效,只是 5h primary 已满 — 我先前那次 auth_error 探测是误判。CHANGELOG 同步删该条。
+
+### mail-provider 协议错配诊断(issue #1)
+
+> [issue #1](https://github.com/ZRainbow1275/AutoTeam-F/issues/1) 报告:从 `cnitlrt/AutoTeam` 迁过来的用户配的 `CLOUDMAIL_*` 实际指向 `maillab/cloud-mail` 服务器,但本 fork 默认 `MAIL_PROVIDER=cf_temp_email` 走的是 `dreamhunter2333/cloudflare_temp_email` 协议 → maillab 服务器把 `/admin/address` 用 catch-all 路由误回 200,login 假成功;后续 `/admin/new_address` 拿到 `{code:401, message:"身份认证失效"}` 才暴露问题。
+
+- **fix(mail): 双向协议错配嗅探** — `CfTempEmailClient.login()` 在 `/admin/address` 响应没有 `results` 字段但有 `code/data` 时抛出明确切换提示;`create_temp_email()` 二次防御 maillab 风格 `{code, message}` 响应。`MaillabClient._parse_response` 收到 HTTP 404 时提示"看起来是 cf_temp_email 服务器"。
+- **feat(setup_wizard): 启动前路由指纹嗅探** — `_sniff_provider_mismatch` 探测 base_url 的 `/admin/address` 与 `/login` 路由活跃度,与 `MAIL_PROVIDER` 期望不一致时打 warning(不阻断启动,真正校验仍走 login/create)。
+- **docs(README): 推荐 `cf_temp_email`** — README 启动小节明确推荐 [`dreamhunter2333/cloudflare_temp_email`](https://github.com/dreamhunter2333/cloudflare_temp_email),并提示从 cnitlrt 迁移的用户:cnitlrt 原版的 "cloudmail" 实际是 [`maillab/cloud-mail`](https://github.com/maillab/cloud-mail),需要显式 `MAIL_PROVIDER=maillab`。
+- **docs(configuration): 协议错配排查小节** — `docs/configuration.md` 新增 issue #1 错配场景的报错样例 + 切换步骤。
+- **真机验证**:用户当前 `apimail.icoulsy.asia` 是 cf_temp_email(`/admin/address` 401);issue #1 koast18 的服务器是 maillab(`/login` 路径活跃,响应是 `{code, message}` 格式)。
+
+
+### invite-hardening:邀请 / 巡检 / 对账三路加固
+
+- **feat(invite): seat fallback 鲁棒性** — `chatgpt_api.invite_member` 新增 `_classify_invite_error`(rate_limited / network / domain_blocked / other) + POST `/invites` 退避重试 `[5s, 15s]`;`_update_invite_seat_type` 的 PATCH 加 1 次重试,全部失败时**保留 codex 席位**(`_seat_type="usage_based"`)而不是丢账号。响应 dict 现在一定包含 `_seat_type` ∈ {`chatgpt`, `usage_based`, `unknown`} 与 `_error_kind`,`invite.py` / `manual_account.py` / `manager._run_post_register_oauth` 都据此把席位类型落到 `accounts.json.seat_type`。
+- **feat(check): `cmd_check --include-standby`** — `cmd_check(include_standby=False)` 默认行为不变;传 `True` 时调用新增的 `_probe_standby_quota` 遍历 standby 池,限速 `STANDBY_PROBE_INTERVAL_SEC=1.5s`、去重 `STANDBY_PROBE_DEDUP_SEC=86400s`(24h 内已探测过的跳过)。探到 401/403 → 标 `STATUS_AUTH_INVALID`,仍 exhausted → 刷新 `quota_exhausted_at/resets_at`,ok → 写回 `last_quota` + `last_quota_check_at`(不动 status)。CLI `autoteam check --include-standby`,API `POST /api/tasks/check` 接受 `{"include_standby": true}`。
+- **feat(reconcile): 残废 / 错位 / 耗尽未抛弃 + dry-run** — `_reconcile_team_members` 从原先 3 类扩到 8 类分支,覆盖:
+  - **残废**(workspace 有 active + 本地 `auth_file` 缺失)→ 先尝试从 `auths/codex-{email}-team-*.json` 兜底补齐;找不到则按 `RECONCILE_KICK_ORPHAN` 决定 KICK 或标 `STATUS_ORPHAN`
+  - **错位**(workspace active + 本地 standby)→ 改回 active + 补齐 auth_file(找不到 auth 则降级残废路径)
+  - **耗尽未抛弃**(active + `last_quota` 5h/周均 100%)→ 标 `STATUS_EXHAUSTED` + `quota_exhausted_at=now`,**不立即 kick**,让正常 rotate 流程走,避开 token_revoked 风控
+  - **ghost**(workspace 有 + 本地完全无记录)→ 按 `RECONCILE_KICK_GHOST` 决定 KICK 或留给 `sync_account_states` 补录
+  - `auth_invalid` / `exhausted` / `personal` → 同样 KICK
+  - `orphan` → 已标记,跳过,等人工
+- **feat(reconcile): dry-run 模式** — `cmd_reconcile(dry_run=True)` / `cmd_reconcile_dry_run()` 只诊断不动账户;CLI `autoteam reconcile [--dry-run]`,API `POST /api/admin/reconcile?dry_run=1`。`_reconcile_team_members` 返回结构化 dict(`kicked` / `orphan_kicked` / `orphan_marked` / `misaligned_fixed` / `exhausted_marked` / `ghost_kicked` / `ghost_seen` / `over_cap_kicked` / `flipped_to_active`),第二轮 over-cap kick 优先级改为 `orphan → auth_invalid → exhausted → personal → standby → 额度最低 active`。
+- **新增字段 / 状态**:
+  - `accounts.json.seat_type` ∈ `SEAT_CHATGPT` / `SEAT_CODEX` / `SEAT_UNKNOWN`,常量在 `autoteam.accounts`
+  - `accounts.json.last_quota_check_at`(epoch 秒)— standby 探测去重依据
+  - `STATUS_ORPHAN` — workspace 占席 + 本地 auth 丢失,等人工补登或 kick
+  - `STATUS_AUTH_INVALID` — `auth_file` token 已不可用(401/403),待 reconcile 清理或重登
+- **新增配置**:
+  - `RECONCILE_KICK_ORPHAN`(默认 `true`)— 残废是否自动 KICK
+  - `RECONCILE_KICK_GHOST`(默认 `true`)— ghost 是否自动 KICK
+- **测试**:`tests/unit/test_invite_member_seat_fallback.py`(5)、`tests/unit/test_cmd_check_standby.py`(5)、`tests/unit/test_reconcile_anomalies.py`(5),全过;ruff 干净。
+
+### invite-hardening 回归修复(真机对账后发现)
+
+- **fix(reconcile): KICK orphan 成功后必须同步本地 `STATUS_AUTH_INVALID`** — `_reconcile_team_members` 第一轮把 workspace 残废账号 KICK 掉之后,**只动了 workspace 状态、没改 `accounts.json`**,下次 `cmd_fill` / `cmd_rotate` 仍按 `STATUS_ACTIVE` 计数,Team 席位计算飘移、出现"账号已被踢但本地仍占名额"的幽灵态。补丁:`manager.py:280-281`(STANDBY 错位降级路径)和 `manager.py:304-305`(直接残废路径)KICK 返回 `removed`/`already_absent`/`dry_run` 时,立刻 `_safe_update(email, status=STATUS_AUTH_INVALID)`。新增 `tests/unit/test_reconcile_anomalies.py::test_reconcile_orphan_kick_syncs_local_status_to_auth_invalid` 做回归保护。
+
+### invite-hardening 批判性代码评审产出(2026-04-25,5-agent team review,findings only,补丁待后续 PR)
+
+> 这一节记录 d6082ad + 上述回归修复合到 main 后,5 个 agent 各自负责一个攻击面跑批判审查得出的**待修问题清单**。本节代码未改动,只列入 backlog 供后续 PR 拆单解决。
+
+- **invite_member 重试与错误分类(`chatgpt_api.py`)**
+  - `_classify_invite_error` 把 5xx 归为 `other` → 不重试,OpenAI 网关短抖直接掉号(`chatgpt_api.py:1309-1340`)
+  - `domain` / `forbidden` / `blocked` 关键词命中面太宽,可恢复错误被吞成 `domain_blocked` 不重试(`chatgpt_api.py:1338`)
+  - `errored_emails` / `account_invites` 数组形态的内层 error 字段不被扫描(`chatgpt_api.py:1322-1334`)
+  - 重试无 jitter,批量号同步反弹放大 rate_limit;`status==0` 网络分支总耗时可能 1–2 分钟卡死调用链
+- **`invite_to_team` 是死代码**(`manager.py:1239-1268`)
+  - `invite.py:479` 直接调 `chatgpt_api.invite_member` 绕过包装,`return_detail=True` / `seat_label` 转译 / `default→usage_based` 兜底**全部从未生效**;commit msg 宣称的链路与运行时不符
+- **`seat_type` 落盘是死数据**
+  - 全仓 grep 无任何模块读 `acc.get("seat_type")`,PATCH 失败保留 codex 席位的兜底对下游零影响 — 仍按 chatgpt 席位走 OAuth + 查 `wham/usage`
+  - `_run_post_register_oauth` 的 `team_auth_missing` 分支(`manager.py:1364-1370`)+ `sync_account_states` 自动补录路径(`manager.py:479-491` / `509-521`)写新账号时跳过 `add_account` 工厂,字段不全
+- **新状态 `auth_invalid` / `orphan` 在前端/状态汇总缺失**
+  - `api.py:1529-1573` `/api/status` summary 硬编码 5 种旧状态,新状态不计数
+  - `web/src/components/Dashboard.vue:381-403` `statusClass` / `dotClass` / `statusLabel` 白名单不包含新状态,UI 看到原始英文 + 灰色样式
+- **`_reconcile_team_members` 漏洞**
+  - **dry_run 严重低估真实 KICK 数**:跳过第二轮 over-cap,审批链路被绕过(`manager.py:344-346`)
+  - **`_priority` 里 ghost 返回 `(0, 0)` 最先 kick,绕过 `RECONCILE_KICK_GHOST=False` 开关**(`manager.py:378-379`)
+  - **`_find_team_auth_file` fallback** 接受 personal/plus plan 的 auth 挂到 team 席位账号,导致下次 API 401 / org mismatch(`manager.py:124-126`)
+  - **补齐 auth_file 后 `continue` 跳过 `_is_quota_exhausted_snapshot`**:本应标 EXHAUSTED 的号当 active 留下,下次 fill 立即 429(`manager.py:269-272` / `295-298`)
+  - STANDBY 错位降级 KICK 后打 `STATUS_AUTH_INVALID`,语义被拉宽到"auth 文件压根不存在",和 accounts.py:19 的"token 失效"注释不符,可能让暂时丢 auth 的号永久从 standby 池消失
+- **`_probe_standby_quota` 网络抖动误判 + 自愈断裂**(`manager.py:1120-1122` + `codex_auth.py:1642-1656`)
+  - `check_codex_quota` 把 DNS / timeout / SSL / 5xx / 429 一律返回 `auth_error` → standby 探测看到无条件标 `STATUS_AUTH_INVALID` + 写 `last_quota_check_at` → **24h 内不复验**;若该号之后 reinvite 回 Team,reconcile 立即 KICK,自愈链路断裂
+  - 未知 `status_str` 防御分支也写 `last_quota_check_at`,异常被屏蔽 24h
+  - 主循环无 `stop_flag` / 软取消信号,中途取消会留下半截探测状态
+- **文档缺漏**
+  - `.env.example` 漏列 `RECONCILE_KICK_ORPHAN` / `RECONCILE_KICK_GHOST` 两个开关示例
+  - `docs/api.md` 未更新 `POST /api/admin/reconcile` 与 `POST /api/tasks/check {"include_standby": true}`
+  - `docs/architecture.md` 状态机图未画 "reconcile KICK orphan → STATUS_AUTH_INVALID" 转移
+  - `docs/platform-signup-protocol.md` 顶部 `Status:` 行未明确"探索性归档(需求 1 已放弃)"
+
+> 评审范围:`d6082ad` + 本节回归补丁。共 5 个 reviewer 跑出 11 high / 13 medium / 2 low / 6 文档缺漏。补丁拆单到下个 PR,**这一节用于追溯,不构成代码改动**。
+
+### invite-hardening 批判审查 round 2:实际修复落地
+
+> 上一节列出的 backlog 在本轮按攻击面拆 4 个 fix task 跑完,以下逐条对照 finding 标记修复状态(✅ = 已修;(待后续) = 本轮未覆盖)。
+
+- **invite_member 重试与错误分类(`chatgpt_api.py`)**
+  - ✅ 5xx(500/502/503/504) 新增 `server_error` 分类,与 `network` / `rate_limited` 一并按退避表重试,不再被吞成 `other` 直接掉号
+  - ✅ `_DOMAIN_BLOCKED_KEYWORDS` 收窄到 `not allowed` / `domain blocked` / `domain is not allowed` / `forbidden domain` / `domain not permitted`,移除裸 `domain` / `forbidden` / `blocked`,避免命中 `errored_emails` 里 email 自身的 "@gmail.com" 之类被误判为 domain_blocked
+  - ✅ `errored_emails[].error/code/message` 内层字段进入 body_text 扫描;同时停止 fallthrough 到 `resp_body`,杜绝邮箱字面量污染分类
+  - ✅ POST 重试加 30% jitter(`time.sleep(base + random.uniform(0, base*0.3))`),批量号被同一窗口拒绝后不会同步反弹再次撞 rate_limit
+- **`invite_to_team` 死代码下沉(`manager.py` / `chatgpt_api.py`)**
+  - ✅ 把 `default → usage_based` 兜底、`errored_emails` 处理、`_seat_type` 标注全部下沉到 `chatgpt_api.invite_member` 内部(新增 `_invite_member_with_fallback` / `_invite_member_once`),`invite.py:run` 只读 `_seat_type` 字段。manager 包装层不再被绕过,链路与 commit msg 一致
+  - ✅ `invite.py` 调用 `add_account(... seat_type=seat_label)` 把 raw `_seat_type` 翻译成 `SEAT_CHATGPT` / `SEAT_CODEX` / `SEAT_UNKNOWN` 常量落盘
+- **`seat_type` 落盘是死数据**
+  - (待后续)下游 OAuth / `wham/usage` 路径暂未按 `seat_type` 分流(本轮重点是堵漏,差异化处理留给后续 PR)
+  - (待后续)`_run_post_register_oauth` 的 `team_auth_missing` 分支与 `sync_account_states` 自动补录路径仍直接拼字段,未走 `add_account` 工厂 — 字段不全的隐患未根治
+- **新状态 `auth_invalid` / `orphan` 在前端 / 状态汇总缺失**
+  - ✅ `api.py:get_status` summary dict 新增 `auth_invalid` / `orphan` 计数项
+  - ✅ `web/src/components/Dashboard.vue` 的 `statusClass` / `dotClass` / `statusLabel` 白名单加 `auth_invalid`(橙色 / "认证失效")和 `orphan`(琥珀色 / "孤立");`loginLabel` 把这两种状态归入"补登录"语境
+- **`_reconcile_team_members` 漏洞**
+  - ✅ **dry_run 第二轮 over-cap 预测**:不再 `return result` 跳过第二轮;dry_run 下用 "round-1 team_subs - 已 KICK" 模拟 remaining,避免重新 GET /users 把"假装 KICK"的 ghost 计回去高估 over_cap 数量;victims 只 log + 写 `result["over_cap_kicked"]`,不调 `remove_from_team`
+  - ✅ **ghost 不再绕过 `RECONCILE_KICK_GHOST=False` 开关**:`_priority` 中 ghost(本地无记录)的元组从 `(0, 0)` 改为按开关取值 — `True` 时仍 `(0, 0)` 优先 KICK,`False` 时降到 `(99, 0)` 排到最后,被开关压住
+  - ✅ **`_find_team_auth_file` 拒绝 personal/plus auth**:删除 `codex-{email}-*.json` 兜底分支,严格只接 `codex-{email}-team-*.json`,避免错 plan bundle 被挂到 team 席位账号导致 OAuth 401 / org mismatch
+  - ✅ **补齐 auth_file 后 fallthrough quota 检查**:抽出 `_check_and_mark_exhausted` 辅助函数,STANDBY 错位补 auth + ACTIVE 缺 auth 补齐两条路径都在补完后立刻做 `_is_quota_exhausted_snapshot`,该标 EXHAUSTED 的不再被当 active 留下
+  - (待后续)STANDBY 错位降级 KICK 后写 `STATUS_AUTH_INVALID` 与 `accounts.py` 注释"token 失效"语义不符的问题,本轮未改语义(改字段名 / 状态值需要更大面 PR)
+- **`_probe_standby_quota` 网络抖动误判 + 自愈断裂**
+  - ✅ **`check_codex_quota` 错误分类细化**:返回值新增 `("network_error", None)`,DNS / Timeout / SSL / 5xx / 429 / 4xx(非 401/403) / JSON 解析失败 / 未知异常一律归 `network_error`,只有 HTTP 401/403 才返回 `auth_error`
+  - ✅ **`_probe_standby_quota` 网络分支不再误标 AUTH_INVALID + 不再写 `last_quota_check_at`**:看到 `network_error` 只 log warning,不动 status,不写时间戳 — 下一轮立即重试,不被 24h 去重屏蔽。事故根因(一次网络抖动 18 个号被批量误标 AUTH_INVALID 后被 reconcile 全删)修复
+  - ✅ **未知 `status_str` 防御分支不写时间戳**:`cmd_check` 主路径里碰到 `network_error` 也走"本轮跳过、不进 auth_error_list"的安全分支
+  - (待后续)`_probe_standby_quota` 主循环 `stop_flag` / 软取消信号未接入,中途取消仍可能留半截探测状态
+- **文档缺漏**
+  - ✅ `.env.example` 末尾追加 `RECONCILE_KICK_ORPHAN` / `RECONCILE_KICK_GHOST` 两个开关示例(带注释说明 true / false 行为差异)
+  - ✅ `docs/api.md` 后台任务表格 `/api/tasks/check` 行注明 `{"include_standby": false}`;新增 "管理员运维" 小节,列 `POST /api/admin/reconcile?dry_run=0` 端点说明
+  - ✅ `CHANGELOG.md` 新增本节,逐条对照 backlog 标 ✅ / (待后续)
+  - ✅ `README.md` "修复了什么" 末尾追加一行"子号巡检在网络抖动 / 5xx 时被错误标 auth_invalid → 整批号被踢"
+  - (待后续)`docs/architecture.md` 状态机图未画 "reconcile KICK orphan → STATUS_AUTH_INVALID" 转移
+  - (待后续)`docs/platform-signup-protocol.md` 顶部 `Status:` 行未标"探索性归档(需求 1 已放弃)"
+
+**测试统计**:71 passed, 1 pre-existing fail。新增回归测试覆盖 `_classify_invite_error` 5xx 分类、`errored_emails` 解析、_invite_member_once 兜底、reconcile dry_run 第二轮 over-cap 预测、ghost priority 受 RECONCILE_KICK_GHOST 控制、`_find_team_auth_file` 拒绝 personal auth、补齐 auth 后 fallthrough quota、`check_codex_quota` 网络错误分类、`_probe_standby_quota` 网络抖动不写时间戳。
+
+**真机验证**:18 个被误标 AUTH_INVALID 的号已批量删除,确认本批 bug 修完后单次网络抖动不再造成整批误判。
 
 ### 后续修复（基于代码评审 + 真机验证）
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import requests
 
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
-from autoteam.config import CPA_KEY, CPA_URL
+from autoteam.config import AUTO_CHECK_TARGET_SEATS, CPA_KEY, CPA_URL
 from autoteam.textio import write_text
 
 logger = logging.getLogger(__name__)
@@ -22,13 +22,27 @@ def _headers():
 
 
 def list_cpa_files():
-    """获取 CPA 中所有认证文件"""
-    resp = requests.get(f"{CPA_URL}/v0/management/auth-files", headers=_headers(), timeout=10)
+    """获取 CPA 中所有认证文件。远端异常必须显式失败，不能伪装成空列表。"""
+    try:
+        resp = requests.get(f"{CPA_URL}/v0/management/auth-files", headers=_headers(), timeout=10)
+    except requests.RequestException as exc:
+        logger.error("[CPA] 获取文件列表失败: %s", exc)
+        raise RuntimeError(f"[CPA] auth-files list request failed: {exc}") from exc
+
     if resp.status_code != 200:
-        logger.error("[CPA] 获取文件列表失败: %d", resp.status_code)
-        return []
-    data = resp.json()
-    return data.get("files", [])
+        logger.error("[CPA] 获取文件列表失败: %d %s", resp.status_code, resp.text[:200])
+        raise RuntimeError(f"[CPA] auth-files list failed: HTTP {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        logger.error("[CPA] 获取文件列表返回非 JSON 内容: %s", resp.text[:200])
+        raise RuntimeError("[CPA] auth-files list returned non-JSON response") from exc
+
+    files = data.get("files", [])
+    if not isinstance(files, list):
+        raise RuntimeError("[CPA] auth-files list response missing files list")
+    return files
 
 
 def upload_to_cpa(filepath):
@@ -149,6 +163,96 @@ def _bundle_from_auth_data(auth_data, fallback_name=""):
         "expired": _parse_expired_timestamp(auth_data.get("expired")),
         "last_refresh_ts": _parse_optional_timestamp(auth_data.get("last_refresh")),
     }
+
+
+def _refresh_account_proxy_url_for_upload(acc: dict, path: Path) -> None:
+    email = str(acc.get("email") or "").strip().lower()
+    if not email or path.name.startswith("codex-main-"):
+        return
+    try:
+        from autoteam.admin_state import get_admin_email
+
+        if email == (get_admin_email() or "").strip().lower():
+            return
+    except Exception:
+        pass
+
+    required = False
+    try:
+        from autoteam import config as runtime_config
+        from autoteam.ipv6_pool import ipv6_pool
+
+        required = bool(getattr(runtime_config, "AUTOTEAM_IPV6_POOL_REQUIRED", False))
+        proxy_url = ipv6_pool.ensure(email) or ""
+        if not proxy_url:
+            if required:
+                raise RuntimeError("IPv6 pool is required but no account proxy was assigned")
+            return
+
+        try:
+            auth_data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            if required:
+                raise RuntimeError(f"cannot read auth file for required IPv6 proxy: {path.name}") from exc
+            logger.warning("[CPA] 无法读取 auth_file 以刷新 proxy_url，继续原样上传: %s (%s)", path.name, exc)
+            return
+
+        if auth_data.get("proxy_url") == proxy_url:
+            return
+        auth_data["proxy_url"] = proxy_url
+        write_text(path, json.dumps(auth_data, indent=2, ensure_ascii=False))
+        logger.info("[CPA] 已刷新待同步凭证 proxy_url: %s", email)
+    except Exception as exc:
+        if required:
+            logger.error("[CPA] IPv6 proxy_url 为必需但刷新失败: %s (%s)", email, exc)
+            raise
+        logger.warning("[CPA] IPv6 proxy_url 刷新失败，继续上传原凭证: %s (%s)", email, exc)
+
+
+def _active_auth_publish_decision(acc: dict, path: Path) -> str:
+    """Return publish/delete_remote/keep_remote for a local active Codex auth file."""
+    if not path.exists():
+        return "delete_remote"
+
+    try:
+        auth_data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("[CPA] 跳过无法读取的 active 凭证 %s: %s", path.name, exc)
+        return "delete_remote"
+
+    access_token = auth_data.get("access_token")
+    if not access_token:
+        logger.warning("[CPA] 跳过缺少 access_token 的 active 凭证: %s", path.name)
+        return "delete_remote"
+
+    try:
+        from autoteam.codex_auth import check_codex_quota
+
+        quota_status, _info = check_codex_quota(access_token, timeout=8)
+    except Exception as exc:
+        logger.warning("[CPA] active 凭证实时验证异常，保留远端副本等待下轮: %s (%s)", path.name, exc)
+        return "keep_remote"
+
+    if quota_status == "network_error":
+        logger.warning("[CPA] active 凭证实时验证网络异常，保留远端副本等待下轮: %s", path.name)
+        return "keep_remote"
+
+    if quota_status == "ok":
+        try:
+            from autoteam.ipv6_pool import ipv6_pool
+
+            email = (acc.get("email") or auth_data.get("email") or "").strip().lower()
+            proxy_url = ipv6_pool.ensure(email) or ""
+            if proxy_url and auth_data.get("proxy_url") != proxy_url:
+                auth_data["proxy_url"] = proxy_url
+                write_text(path, json.dumps(auth_data, indent=2, ensure_ascii=False))
+                logger.info("[CPA] 已刷新 active 凭证 proxy_url: %s", email)
+        except Exception as exc:
+            logger.warning("[CPA] active 凭证 IPv6 proxy_url 刷新失败，继续上传原凭证: %s", exc)
+        return "publish"
+
+    logger.warning("[CPA] 跳过实时验证失败的 active 凭证: %s (%s)", path.name, quota_status)
+    return "delete_remote"
 
 
 def _normalized_auth_path(bundle, main=False):
@@ -311,7 +415,15 @@ def sync_from_cpa():
     - 非主号文件会导入/修复到 accounts.json，默认状态为 standby（保守导入）
     - 不删除本地账号记录，仅补充/更新 auth_file
     """
-    from autoteam.accounts import STATUS_STANDBY, find_account, load_accounts, save_accounts
+    from autoteam.accounts import (
+        STATUS_STANDBY,
+        add_account,
+        find_account,
+        load_accounts,
+        save_accounts,
+        update_account,
+    )
+    from autoteam.mail import infer_mail_provider_from_email
 
     AUTH_DIR.mkdir(exist_ok=True)
 
@@ -461,25 +573,52 @@ def sync_from_cpa():
 
         acc = find_account(accounts, email)
         resolved_path = str(normalized_path.resolve())
+        inferred_provider = infer_mail_provider_from_email(email)
         if acc:
+            acc_changed = False
             if acc.get("auth_file") != resolved_path:
                 acc["auth_file"] = resolved_path
+                acc_changed = True
+            if inferred_provider and not acc.get("mail_provider"):
+                acc["mail_provider"] = inferred_provider
+                acc_changed = True
+            if acc_changed:
                 changed_accounts = True
                 updated_accounts += 1
         else:
-            accounts.append(
-                {
-                    "email": email,
-                    "password": "",
-                    "cloudmail_account_id": None,
-                    "status": STATUS_STANDBY,
-                    "auth_file": resolved_path,
-                    "quota_exhausted_at": None,
-                    "quota_resets_at": None,
-                    "created_at": time.time(),
-                    "last_active_at": None,
-                }
-            )
+            # Round 12 wire-up (M2) — 改用 add_account API 触发 None→PENDING transition,
+            # 紧接着 update_account → STANDBY 一次性带上 auth_file. 这样状态机能落每条
+            # state_log.jsonl + F2 SSE 推送, 不再静默直 append 旁路.
+            try:
+                add_account(email, "", cloudmail_account_id=None, mail_provider=inferred_provider or None)
+                update_account(
+                    email,
+                    status=STATUS_STANDBY,
+                    auth_file=resolved_path,
+                    quota_exhausted_at=None,
+                    quota_resets_at=None,
+                    _reason="cpa_sync:import_unknown",
+                )
+                accounts = load_accounts()  # 刷新 in-memory snapshot 给后续 _cleanup_local_duplicates 用
+            except Exception as exc:
+                logger.warning(
+                    "[CPA] 反向同步 add_account/transition 抛异常,回退直 append: %s (%s)",
+                    email, exc,
+                )
+                accounts.append(
+                    {
+                        "email": email,
+                        "password": "",
+                        "cloudmail_account_id": None,
+                        "mail_provider": inferred_provider or "",
+                        "status": STATUS_STANDBY,
+                        "auth_file": resolved_path,
+                        "quota_exhausted_at": None,
+                        "quota_resets_at": None,
+                        "created_at": time.time(),
+                        "last_active_at": None,
+                    }
+                )
             changed_accounts = True
             added_accounts += 1
 
@@ -522,10 +661,14 @@ def sync_to_cpa():
     - CPA 有但本地账号状态已不在上述两种（standby / exhausted / pending 等）→ 从 CPA 删除
     - 仅清理本地 accounts.json 管理过的邮箱，主号和 CPA 手动上传文件不会被删
     """
-    from autoteam.accounts import STATUS_ACTIVE, STATUS_PERSONAL, load_accounts, save_accounts
+    from autoteam.accounts import STATUS_ACTIVE, STATUS_PERSONAL, is_account_disabled, load_accounts, save_accounts
 
     accounts = load_accounts()
-    local_emails = {a["email"].lower() for a in accounts}
+    local_emails = {
+        str(a.get("email") or "").strip().lower()
+        for a in accounts
+        if str(a.get("email") or "").strip()
+    }
     local_duplicates_deleted, accounts_path_repaired = _cleanup_local_duplicates(accounts)
     if accounts_path_repaired:
         save_accounts(accounts)
@@ -547,7 +690,14 @@ def sync_to_cpa():
     files_to_sync = {}
     synced_active = 0
     synced_personal = 0
+    disabled_skipped = 0
+    active_publish_skipped = 0
+    active_publish_kept_remote = 0
+    active_publish_delete_remote = 0
     for acc in accounts:
+        if is_account_disabled(acc):
+            disabled_skipped += 1
+            continue
         status = acc.get("status")
         if status not in (STATUS_ACTIVE, STATUS_PERSONAL):
             continue
@@ -557,6 +707,20 @@ def sync_to_cpa():
         path = Path(auth_path)
         if not path.exists():
             continue
+
+        if status == STATUS_ACTIVE:
+            decision = _active_auth_publish_decision(acc, path)
+            if decision == "keep_remote":
+                active_publish_kept_remote += 1
+                continue
+            if decision == "delete_remote":
+                active_publish_delete_remote += 1
+                continue
+            if decision != "publish":
+                active_publish_skipped += 1
+                continue
+
+        _refresh_account_proxy_url_for_upload(acc, path)
         files_to_sync[path.name] = path
         if status == STATUS_ACTIVE:
             synced_active += 1
@@ -565,7 +729,35 @@ def sync_to_cpa():
 
     # CPA 认证文件
     cpa_files = list_cpa_files()
-    cpa_names = {f["name"]: f for f in cpa_files}
+    cpa_names = {f["name"]: f for f in cpa_files if f.get("name")}
+    min_active_for_remote_delete = max(1, int(AUTO_CHECK_TARGET_SEATS) - 1)
+    allow_remote_delete = synced_active >= min_active_for_remote_delete
+
+    try:
+        from autoteam.manager import _is_protected_local_credential_seat
+    except Exception:
+        _is_protected_local_credential_seat = None
+
+    protected_remote_names = set()
+    protected_remote_emails = set()
+    if _is_protected_local_credential_seat is not None:
+        for acc in accounts:
+            if is_account_disabled(acc):
+                continue
+            email = str(acc.get("email") or "").strip().lower()
+            auth_path_value = acc.get("auth_file")
+            if not email:
+                continue
+            try:
+                if _is_protected_local_credential_seat(acc):
+                    protected_remote_emails.add(email)
+                    if auth_path_value:
+                        protected_remote_names.add(Path(auth_path_value).name)
+            except Exception as exc:
+                logger.warning("[CPA] 判断受保护凭证失败，保留远端副本: %s (%s)", email, exc)
+                protected_remote_emails.add(email)
+                if auth_path_value:
+                    protected_remote_names.add(Path(auth_path_value).name)
 
     logger.info(
         "[CPA] 待同步认证文件: %d (Team=%d, Personal=%d), CPA 现有: %d",
@@ -574,6 +766,12 @@ def sync_to_cpa():
         synced_personal,
         len(cpa_files),
     )
+    if not allow_remote_delete:
+        logger.warning(
+            "[CPA] active 凭证不足，跳过本轮远端删除: %d/%d",
+            synced_active,
+            min_active_for_remote_delete,
+        )
 
     # 上传：所有 active + personal 认证文件（覆盖同名文件，确保 token 最新）
     uploaded = 0
@@ -582,15 +780,29 @@ def sync_to_cpa():
         if upload_to_cpa(path):
             uploaded += 1
 
-    # 删除：CPA 中有但不在同步列表的（仅限本地管理的账号 — 避免误删主号或 CPA 手动文件）
-    # 注意：personal 号已计入 files_to_sync，这里不会被删掉；只有状态变成 STANDBY/EXHAUSTED 等才会清理
     deleted = 0
+    skipped_remote_delete = 0
+    skipped_protected = 0
     for name, cpa_file in cpa_names.items():
         email = cpa_file.get("email", "").lower()
         if email in local_emails and name not in files_to_sync:
+            if name in protected_remote_names or email in protected_remote_emails:
+                logger.info("[CPA] 保留受保护本地凭证远端副本: %s (%s)", name, email)
+                skipped_protected += 1
+                continue
+            if not allow_remote_delete:
+                skipped_remote_delete += 1
+                continue
             logger.info("[CPA] 删除非 active/personal 文件: %s (%s)", name, email)
             if delete_from_cpa(name):
                 deleted += 1
+    if skipped_protected:
+        logger.info("[CPA] 守卫保留 %d 个 CPA 文件(本地仍持有,避免误删 token)", skipped_protected)
+    if skipped_remote_delete:
+        logger.warning("[CPA] 本轮因 active 凭证不足保留远端非 active 文件: %d", skipped_remote_delete)
+
+    if disabled_skipped:
+        logger.info("[CPA] 跳过 %d 个本地禁用账号", disabled_skipped)
 
     logger.info("[CPA] 同步完成: 上传 %d, 删除 %d, 本地去重 %d", uploaded, deleted, local_duplicates_deleted)
 
@@ -602,6 +814,29 @@ def sync_to_cpa():
         len(final_local_managed),
         len(files_to_sync),
     )
+    return {
+        "ok": True,
+        "uploaded": uploaded,
+        "deleted": deleted,
+        "remote_count_before": len(cpa_files),
+        "remote_managed_after": len(final_local_managed),
+        "synced_active": synced_active,
+        "synced_personal": synced_personal,
+        "disabled_skipped": disabled_skipped,
+        "active_publish": {
+            "skipped_unknown": active_publish_skipped,
+            "kept_remote": active_publish_kept_remote,
+            "delete_remote": active_publish_delete_remote,
+        },
+        "local_duplicates_deleted": local_duplicates_deleted,
+        "delete_guard": {
+            "allow_remote_delete": allow_remote_delete,
+            "min_active_for_remote_delete": min_active_for_remote_delete,
+            "skipped_remote_delete": skipped_remote_delete,
+            "skipped_protected": skipped_protected,
+            "skipped_protected_delete": skipped_protected,
+        },
+    }
 
 
 def sync_main_codex_to_cpa(filepath):
@@ -621,5 +856,45 @@ def sync_main_codex_to_cpa(filepath):
     if not upload_to_cpa(filepath):
         raise RuntimeError(f"上传主号认证文件失败: {name}")
 
-    logger.info("[CPA] 主号 Codex 已同步: %s", name)
+    # Round 12 S7 — 主号同步成功后,记录当前 active workspace,便于上游观测
+    try:
+        active = _get_active_workspace_summary()
+        if active:
+            logger.info(
+                "[CPA] 主号 Codex 已同步 (active workspace: id=%s admin=%s account_id=%s)",
+                active.get("id"), active.get("admin_email"), active.get("account_id"),
+            )
+        else:
+            logger.info("[CPA] 主号 Codex 已同步: %s", name)
+    except Exception:
+        logger.info("[CPA] 主号 Codex 已同步: %s", name)
     return {"uploaded": name}
+
+
+def _get_active_workspace_summary():
+    """Round 12 S7 — return the current active workspace (id/admin/account_id) or None.
+
+    Best-effort: never raises; pool unavailable returns None.
+    """
+    try:
+        from autoteam.workspace_pool import default_pool
+
+        active = default_pool.get_active()
+        if not active:
+            return None
+        return {
+            "id": active.get("id"),
+            "admin_email": active.get("admin_email"),
+            "account_id": active.get("account_id"),
+        }
+    except Exception:
+        return None
+
+
+def get_active_sync_target():
+    """Round 12 S7 — public helper: which workspace identity should CPA sync to?
+
+    Returns dict({id, admin_email, account_id}) or None when single-workspace
+    mode (caller falls back to legacy admin_state).
+    """
+    return _get_active_workspace_summary()

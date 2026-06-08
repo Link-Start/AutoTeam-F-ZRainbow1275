@@ -12,6 +12,9 @@ Authorization: Bearer <API_KEY>
 - `/api/auth/check`
 - `/api/setup/status`
 - `/api/setup/save`
+- `/api/version`
+- `/api/setup/dns/check`(setup 阶段免鉴权;`API_KEY` 已配置时仍要求 Bearer,只读查询)
+- `/api/mail-provider/probe`(setup 阶段免鉴权;`API_KEY` 已配置时仍要求 Bearer,见下文)
 
 ## 即时返回接口
 
@@ -20,9 +23,13 @@ Authorization: Bearer <API_KEY>
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/auth/check` | 验证 API Key |
-| GET | `/api/setup/status` | 检查配置是否完整 |
-| POST | `/api/setup/save` | 保存初始配置 |
+| GET | `/api/setup/status` | 检查配置是否完整(按 `MAIL_PROVIDER` 动态切换 `optional`) |
+| POST | `/api/setup/save` | 保存初始配置(provider 互斥写盘) |
+| POST | `/api/setup/dns/check` | 只读 DNS 诊断(A/AAAA/CNAME/MX/TXT,不会写 Cloudflare 或 DNS 服务商) |
+| POST | `/api/mail-provider/probe` | 邮箱后端 3 步探测(fingerprint / credentials / domain_ownership) |
+| GET | `/api/version` | 镜像版本指纹（`git_sha` + `build_time`，免鉴权，用于排查 docker 镜像是否过期） |
 | GET | `/api/status` | 账号状态 + 实时额度 |
+| GET | `/api/status?fast=true` | 快速状态快照（跳过实时额度探测，适合前端轮询和轮换任务运行时刷新） |
 | GET | `/api/accounts` | 所有账号列表 |
 | GET | `/api/accounts/active` | 活跃账号 |
 | GET | `/api/accounts/standby` | 待命账号 |
@@ -61,15 +68,46 @@ Authorization: Bearer <API_KEY>
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/tasks/rotate` | 智能轮转 `{"target": 5}` |
-| POST | `/api/tasks/check` | 检查额度 |
+| POST | `/api/tasks/rotate` | 智能轮转 `{"target": 3}` |
+| POST | `/api/tasks/check` | 检查额度，`{"include_standby": false}` 追加探测 standby 池（限速 1.5s/号 + 24h 去重） |
 | POST | `/api/tasks/add` | 自动注册并添加新账号 |
-| POST | `/api/tasks/fill` | 补满成员 `{"target": 5}` |
+| POST | `/api/tasks/fill` | 补满成员 `{"target": 3}` |
+| POST | `/api/tasks/multi-master/fill` | 多 Team 母号并行补位 `{"target": 3, "owner_workers": 2, "direct_parallel": 1, "workspace_ids": null, "dry_run": false}` |
 | POST | `/api/tasks/cleanup` | 清理成员 `{"max_seats": null}` |
 | GET | `/api/tasks` | 任务列表 |
 | GET | `/api/tasks/{task_id}` | 任务详情 |
 
 > 同一时间只允许一个 Playwright 操作；如果有任务执行中，新请求可能返回 `409 Conflict`。
+
+### 多 Team 母号并行补位
+
+`POST /api/tasks/multi-master/fill` 在一个全局后台任务内部调度多个已导入的 Team owner。每个 Team 仍保持 `1 owner + 2 managed children = 3 seats`，并行只发生在 owner worker 维度，不会提高单 Team seat cap。
+
+请求体：
+
+```json
+{
+  "target": 3,
+  "owner_workers": 2,
+  "direct_parallel": 1,
+  "workspace_ids": ["ws-..."],
+  "dry_run": false
+}
+```
+
+- `target` 会按现有 Team 上限 clamp 到 `1..3`。
+- `owner_workers` 会受 `MULTI_MASTER_MAX_OWNER_WORKERS` 和 `MULTI_MASTER_BROWSER_BUDGET` 裁剪。
+- `direct_parallel` 是单 owner direct signup race 的预算参数；当前切片先用于预算和任务可观测，直接注册 race 逻辑仍必须在 `manager.py` 中安全接入后才会改变单账号注册行为。
+- `workspace_ids` 可填 workspace id、owner account id 或 owner email；为空时使用所有 `parallel=true` 且 `enabled=true` 的 owner，若没有 parallel owner 则回退当前 active workspace。
+- `dry_run=true` 不创建后台任务，直接返回 plan，便于确认 owner 列表和预算。
+
+`GET /api/status` 会额外返回 `multi_master` 字段，包含 aggregate summary 与 per-owner diagnostics。该字段不会回显 `session_token`。
+
+## 管理员运维
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/admin/reconcile?dry_run=0` | 对账修复：扫描 workspace 实际成员 vs 本地 `accounts.json`，识别**残废 / 错位 / 耗尽未抛弃 / ghost / over-cap**五类异常并按 `RECONCILE_KICK_ORPHAN` / `RECONCILE_KICK_GHOST` 决定 KICK 或打标记。`dry_run=1` 仅预测不动账户（包含第二轮 over-cap 预测），返回结构化诊断 dict（`kicked` / `orphan_kicked` / `orphan_marked` / `misaligned_fixed` / `exhausted_marked` / `ghost_kicked` / `ghost_seen` / `over_cap_kicked` / `flipped_to_active`） |
 
 ## 管理员登录
 
@@ -88,11 +126,14 @@ Authorization: Bearer <API_KEY>
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/main-codex/status` | 同步状态 |
-| POST | `/api/main-codex/start` | 开始同步 |
+| GET | `/api/main-codex/status` | 登录/同步状态，包含 `action` |
+| POST | `/api/main-codex/start` | 开始登录并同步到已启用的 CPA/Sub2API 目标；未启用目标时返回 `400` |
+| POST | `/api/main-codex/login` | 只登录并保存本地主号 Codex 认证文件，不同步远端 |
 | POST | `/api/main-codex/password` | 提交密码 |
 | POST | `/api/main-codex/code` | 提交验证码 |
 | POST | `/api/main-codex/cancel` | 取消同步 |
+| POST | `/api/main-codex/delete-remote-files` | 删除已启用远端中的主号 Codex 认证文件 |
+| POST | `/api/main-codex/delete-cpa` | 兼容旧接口：同 `/api/main-codex/delete-remote-files` |
 
 ## 手动 OAuth 导入
 
@@ -116,6 +157,167 @@ Authorization: Bearer <API_KEY>
 | `auto_callback_available` | 本地自动回调服务是否启动成功 |
 | `account` | 完成后导入的账号信息 |
 
+## 初始配置 API
+
+### `POST /api/setup/dns/check`
+
+只读 DNS 诊断端点,用于检查邮箱域名、OpenAI 域名验证 TXT、SPF、MX 等记录是否已经在公网 DNS 生效。该端点只通过公共 DNS-over-HTTPS 查询,不会读取 Cloudflare token,不会调用 DNS 服务商写接口,也不会创建、更新或删除记录。
+
+鉴权策略与 `/api/mail-provider/probe` 一致:setup 阶段免 Bearer;一旦 `API_KEY` 已配置,必须带 `Authorization: Bearer <API_KEY>`。
+
+请求体可以使用内置字段,也可以直接传 `records`:
+
+```json
+{
+  "domain": "example.com",
+  "mail_host": "mail.example.com",
+  "mail_ip": "203.0.113.10",
+  "mx_target": "mail.example.com",
+  "spf_value": "v=spf1 include:_spf.example.com ~all",
+  "openai_domain_verification": "openai-domain-verification=abc",
+  "records": [
+    {
+      "type": "TXT",
+      "name": "example.com",
+      "expected": "openai-domain-verification=abc"
+    }
+  ]
+}
+```
+
+响应示例:
+
+```json
+{
+  "ok": false,
+  "domain": "example.com",
+  "all_ok": false,
+  "safe_read_only": true,
+  "checks": [
+    {
+      "type": "TXT",
+      "name": "example.com",
+      "expected": "openai-domain-verification=abc",
+      "observed": [],
+      "ok": false,
+      "error": null
+    }
+  ],
+  "error_code": null,
+  "message": null
+}
+```
+
+### `POST /api/mail-provider/probe`
+
+邮箱后端 3 步探测,SetupPage / Settings 用作切换前置校验。**setup 阶段免 Bearer**(在 `_AUTH_SKIP_PATHS` 白名单);一旦 `API_KEY` 已配置,仍要求 Bearer,且按 IP 限速 60 req/min(超限返 `error_code=RATE_LIMITED` + HTTP 429)。
+
+请求体(共用 schema):
+
+```json
+{
+  "provider": "cf_temp_email | maillab",
+  "step": "fingerprint | credentials | domain_ownership",
+  "base_url": "https://example.com/api",
+  "username": "admin@example.com",     // 仅 maillab credentials/domain_ownership
+  "password": "...",                   // 仅 maillab credentials/domain_ownership
+  "admin_password": "...",             // 仅 cf_temp_email credentials/domain_ownership
+  "domain": "example.com"              // 仅 domain_ownership
+}
+```
+
+响应通用字段:
+
+```json
+{
+  "ok": true,
+  "step": "fingerprint",
+  "provider": "maillab",
+  "detected_provider": "maillab",
+  "domain_list": ["@a.com"],
+  "warnings": [],
+  "error_code": null,
+  "message": null,
+  "hint": null,
+  "leaked_probe": null,
+  "cleaned": null
+}
+```
+
+`error_code` 取值见下表(失败时 `ok=false`):
+
+| `error_code` | HTTP | 说明 |
+|---|---|---|
+| `PROVIDER_MISMATCH` | 200 | base_url 指纹与 `provider` 不一致(典型 issue#1) |
+| `ROUTE_NOT_FOUND` | 200 | base_url 不是任何已知后端 |
+| `EMPTY_DOMAIN_LIST` | 200 | maillab `domainList` 空 |
+| `UNAUTHORIZED` | 200 | 凭据校验失败 |
+| `CAPTCHA_REQUIRED` | 200 | maillab 启用了登录验证码 |
+| `DOMAIN_REJECTED` | 200 | 创建探测邮箱被后端拒绝(`addVerify=1` 等) |
+| `NETWORK_ERROR` / `TIMEOUT` | 200 | 网络异常 |
+| `RATE_LIMITED` | 429 | 60 req/min 限速触发 |
+
+#### 示例 1:`step=fingerprint`(探测后端归属)
+
+```bash
+curl -X POST http://localhost:8787/api/mail-provider/probe \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"maillab","step":"fingerprint","base_url":"https://m.example.com"}'
+```
+
+成功响应:
+
+```json
+{
+  "ok": true,
+  "detected_provider": "maillab",
+  "domain_list": ["@example.com", "@x.example.com"],
+  "warnings": []
+}
+```
+
+#### 示例 2:`step=credentials`(凭据校验)
+
+cf_temp_email:
+
+```bash
+curl -X POST http://localhost:8787/api/mail-provider/probe \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"cf_temp_email","step":"credentials","base_url":"https://mail.example.com/api","admin_password":"..."}'
+```
+
+> `cf_temp_email` 的 `base_url` 对应 `CLOUDMAIL_BASE_URL`，必须包含 `/api` 前缀；不要只填域名根路径。
+
+maillab:
+
+```bash
+curl -X POST http://localhost:8787/api/mail-provider/probe \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"maillab","step":"credentials","base_url":"...","username":"admin@x.com","password":"..."}'
+```
+
+#### 示例 3:`step=domain_ownership`(域名归属验证)
+
+```bash
+curl -X POST http://localhost:8787/api/mail-provider/probe \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"maillab","step":"domain_ownership","base_url":"...","username":"...","password":"...","domain":"example.com"}'
+```
+
+成功响应:
+
+```json
+{
+  "ok": true,
+  "cleaned": true,
+  "leaked_probe": null
+}
+```
+
+如果探测邮箱删除失败(`cleaned=false`),`leaked_probe` 含 `{"email":"probe-...","account_id":"..."}`,需到管理后台手动删除。
+
+> 内部使用 `autoteam.mail.probe.probe_domain_ownership` helper,与 `/api/config/register-domain`(注册域名验证)共用同一份逻辑,语义对齐。
+
 ## 调用示例
 
 ```bash
@@ -123,10 +325,14 @@ Authorization: Bearer <API_KEY>
 curl -H "Authorization: Bearer YOUR_KEY" \
   http://localhost:8787/api/status
 
+# 快速轮询状态（不触发实时额度探测）
+curl -H "Authorization: Bearer YOUR_KEY" \
+  "http://localhost:8787/api/status?fast=true"
+
 # 触发轮转
 curl -X POST -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"target": 5}' \
+  -d '{"target": 3}' \
   http://localhost:8787/api/tasks/rotate
 
 # 从 CPA 拉取认证文件到本地

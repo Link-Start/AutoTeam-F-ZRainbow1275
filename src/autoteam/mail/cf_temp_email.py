@@ -32,13 +32,21 @@ from autoteam.mail.base import (
 logger = logging.getLogger(__name__)
 
 
+def normalize_cloudflare_temp_email_base_url(value: str | None) -> str:
+    """Normalize a cf_temp_email base URL without changing the provider package shape."""
+    base_url = (value or "").strip().rstrip("/")
+    if base_url.lower().endswith("/admin"):
+        base_url = base_url[:-6].rstrip("/")
+    return base_url
+
+
 class CfTempEmailClient(MailProvider):
     """dreamhunter2333/cloudflare_temp_email 后端客户端。"""
 
     provider_name = "CloudMail"
 
     def __init__(self):
-        self.base_url = (CLOUDMAIL_BASE_URL or "").rstrip("/")
+        self.base_url = normalize_cloudflare_temp_email_base_url(CLOUDMAIL_BASE_URL)
         self.admin_password = CLOUDMAIL_PASSWORD
         self.session = requests.Session()
         # 占位符,为兼容旧代码 `self.token`
@@ -95,6 +103,23 @@ class CfTempEmailClient(MailProvider):
             body = (r.text or "")[:200]
             raise Exception(f"CloudMail 登录失败: HTTP {r.status_code} {body}")
 
+        # SPEC-1 §3.2 — 正向白名单嗅探:cf_temp_email 的 /admin/address 必须返回含 `results`
+        # 字段的 dict。任何缺 results 的响应(空 {}、maillab 风格 {code,...}、null 等)都视为
+        # 协议错配,直接抛错。round-3 漏判的空 dict 也被本次收紧覆盖。
+        try:
+            payload = r.json()
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict) or "results" not in payload:
+            payload_type = type(payload).__name__ if payload is not None else "None"
+            raise Exception(
+                "CloudMail 登录响应不像 dreamhunter2333/cloudflare_temp_email"
+                f"(响应 {payload_type} 不含 `results` 字段)。"
+                f"你的 CLOUDMAIL_BASE_URL={self.base_url} 可能指向 maillab/cloud-mail 服务器或路由错。"
+                "请确认 .env 中 MAIL_PROVIDER=cf_temp_email 时填的是 dreamhunter2333 后端;"
+                "如果你部署的是 maillab,请改 MAIL_PROVIDER=maillab 并补齐 MAILLAB_API_URL/USERNAME/PASSWORD/DOMAIN。"
+            )
+
         self.token = "admin-" + self.admin_password[:6]
         logger.info("[CloudMail] 管理员鉴权通过")
         return self.token
@@ -131,6 +156,15 @@ class CfTempEmailClient(MailProvider):
             data = r.json()
         except Exception:
             pass
+
+        # SPEC-1 §3.2 — 正向白名单嗅探:任何缺 `address` 字段就报错。
+        # 比 round-3 的"必须同时含 code+message"宽松条件更严,空 dict / null 也被捕获。
+        if not isinstance(data, dict) or "address" not in data:
+            raise Exception(
+                f"创建邮箱响应不像 cf_temp_email(收到 {data!r})。"
+                "请检查 MAIL_PROVIDER 与 base_url 是否对应;"
+                "如果服务器是 maillab,请改 MAIL_PROVIDER=maillab。"
+            )
 
         address = data.get("address")
         jwt = data.get("jwt") or ""

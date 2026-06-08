@@ -1,0 +1,441 @@
+import inspect
+import threading
+
+import pytest
+
+from autoteam import api, chatgpt_api, codex_auth, invite, manager
+
+
+def test_launch_browser_stops_playwright_when_browser_launch_fails(tmp_path, monkeypatch):
+    class FakePlaywright:
+        def __init__(self):
+            self.stopped = False
+            self.chromium = self
+
+        def launch(self, **_kwargs):
+            raise RuntimeError("proxy launch failed")
+
+        def stop(self):
+            self.stopped = True
+
+    class FakeSyncPlaywright:
+        def __init__(self, playwright):
+            self._playwright = playwright
+
+        def start(self):
+            return self._playwright
+
+    fake_playwright = FakePlaywright()
+    monkeypatch.setattr(chatgpt_api, "SCREENSHOT_DIR", tmp_path)
+    monkeypatch.setattr(chatgpt_api, "get_playwright_launch_options", lambda: {"proxy": {"server": "http://proxy"}})
+    monkeypatch.setattr(chatgpt_api, "sync_playwright", lambda: FakeSyncPlaywright(fake_playwright))
+
+    client = chatgpt_api.ChatGPTTeamAPI()
+
+    with pytest.raises(RuntimeError, match="proxy launch failed"):
+        client._launch_browser()
+
+    assert fake_playwright.stopped is True
+    assert client.playwright is None
+    assert client.browser is None
+    assert client.context is None
+    assert client.page is None
+
+
+def test_launch_browser_uses_unified_context_options(monkeypatch):
+    captured = {}
+
+    class FakePage:
+        def close(self):
+            captured["closed_page"] = True
+
+    class FakeContext:
+        def close(self):
+            captured["closed_context"] = True
+
+        def new_page(self):
+            return FakePage()
+
+    class FakePlaywright:
+        def __init__(self):
+            self.chromium = self
+
+        def launch(self, **_kwargs):
+            return self
+
+        def new_context(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeContext()
+
+        def stop(self):
+            captured["stopped"] = True
+
+    class FakeSyncPlaywright:
+        def start(self):
+            return FakePlaywright()
+
+    monkeypatch.setattr(chatgpt_api, "sync_playwright", lambda: FakeSyncPlaywright())
+    monkeypatch.setattr(chatgpt_api, "get_playwright_launch_options", lambda: {})
+    monkeypatch.setattr(chatgpt_api, "get_playwright_context_options", lambda: {"viewport": {"width": 100, "height": 200}})
+
+    client = chatgpt_api.ChatGPTTeamAPI()
+    client._launch_browser()
+
+    assert captured["kwargs"] == {"viewport": {"width": 100, "height": 200}}
+
+
+def test_chatgpt_stop_closes_page_context_browser_and_playwright():
+    calls = []
+
+    class FakeClosable:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            calls.append(f"close:{self.name}")
+
+    class FakePlaywright:
+        def stop(self):
+            calls.append("stop:playwright")
+
+    client = chatgpt_api.ChatGPTTeamAPI()
+    client.page = FakeClosable("page")
+    client.context = FakeClosable("context")
+    client.browser = FakeClosable("browser")
+    client.playwright = FakePlaywright()
+
+    client.stop()
+    client.stop()
+
+    assert calls == ["close:page", "close:context", "close:browser", "stop:playwright"]
+    assert client.page is None
+    assert client.context is None
+    assert client.browser is None
+    assert client.playwright is None
+
+
+def test_start_with_session_stops_partially_started_browser_session():
+    calls = []
+
+    class FakeClosable:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            calls.append(f"close:{self.name}")
+
+    class FakePlaywright:
+        def stop(self):
+            calls.append("stop:playwright")
+
+    client = chatgpt_api.ChatGPTTeamAPI()
+
+    def fail_after_browser_started(_session_token):
+        client.page = FakeClosable("page")
+        client.context = FakeClosable("context")
+        client.browser = FakeClosable("browser")
+        client.playwright = FakePlaywright()
+        raise RuntimeError("token fetch failed")
+
+    client._start_browser_session = fail_after_browser_started
+
+    with pytest.raises(RuntimeError, match="token fetch failed"):
+        client.start_with_session("session-token", "account-id", require_browser=True)
+
+    assert calls == ["close:page", "close:context", "close:browser", "stop:playwright"]
+    assert client.page is None
+    assert client.context is None
+    assert client.browser is None
+    assert client.playwright is None
+
+
+def test_api_fetch_browser_fallback_cleans_partial_browser_session():
+    calls = []
+
+    class FakeClosable:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            calls.append(f"close:{self.name}")
+
+    class FakePlaywright:
+        def stop(self):
+            calls.append("stop:playwright")
+
+    client = chatgpt_api.ChatGPTTeamAPI()
+    client.session_token = "session-token"
+    client.http_transport = FakeClosable("transport")
+
+    def fail_after_browser_started(_session_token):
+        client.page = FakeClosable("page")
+        client.context = FakeClosable("context")
+        client.browser = FakeClosable("browser")
+        client.playwright = FakePlaywright()
+        raise RuntimeError("cloudflare fallback failed")
+
+    client._start_browser_session = fail_after_browser_started
+
+    with pytest.raises(RuntimeError, match="cloudflare fallback failed"):
+        client._ensure_browser_session()
+
+    assert calls == [
+        "close:transport",
+        "close:page",
+        "close:context",
+        "close:browser",
+        "stop:playwright",
+    ]
+    assert client.http_transport is None
+    assert client.page is None
+    assert client.context is None
+    assert client.browser is None
+    assert client.playwright is None
+
+
+def test_complete_registration_closes_page_context_browser_when_invite_registration_raises(monkeypatch):
+    calls = []
+    captured = {}
+
+    class FakeClosable:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            calls.append(f"close:{self.name}")
+
+    class FakeContext(FakeClosable):
+        def __init__(self):
+            super().__init__("context")
+
+        def new_page(self):
+            return FakeClosable("page")
+
+    class FakeBrowser(FakeClosable):
+        def __init__(self):
+            super().__init__("browser")
+
+        def new_context(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeContext()
+
+    class FakeChromium:
+        def launch(self, **_kwargs):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeSyncPlaywright:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fail_register(*_args, **_kwargs):
+        raise RuntimeError("registration crashed")
+
+    monkeypatch.setattr(manager, "sync_playwright", lambda: FakeSyncPlaywright())
+    monkeypatch.setattr(manager, "get_playwright_context_options", lambda: {"locale": "zh-CN"})
+    monkeypatch.setattr(invite, "register_with_invite", fail_register)
+
+    with pytest.raises(RuntimeError, match="registration crashed"):
+        manager._complete_registration(
+            "child@example.com",
+            "password",
+            "https://invite.example",
+            mail_client=object(),
+        )
+
+    assert calls == ["close:page", "close:context", "close:browser"]
+    assert captured["kwargs"] == {"locale": "zh-CN"}
+
+
+def test_register_direct_once_cleans_browser_context_on_unhandled_page_error(monkeypatch):
+    calls = []
+    captured = {}
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, *_args, **_kwargs):
+            raise RuntimeError("navigation exploded")
+
+        def close(self):
+            calls.append("close:page")
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+        def close(self):
+            calls.append("close:context")
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeContext()
+
+        def close(self):
+            calls.append("close:browser")
+
+    class FakeChromium:
+        def launch(self, **_kwargs):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeSyncPlaywright:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(manager, "sync_playwright", lambda: FakeSyncPlaywright())
+    monkeypatch.setattr(manager, "get_playwright_context_options", lambda: {"timezone_id": "Asia/Shanghai"})
+
+    with pytest.raises(RuntimeError, match="navigation exploded"):
+        manager._register_direct_once(object(), "child@example.com", "password")
+
+    assert calls == ["close:page", "close:context", "close:browser"]
+    assert captured["kwargs"] == {"timezone_id": "Asia/Shanghai"}
+
+
+def test_registration_and_oauth_paths_use_unified_playwright_cleanup():
+    assert "browser.close()" not in inspect.getsource(manager._complete_registration)
+    assert "browser.close()" not in inspect.getsource(manager._register_direct_once)
+    assert "browser.close()" not in inspect.getsource(invite.run)
+    assert "browser.close()" not in inspect.getsource(codex_auth.login_codex_via_browser)
+    assert "close_playwright_objects" in inspect.getsource(manager._register_direct_once)
+    assert "close_playwright_objects" in inspect.getsource(codex_auth.login_codex_via_browser)
+    assert "get_playwright_context_options()" in inspect.getsource(chatgpt_api.ChatGPTTeamAPI._launch_browser)
+    assert "get_playwright_context_options()" in inspect.getsource(invite.run)
+    assert "get_playwright_context_options()" in inspect.getsource(codex_auth.login_codex_via_browser)
+    assert "get_playwright_context_options()" in inspect.getsource(manager._complete_registration)
+    assert "get_playwright_context_options()" in inspect.getsource(manager._register_direct_once)
+    assert "viewport={\"width\": 1280, \"height\": 800}" not in inspect.getsource(chatgpt_api.ChatGPTTeamAPI._launch_browser)
+    assert "user_agent=\"Mozilla/5.0" not in inspect.getsource(chatgpt_api.ChatGPTTeamAPI._launch_browser)
+
+
+def test_session_codex_auth_flow_stops_chatgpt_when_page_start_fails(monkeypatch):
+    instances = []
+
+    class FakeContext:
+        def new_page(self):
+            raise RuntimeError("new page failed")
+
+    class FakeChatGPTTeamAPI:
+        def __init__(self):
+            self.context = FakeContext()
+            self.stopped = False
+            instances.append(self)
+
+        def start_with_session(self, *_args, **_kwargs):
+            return None
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr("autoteam.chatgpt_api.ChatGPTTeamAPI", FakeChatGPTTeamAPI)
+
+    flow = codex_auth.SessionCodexAuthFlow(
+        email="admin@example.com",
+        session_token="session-token",
+        account_id="account-id",
+        workspace_name="workspace",
+    )
+
+    with pytest.raises(RuntimeError, match="new page failed"):
+        flow.start()
+
+    assert len(instances) == 1
+    assert instances[0].stopped is True
+    assert flow.chatgpt is None
+    assert flow.page is None
+
+
+def test_post_admin_login_start_stops_api_when_begin_login_fails(monkeypatch):
+    instances = []
+
+    class FakeChatGPTTeamAPI:
+        def __init__(self):
+            self.stopped = False
+            instances.append(self)
+
+        def begin_admin_login(self, _email):
+            raise RuntimeError("proxy launch failed")
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr(api, "_playwright_lock", threading.Lock())
+    monkeypatch.setattr(api, "_admin_login_api", None)
+    monkeypatch.setattr(api, "_admin_login_step", None)
+    monkeypatch.setattr(api._pw_executor, "run", lambda func, *args, **kwargs: func(*args, **kwargs))
+    monkeypatch.setattr("autoteam.chatgpt_api.ChatGPTTeamAPI", FakeChatGPTTeamAPI)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.post_admin_login_start(api.AdminEmailParams(email="admin@example.com"))
+
+    assert exc.value.status_code == 400
+    assert "proxy launch failed" in str(exc.value.detail)
+    assert len(instances) == 1
+    assert instances[0].stopped is True
+    assert api._admin_login_api is None
+    assert api._playwright_lock.locked() is False
+
+
+def test_get_team_members_stops_chatgpt_when_start_fails(monkeypatch):
+    instances = []
+
+    class FakeChatGPTTeamAPI:
+        def __init__(self):
+            self.stopped = False
+            instances.append(self)
+
+        def start(self):
+            raise RuntimeError("http proxy failed")
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr(api, "_playwright_lock", threading.Lock())
+    monkeypatch.setattr(api._pw_executor, "run", lambda func, *args, **kwargs: func(*args, **kwargs))
+    monkeypatch.setattr("autoteam.admin_state.get_admin_session_token", lambda: "session")
+    monkeypatch.setattr("autoteam.admin_state.get_chatgpt_account_id", lambda: "acc-1")
+    monkeypatch.setattr("autoteam.chatgpt_api.ChatGPTTeamAPI", FakeChatGPTTeamAPI)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.get_team_members()
+
+    assert exc.value.status_code == 502
+    assert "http proxy failed" in str(exc.value.detail)
+    assert len(instances) == 1
+    assert instances[0].stopped is True
+    assert api._playwright_lock.locked() is False
+
+
+def test_parse_playwright_probe_stdout_uses_last_json_line():
+    assert api._parse_playwright_probe_stdout("noise\n{\"count\": 4}\n") == {"count": 4}
+
+
+def test_auto_check_team_member_count_returns_minus_one_when_probe_fails(monkeypatch):
+    calls = []
+
+    def fake_probe(*_args, **_kwargs):
+        calls.append(True)
+        raise TimeoutError("probe timeout")
+
+    monkeypatch.setattr(api, "_run_playwright_probe", fake_probe)
+
+    assert api._auto_check_team_member_count(timeout_seconds=0.01, retries=2) == -1
+    assert len(calls) == 2
+
+
+def test_auto_check_team_member_count_reads_probe_count(monkeypatch):
+    monkeypatch.setattr(api, "_run_playwright_probe", lambda *_args, **_kwargs: {"count": "5"})
+
+    assert api._auto_check_team_member_count(timeout_seconds=0.01, retries=1) == 5

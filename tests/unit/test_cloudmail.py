@@ -5,7 +5,7 @@
 `/admin/*` 路由的实现。OTP 提取测试与后端无关,沿用原断言。
 """
 
-from autoteam import accounts
+from autoteam import accounts, cloudflare_temp_email
 from autoteam.mail import cf_temp_email
 
 
@@ -60,6 +60,53 @@ def test_search_emails_by_recipient_returns_normalized_records(monkeypatch):
     assert emails[0]["sendEmail"] == "noreply@tm.openai.com"
     assert emails[0]["accountEmail"] == target
     assert emails[0]["createTime"] == 1761331200
+
+
+def test_cloudflare_temp_email_top_level_compat_uses_provider(monkeypatch):
+    assert (
+        cloudflare_temp_email.normalize_cloudflare_temp_email_base_url("https://mail.example.com/admin/")
+        == "https://mail.example.com"
+    )
+
+    client = cloudflare_temp_email.CloudflareTempEmailClient()
+    monkeypatch.setattr(client, "domain", "example.com")
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda method, path, **kwargs: {
+            "address": "tmp-user@example.com",
+            "address_id": 321,
+            "jwt": "token",
+        },
+    )
+
+    account_id, email = client.create_temp_email(prefix="tmp-user")
+
+    assert account_id == 321
+    assert email == "tmp-user@example.com"
+
+
+def test_extract_helpers_prefer_ai_extract_metadata():
+    client = cf_temp_email.CfTempEmailClient()
+
+    assert (
+        client.extract_verification_code(
+            {
+                "metadata": '{"ai_extract":{"type":"auth_code","result":"123456"}}',
+                "subject": "ignored 654321",
+            }
+        )
+        == "123456"
+    )
+    assert (
+        client.extract_invite_link(
+            {
+                "metadata": '{"ai_extract":{"type":"auth_link","result":"https://chatgpt.com/auth/login?invite=abc"}}',
+                "content": "",
+            }
+        )
+        == "https://chatgpt.com/auth/login?invite=abc"
+    )
 
 
 def test_search_emails_by_recipient_filters_unrelated_address(monkeypatch):

@@ -24,11 +24,20 @@ REQUIRED_CONFIGS = [
         "cf_temp_email",
         True,
     ),
-    ("CLOUDMAIL_BASE_URL", "CloudMail API 地址（cf_temp_email 后端）", "", False),
+    # cf_temp_email 字段(provider=cf_temp_email 时必填,api.get_setup_status 按 provider 动态切 optional)
+    ("CLOUDMAIL_BASE_URL", "CloudMail API 地址（cf_temp_email 后端，必须包含 /api）", "", False),
     ("CLOUDMAIL_PASSWORD", "CloudMail 管理员密码（cf_temp_email 后端）", "", False),
     ("CLOUDMAIL_DOMAIN", "邮箱域名（如 @example.com）", "", False),
+    # maillab 字段(SPEC-1 §3.4;provider=maillab 时必填,默认 optional 由 setup_status 动态切换)
+    ("MAILLAB_API_URL", "Maillab API 地址（maillab 后端）", "", True),
+    ("MAILLAB_USERNAME", "Maillab 管理员邮箱（maillab 后端）", "", True),
+    ("MAILLAB_PASSWORD", "Maillab 管理员密码（maillab 后端）", "", True),
+    ("MAILLAB_DOMAIN", "Maillab 邮箱域名（缺省回落 CLOUDMAIL_DOMAIN）", "", True),
     ("CPA_URL", "CPA (CLIProxyAPI) 地址", "http://127.0.0.1:8317", False),
     ("CPA_KEY", "CPA 管理密钥", "", False),
+    ("ROTATE_NEW_ACCOUNT_MODE", "新号创建策略（domain_auto_join_first/invite_first/direct_first）", "domain_auto_join_first", True),
+    ("AUTOTEAM_AUTO_JOIN_DOMAINS", "自动入工作空间域名（auto 或逗号分隔域名）", "auto", True),
+    ("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", "直接注册失败后回退邀请（true/false）", "true", True),
     ("PLAYWRIGHT_PROXY_URL", "Playwright 浏览器代理 URL（可选，如 socks5://host:port）", "", True),
     ("PLAYWRIGHT_PROXY_BYPASS", "Playwright 代理绕过列表（可选，如 localhost,127.0.0.1）", "", True),
     ("API_KEY", "API 鉴权密钥（回车自动生成）", "", False),
@@ -170,6 +179,85 @@ def check_and_setup(interactive: bool = True) -> bool:
     return True
 
 
+def _sniff_provider_mismatch(provider: str) -> tuple[bool, str]:
+    """SPEC-1 §3.4 — 探测 base_url 与 MAIL_PROVIDER 的匹配性。
+
+    返回 (matched, reason):
+      - matched=True:可继续 login(reason 为空字符串或 warning 内容)
+      - matched=False:_verify_cloudmail 应直接 return False
+
+    探测点:
+      - GET /setting/websiteConfig — maillab 独有,通常含 domainList
+      - GET /admin/address         — cf_temp_email 独有,401/403/200 视为"路由活跃"
+      - GET /login                 — maillab POST 路由,GET 期望非 404
+    """
+    import requests
+
+    base = ""
+    if provider in ("cf_temp_email", "cloudflare_temp_email", ""):
+        base = (os.environ.get("CLOUDMAIL_BASE_URL") or "").rstrip("/")
+    elif provider == "maillab":
+        base = (os.environ.get("MAILLAB_API_URL") or "").rstrip("/")
+    if not base:
+        return True, ""
+
+    # 探测 1:maillab /setting/websiteConfig (无需 token)
+    websiteconfig_alive = False
+    websiteconfig_has_domainlist = False
+    try:
+        r_wc = requests.get(f"{base}/setting/websiteConfig", timeout=5)
+        if r_wc.status_code == 200:
+            try:
+                data = r_wc.json() or {}
+                if isinstance(data, dict):
+                    websiteconfig_alive = True
+                    websiteconfig_has_domainlist = "domainList" in data
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 探测 2:cf_temp_email /admin/address (无 admin auth 时期望 401/403,或 200 含 results)
+    admin_route_alive = False
+    try:
+        r_admin = requests.get(f"{base}/admin/address", timeout=5)
+        admin_route_alive = r_admin.status_code in (200, 401, 403)
+    except Exception:
+        pass
+
+    # 探测 3:maillab /login (用 GET 探测路由存在性)
+    login_route_alive = False
+    try:
+        r_login = requests.get(f"{base}/login", timeout=5)
+        login_route_alive = r_login.status_code != 404
+    except Exception:
+        pass
+
+    # 推断 detected_provider
+    if websiteconfig_alive or login_route_alive:
+        detected = "maillab"
+    elif admin_route_alive:
+        detected = "cf_temp_email"
+    else:
+        detected = "unknown"
+
+    if provider in ("cf_temp_email", "cloudflare_temp_email", ""):
+        if detected == "maillab":
+            return False, (
+                f"CLOUDMAIL_BASE_URL={base} 看起来是 maillab/cloud-mail 服务器"
+                f"(/setting/websiteConfig {'存在 domainList' if websiteconfig_has_domainlist else '可达'} / /login 路由活跃)。"
+                "请改 MAIL_PROVIDER=maillab 并补齐 MAILLAB_API_URL/USERNAME/PASSWORD/DOMAIN。"
+            )
+    elif provider == "maillab":
+        if detected == "cf_temp_email":
+            return False, (
+                f"MAILLAB_API_URL={base} 看起来是 dreamhunter2333/cloudflare_temp_email 服务器"
+                "(/setting/websiteConfig 不可达,但 /admin/address 活跃)。"
+                "请改 MAIL_PROVIDER=cf_temp_email 并配置 CLOUDMAIL_BASE_URL/PASSWORD/DOMAIN。"
+            )
+    return True, ""
+
+
 def _verify_cloudmail():
     """验证 mail provider 配置:登录 + 创建测试邮箱 + 删除。
 
@@ -203,6 +291,14 @@ def _verify_cloudmail():
         return False
 
     logger.info("[验证] %s 配置...", label)
+
+    # SPEC-1 §3.4 — 嗅探前置 + 强阻断:base_url 路由指纹与 MAIL_PROVIDER 不一致时,
+    # 直接 return False,**不**实例化 client。AUTOTEAM_SKIP_PROVIDER_SNIFF=1 可跳过(逃生口)。
+    if os.environ.get("AUTOTEAM_SKIP_PROVIDER_SNIFF") != "1":
+        matched, reason = _sniff_provider_mismatch(provider)
+        if not matched:
+            logger.error("[验证] 协议错配: %s", reason)
+            return False
 
     try:
         from autoteam.cloudmail import CloudMailClient

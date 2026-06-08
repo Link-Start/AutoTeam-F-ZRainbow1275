@@ -23,15 +23,49 @@ import time
 
 from playwright.sync_api import sync_playwright
 
+from autoteam.accounts import (
+    SEAT_CHATGPT,
+    SEAT_CODEX,
+    SEAT_UNKNOWN,
+    add_account,
+    update_account,
+)
 from autoteam.chatgpt_api import ChatGPTTeamAPI
 from autoteam.cloudmail import CloudMailClient
-from autoteam.config import get_playwright_launch_options
-from autoteam.identity import random_age, random_birthday, random_full_name, random_password
+from autoteam.config import get_playwright_context_options, get_playwright_launch_options
+from autoteam.identity import random_password
+from autoteam.playwright_lifecycle import close_playwright_objects
+from autoteam.signup_profile import generate_signup_profile
+
+
+def _seat_label_from_raw(raw_seat: str) -> str:
+    """把 invite_member 返回的 _seat_type 字面量翻译成 accounts.SEAT_* 常量。"""
+    return {
+        "chatgpt": SEAT_CHATGPT,
+        "usage_based": SEAT_CODEX,
+    }.get(raw_seat or "", SEAT_UNKNOWN)
+
 
 logger = logging.getLogger(__name__)
 
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
 SCREENSHOT_DIR = "screenshots"
+INVITE_CODE_SELECTORS = [
+    'input[name="code"]',
+    'input[autocomplete="one-time-code"]',
+    'input[autocomplete*="one-time-code" i]',
+    'input[placeholder*="code" i]',
+    'input[placeholder*="验证码" i]',
+    'input[placeholder*="verification" i]',
+    'input[aria-label*="code" i]',
+    'input[aria-label*="verification" i]',
+    'input[inputmode="numeric"]',
+    'input[type="text"]',
+]
+INVITE_MULTI_CODE_SELECTOR = 'input[maxlength="1"]'
+INVITE_CODE_RENDER_TIMEOUT = 25
+INVITE_BLANK_PAGE_RECOVERY_ATTEMPTS = max(0, int(os.environ.get("INVITE_BLANK_PAGE_RECOVERY_ATTEMPTS", "2")))
+INVITE_BLANK_PAGE_RECOVERY_WAIT = max(0.0, float(os.environ.get("INVITE_BLANK_PAGE_RECOVERY_WAIT", "3")))
 
 
 class RegisterBlocked(Exception):
@@ -136,6 +170,69 @@ def screenshot(page, name):
     logger.debug("[截图] %s", path)
 
 
+def _page_excerpt(page, limit=240):
+    try:
+        return page.inner_text("body")[:limit]
+    except Exception:
+        return ""
+
+
+def _visible_control_count(page, limit=12):
+    try:
+        controls = page.locator('input, button, a, textarea, select, [role="button"]').all()
+    except Exception:
+        return 0
+
+    visible = 0
+    for locator in controls[:limit]:
+        try:
+            if locator.is_visible(timeout=250):
+                visible += 1
+        except Exception:
+            continue
+    return visible
+
+
+def _is_probably_blank_page(page):
+    """Return True when the page has no visible text or interactive controls."""
+    if _page_excerpt(page, limit=160).strip():
+        return False
+    return _visible_control_count(page) == 0
+
+
+def _recover_blank_invite_page(page, stage, attempts=INVITE_BLANK_PAGE_RECOVERY_ATTEMPTS):
+    """Reload a post-auth blank page a few times without restarting registration."""
+    recovered = False
+    for attempt in range(1, max(0, int(attempts)) + 1):
+        if not _is_probably_blank_page(page):
+            return recovered
+
+        logger.warning(
+            "[注册] %s 检测到空白页，尝试刷新恢复 (%d/%d) | URL=%s",
+            stage,
+            attempt,
+            attempts,
+            getattr(page, "url", ""),
+        )
+        screenshot(page, f"reg_blank_{stage}_{attempt}_before.png")
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:
+            logger.warning("[注册] %s 空白页刷新失败: %s", stage, exc)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+        time.sleep(INVITE_BLANK_PAGE_RECOVERY_WAIT)
+        wait_for_cloudflare(page, max_wait=20)
+        screenshot(page, f"reg_blank_{stage}_{attempt}_after.png")
+        recovered = True
+
+    if _is_probably_blank_page(page):
+        logger.warning("[注册] %s 刷新后仍为空白页 | URL=%s", stage, getattr(page, "url", ""))
+    return recovered
+
+
 def find_and_click(page, selectors, label="元素", timeout=3000):
     for sel in selectors:
         try:
@@ -161,6 +258,211 @@ def find_visible(page, selectors, label="元素", timeout=3000):
     return None
 
 
+def _first_visible_editable_locator(page, selectors, timeout=800):
+    candidates = selectors if isinstance(selectors, (list, tuple)) else [selectors]
+    for selector in candidates:
+        try:
+            locator = page.locator(selector).first
+            if not locator.is_visible(timeout=timeout):
+                continue
+            if locator.is_editable(timeout=timeout):
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+def _visible_single_char_code_inputs(page, timeout=300):
+    try:
+        visible_inputs = []
+        for locator in page.locator(INVITE_MULTI_CODE_SELECTOR).all():
+            try:
+                if locator.is_visible(timeout=timeout) and locator.is_editable(timeout=timeout):
+                    visible_inputs.append(locator)
+            except Exception:
+                continue
+        if len(visible_inputs) >= 4:
+            return visible_inputs
+    except Exception:
+        pass
+    return []
+
+
+def _input_attr(locator, name):
+    try:
+        value = locator.get_attribute(name)
+    except Exception:
+        return ""
+    return (value or "").strip()
+
+
+def _visible_input_summary(page, limit=8):
+    summary = []
+    try:
+        inputs = page.locator("input").all()
+    except Exception:
+        return summary
+
+    for locator in inputs:
+        try:
+            if not locator.is_visible(timeout=300):
+                continue
+            if not locator.is_editable(timeout=300):
+                continue
+        except Exception:
+            continue
+
+        summary.append(
+            {
+                "type": _input_attr(locator, "type"),
+                "name": _input_attr(locator, "name"),
+                "placeholder": _input_attr(locator, "placeholder"),
+                "aria_label": _input_attr(locator, "aria-label"),
+                "autocomplete": _input_attr(locator, "autocomplete"),
+                "inputmode": _input_attr(locator, "inputmode"),
+                "maxlength": _input_attr(locator, "maxlength"),
+            }
+        )
+        if len(summary) >= limit:
+            break
+    return summary
+
+
+def _detect_invite_register_step(page):
+    url = (getattr(page, "url", "") or "").lower()
+    body = _page_excerpt(page).lower()
+
+    if any(token in url for token in ("challenge", "captcha", "human")):
+        return "blocked"
+    if any(token in body for token in ("verify you are human", "captcha", "human verification")):
+        return "blocked"
+    if any(token in url for token in ("phone", "sms", "mobile")):
+        return "phone_verification"
+    if any(token in body for token in ("phone number", "mobile number", "sms verification")):
+        return "phone_verification"
+    if "about-you" in url or "complete-profile" in url or "profile" in url:
+        return "about_you"
+    if _visible_single_char_code_inputs(page, timeout=300):
+        return "code"
+    if _first_visible_editable_locator(page, INVITE_CODE_SELECTORS, timeout=300):
+        return "code"
+    if any(token in url for token in ("email-verification", "verification", "verify", "otp")):
+        return "code"
+    try:
+        if page.locator('input[name="name"], [role="spinbutton"]').first.is_visible(timeout=300):
+            return "about_you"
+    except Exception:
+        pass
+    if any(token in body for token in ("join workspace", "accept invite", "welcome", "workspace")):
+        return "about_you"
+    if "chatgpt.com" in url and "auth" not in url:
+        return "completed"
+    if any(token in body for token in ("code", "verification", "one-time code", "otp")):
+        return "code"
+    return "unknown"
+
+
+def _wait_for_invite_code_target(page, timeout=INVITE_CODE_RENDER_TIMEOUT):
+    deadline = time.time() + max(0.0, float(timeout))
+
+    while time.time() < deadline:
+        split_inputs = _visible_single_char_code_inputs(page, timeout=300)
+        if split_inputs:
+            return {
+                "mode": "split",
+                "target": split_inputs,
+                "url": page.url,
+                "body": _page_excerpt(page),
+                "inputs": _visible_input_summary(page),
+            }
+
+        code_input = _first_visible_editable_locator(page, INVITE_CODE_SELECTORS, timeout=300)
+        if code_input:
+            return {
+                "mode": "single",
+                "target": code_input,
+                "url": page.url,
+                "body": _page_excerpt(page),
+                "inputs": _visible_input_summary(page),
+            }
+
+        step = _detect_invite_register_step(page)
+        if step != "code":
+            return {
+                "mode": "advanced",
+                "step": step,
+                "url": page.url,
+                "body": _page_excerpt(page),
+                "inputs": _visible_input_summary(page),
+            }
+
+        time.sleep(0.5)
+
+    step = _detect_invite_register_step(page)
+    if step != "code":
+        return {
+            "mode": "advanced",
+            "step": step,
+            "url": page.url,
+            "body": _page_excerpt(page),
+            "inputs": _visible_input_summary(page),
+        }
+    return {
+        "mode": "timeout",
+        "step": "code",
+        "url": page.url,
+        "body": _page_excerpt(page),
+        "inputs": _visible_input_summary(page),
+    }
+
+
+def _wait_for_invite_step_change(page, current_step, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        step = _detect_invite_register_step(page)
+        if step != current_step:
+            return step
+        time.sleep(0.5)
+    return _detect_invite_register_step(page)
+
+
+def _submit_invite_verification_code(page, code_target, verification_code):
+    mode = (code_target or {}).get("mode")
+    target = (code_target or {}).get("target")
+    submit_field = None
+    current_step = _detect_invite_register_step(page)
+
+    if mode == "split" and isinstance(target, list):
+        for i, char in enumerate(verification_code):
+            if i >= len(target):
+                break
+            target[i].fill(char)
+            time.sleep(0.1)
+        if target:
+            submit_field = target[0]
+    elif mode == "single" and target:
+        target.fill(verification_code)
+        submit_field = target
+    else:
+        return _detect_invite_register_step(page)
+
+    time.sleep(0.5)
+    if submit_field is not None:
+        find_and_click(
+            page,
+            [
+                'button:has-text("Continue")',
+                'button:has-text("Verify")',
+                'button:has-text("Submit")',
+                'button:has-text("Confirm")',
+                'button:has-text("继续")',
+                'button[type="submit"]',
+            ],
+            "确认按钮",
+        )
+    return _wait_for_invite_step_change(page, current_step, timeout=20)
+
+
 def wait_for_cloudflare(page, max_wait=60):
     for i in range(max_wait // 5):
         html = page.content()[:2000].lower()
@@ -171,8 +473,17 @@ def wait_for_cloudflare(page, max_wait=60):
     return False
 
 
-def register_with_invite(page, invite_link, email, mail_client, password=None):
-    """用邀请链接注册 ChatGPT 账号并加入 workspace，返回 (success, password)"""
+def register_with_invite(page, invite_link, email, mail_client, password=None, signup_profile=None):
+    """用邀请链接注册 ChatGPT 账号并加入 workspace，返回 (success, password)。
+
+    signup_profile (Round 12 S3 cherry-pick from upstream)：
+        可选 :class:`autoteam.signup_profile.SignupProfile` 实例。传入时 about-you
+        阶段的姓名/生日/年龄从该 snapshot 取，调用方再把同一份 profile 透传给
+        Codex OAuth about-you，确保两阶段一致(避免 OpenAI 风控对前后不一致的
+        身份信息触发 add_phone)。
+
+        默认 None → 保持原 fork 的"每次随机"行为(向后兼容,不影响现有调用方)。
+    """
 
     logger.info("[注册] 打开邀请链接...")
     page.goto(invite_link, wait_until="domcontentloaded", timeout=60000)
@@ -301,56 +612,56 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
     logger.info("[注册] 输入验证码: %s", verification_code)
     screenshot(page, "reg_05_before_code.png")
 
-    # 检查是否是多个单字符输入框
-    single_inputs = page.locator('input[maxlength="1"]').all()
-    if len(single_inputs) >= 4:
-        logger.debug("[注册] 检测到 %d 个单字符输入框", len(single_inputs))
-        for i, char in enumerate(verification_code):
-            if i < len(single_inputs):
-                single_inputs[i].fill(char)
-                time.sleep(0.2)
-    else:
-        code_input = find_visible(
-            page,
-            [
-                'input[name="code"]',
-                'input[placeholder*="code" i]',
-                'input[placeholder*="验证" i]',
-                'input[type="text"]',
-                'input[inputmode="numeric"]',
-            ],
-            "验证码输入框",
-        )
-        if code_input:
-            code_input.fill(verification_code)
+    logger.info("[注册] 等待验证码输入框渲染...")
+    code_target_result = _wait_for_invite_code_target(page, timeout=INVITE_CODE_RENDER_TIMEOUT)
+    mode = code_target_result.get("mode")
+    code_target = None
+    if mode in {"single", "split"}:
+        code_target = code_target_result
+        logger.info("[注册] 验证码输入框已就绪（mode=%s）", mode)
+    elif mode == "advanced":
+        step = code_target_result.get("step")
+        if step in {"about_you", "completed"}:
+            logger.info(
+                "[注册] 验证码页等待期间流程已推进到 %s | URL: %s",
+                step,
+                code_target_result.get("url") or page.url,
+            )
         else:
-            logger.warning("[注册] 未找到验证码输入框")
+            logger.warning(
+                "[注册] 等待验证码输入框期间页面切换到 %s，暂停注册 | URL: %s | body=%s | inputs=%s",
+                step,
+                code_target_result.get("url") or page.url,
+                code_target_result.get("body", ""),
+                code_target_result.get("inputs", []),
+            )
             screenshot(page, "reg_05_no_code_input.png")
             return False, password
+    else:
+        logger.warning(
+            "[注册] 未找到验证码输入框 | 类型=code_input_timeout | URL=%s | 阶段=%s | body=%s | inputs=%s",
+            code_target_result.get("url") or page.url,
+            code_target_result.get("step", "code"),
+            code_target_result.get("body", ""),
+            code_target_result.get("inputs", []),
+        )
+        screenshot(page, "reg_05_no_code_input.png")
+        return False, password
 
-    time.sleep(1)
+    if code_target:
+        next_step = _submit_invite_verification_code(page, code_target, verification_code)
+        logger.info("[注册] 验证码提交后状态: %s | URL: %s", next_step, page.url)
 
-    # 点击确认
-    find_and_click(
-        page,
-        [
-            'button:has-text("Continue")',
-            'button:has-text("Verify")',
-            'button:has-text("Submit")',
-            'button[type="submit"]',
-        ],
-        "确认按钮",
-    )
-
-    time.sleep(8)
     screenshot(page, "reg_06_after_code.png")
     logger.info("[注册] 当前 URL: %s", page.url)
     assert_not_blocked(page, "code_submit")
 
-    # 随机身份（每个账号不同，降低批量注册特征）
-    bday = random_birthday()
-    full_name = random_full_name()
-    age_value = random_age()
+    # 随机身份（每个账号不同，降低批量注册特征）。始终归一成
+    # SignupProfile，确保注册 about-you 与 Codex OAuth about-you 复用同一份快照。
+    signup_profile = signup_profile or generate_signup_profile()
+    bday = dict(signup_profile.birthday or {})
+    full_name = signup_profile.full_name
+    age_value = signup_profile.age_text or signup_profile.age
     logger.info(
         "[注册] 本次身份: name=%s birthday=%s/%s/%s age=%s",
         full_name,
@@ -428,6 +739,7 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
         time.sleep(8)
         screenshot(page, "reg_07_after_profile.png")
         assert_not_blocked(page, "profile_submit")
+        _recover_blank_invite_page(page, "after_profile_submit")
 
     # 可能需要接受条款 / 加入 workspace
     find_and_click(
@@ -444,6 +756,7 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
         timeout=5000,
     )
     time.sleep(5)
+    _recover_blank_invite_page(page, "final")
     screenshot(page, "reg_08_final.png")
 
     # 检查结果
@@ -451,6 +764,8 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
     page_text = page.inner_text("body")[:500].lower()
 
     if "chatgpt.com" in current_url and "auth" not in current_url:
+        if _is_probably_blank_page(page):
+            logger.warning("[注册] 最终页仍为空白，但 URL 已进入 ChatGPT，继续后续 session/cookie 验证 | URL=%s", current_url)
         logger.info("[注册] 注册成功并已加入 workspace!")
         return True, password
     elif "workspace" in page_text or "welcome" in page_text:
@@ -473,15 +788,50 @@ def run():
         account_id, email = mail_client.create_temp_email()
         logger.info("[邀请] 临时邮箱: %s", email)
 
-        # Step 2: 发送 Team 邀请
+        # Step 2: 发送 Team 邀请。invite_member 内部已带 default→usage_based 兜底,
+        # 我们只需读 _seat_type 字段决定落盘的 seat_type 常量。
         chatgpt = ChatGPTTeamAPI()
         chatgpt.start()
-        status, data = chatgpt.invite_member(email)
 
-        if status != 200:
-            logger.error("[邀请] 邀请失败 (HTTP %d)", status)
+        # PREFERRED_SEAT_TYPE: "default"(默认 — 优先 ChatGPT 席位 PATCH 升级)
+        #                     "codex"(锁定 codex-only,跳过 PATCH 升级)
+        try:
+            from autoteam.runtime_config import get_preferred_seat_type
+            preferred = (get_preferred_seat_type() or "default").lower()
+        except Exception:
+            preferred = "default"
+        seat_for_invite = "default" if preferred != "codex" else "usage_based"
+        allow_patch = preferred != "codex"
+        status, data = chatgpt.invite_member(
+            email, seat_type=seat_for_invite, allow_patch_upgrade=allow_patch
+        )
+
+        raw_seat = (data or {}).get("_seat_type", "unknown") if isinstance(data, dict) else "unknown"
+        seat_label = _seat_label_from_raw(raw_seat)
+
+        if status != 200 or raw_seat == "unknown":
+            err_kind = (data or {}).get("_error_kind", "unknown") if isinstance(data, dict) else "unknown"
+            errored = (data or {}).get("_errored_emails") if isinstance(data, dict) else None
+            logger.error(
+                "[邀请] 邀请失败 (HTTP %d, kind=%s, errored=%s)",
+                status,
+                err_kind,
+                bool(errored),
+            )
             return False
-        logger.info("[邀请] 邀请已发送")
+        logger.info("[邀请] 邀请已发送 (seat_type=%s → %s)", raw_seat, seat_label)
+        # 邀请发送成功就把账号入池(seat_type / workspace_account_id 落盘),
+        # 即便后续注册流程失败,至少 accounts.json 留有一条记录给上游 reconcile / fill 使用。
+        # workspace_account_id 用于母号切换检测,详见 accounts.add_account 文档。
+        from autoteam.admin_state import get_chatgpt_account_id
+
+        add_account(
+            email,
+            "",
+            cloudmail_account_id=account_id,
+            seat_type=seat_label,
+            workspace_account_id=get_chatgpt_account_id() or None,
+        )
 
         # Step 3: 等待邀请邮件
         logger.info("[邀请] 等待邀请邮件...")
@@ -511,20 +861,24 @@ def run():
         logger.info("[邀请] 开始注册 ChatGPT 账号")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(**get_playwright_launch_options())
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            )
-            page = context.new_page()
+            browser = None
+            context = None
+            page = None
+            try:
+                browser = p.chromium.launch(**get_playwright_launch_options())
+                context = browser.new_context(**get_playwright_context_options())
+                page = context.new_page()
 
-            result, pwd = register_with_invite(page, invite_link, email, mail_client)
+                result, pwd = register_with_invite(page, invite_link, email, mail_client)
 
-            screenshot(page, "final.png")
-            browser.close()
+                screenshot(page, "final.png")
+            finally:
+                close_playwright_objects(page, context, browser, logger=logger, label="invite-registration")
 
         if result:
             logger.info("[邀请] %s 已注册并加入 ChatGPT Team", email)
+            # 注册成功后再把 seat_type 复写一次 — 防止 add_account 时账号已存在被旧值覆盖
+            update_account(email, seat_type=seat_label)
         else:
             logger.error("[邀请] 流程未完成，请查看 screenshots/ 目录")
 

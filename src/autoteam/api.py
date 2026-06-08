@@ -3,32 +3,231 @@
 import json
 import logging
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
+from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from autoteam.config import API_KEY
+from autoteam.runtime_resources import collect_runtime_resource_snapshot, log_runtime_resource_snapshot
 from autoteam.textio import read_text
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_runtime_resource_snapshot() -> dict:
+    try:
+        return collect_runtime_resource_snapshot()
+    except Exception as exc:
+        logger.warning("[资源] runtime resource snapshot failed: %s", exc)
+        return {"error": "runtime_resource_snapshot_failed"}
+
+
+def _safe_ipv6_pool_status() -> dict:
+    try:
+        from autoteam.ipv6_pool import ipv6_pool
+
+        return ipv6_pool.status()
+    except Exception as exc:
+        logger.warning("[IPv6Pool] status unavailable: %s", exc)
+        return {
+            "enabled": False,
+            "required": False,
+            "ok": False,
+            "count": 0,
+            "unhealthy_count": 0,
+            "expired_count": 0,
+            "last_error": str(exc),
+            "preflight": {"ok": False, "errors": ["status_unavailable"], "warnings": []},
+            "entries": [],
+        }
+
+
+def _safe_cliproxy_health(**kwargs) -> dict:
+    try:
+        from autoteam.cliproxy_health import get_cliproxy_health
+
+        return get_cliproxy_health(**kwargs)
+    except Exception as exc:
+        logger.warning("[API] CLIProxyAPI health check failed: %s", exc)
+        return {
+            "ok": False,
+            "safe_read_only": True,
+            "management_api": {"ok": False, "reason": "health_check_exception"},
+            "provider_auth": {
+                "ok": False,
+                "provider": "codex",
+                "model": os.environ.get("CLIPROXY_HEALTH_MODEL") or "gpt-5.5",
+                "reason": "health_check_exception",
+                "total": 0,
+                "available": 0,
+                "check_type": "management_metadata",
+                "canary_required": True,
+            },
+            "error": str(exc),
+        }
+
+
+def _safe_multi_master_status() -> dict:
+    try:
+        from autoteam.multi_master import build_multi_master_status
+
+        return build_multi_master_status()
+    except Exception as exc:
+        logger.warning("[API] multi-master status failed: %s", exc)
+        return {"enabled": False, "owner_count": 0, "owners": [], "error": str(exc)}
+
+
+def _require_sync_target_configs(action_label: str):
+    """Require at least one fully configured enabled remote sync target."""
+    from autoteam.sync_targets import get_enabled_sync_targets, get_missing_target_configs
+
+    enabled_targets = get_enabled_sync_targets()
+    if not enabled_targets:
+        raise HTTPException(
+            status_code=400, detail=f"{action_label} 前请先在配置面板启用至少一个远端同步目标（CPA 或 Sub2API）"
+        )
+
+    missing = get_missing_target_configs(enabled_targets)
+    if missing:
+        fields = "、".join(f"{key}（{label}）" for key, label in missing)
+        raise HTTPException(status_code=400, detail=f"{action_label} 前请先在配置面板填写：{fields}")
+
+
+# Round 7 P2.4 — FastAPI 现代 lifespan handler 替代已废弃的 @app.on_event。
+# 启动期:修复 auths 认证文件权限 + 启动 _auto_check_loop 后台线程。
+# 停止期:发 _auto_check_stop 信号让线程优雅退出。
+# 引用的 _auto_check_loop / _auto_check_stop / ensure_auth_file_permissions 都在
+# module 后段定义,Python 闭包延迟绑定符合预期(yield 时才会解析名字)。
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    logger.info("[lifespan] starting")
+    try:
+        from autoteam.auth_storage import ensure_auth_file_permissions
+
+        fixed = ensure_auth_file_permissions()
+        if fixed:
+            logger.info("[启动] 已修复 %d 个 auths 认证文件权限", fixed)
+    except Exception as exc:
+        logger.warning("[启动] 修复 auths 认证文件权限失败: %s", exc)
+
+    # Round 9 RT-1 — 启动时跑 1 次 retroactive 重分类,解 "重启后 stale active" 根因。
+    # spec/shared/master-subscription-health.md v1.1 §11.3。
+    # 默认 ON,设 STARTUP_RETROACTIVE_DISABLE=1 关闭。后台线程跑,失败仅 warning。
+    if os.getenv("STARTUP_RETROACTIVE_DISABLE", "").strip().lower() not in ("1", "true", "yes"):
+        def _startup_retroactive():
+            try:
+                from autoteam.master_health import _apply_master_degraded_classification
+
+                retro = _apply_master_degraded_classification()
+                if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+                    logger.info(
+                        "[启动-retroactive] GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                        len(retro.get("marked_grace") or []),
+                        len(retro.get("marked_standby") or []),
+                        len(retro.get("reverted_active") or []),
+                    )
+                elif retro and retro.get("skipped_reason"):
+                    logger.info("[启动-retroactive] skipped: %s", retro["skipped_reason"])
+            except Exception as exc:
+                logger.warning("[启动-retroactive] 异常(不阻塞启动): %s", exc)
+
+        try:
+            threading.Thread(target=_startup_retroactive, daemon=True).start()
+        except Exception as exc:
+            logger.warning("[启动-retroactive] 后台线程启动失败: %s", exc)
+
+    try:
+        from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
+        from autoteam.ipv6_pool import ipv6_pool
+
+        active_emails = [
+            acc["email"]
+            for acc in load_accounts()
+            if acc.get("status") == STATUS_ACTIVE
+            and acc.get("email")
+            and not _is_main_account_email(acc.get("email"))
+            and not is_account_disabled(acc)
+        ]
+        ipv6_pool.start(active_emails=active_emails)
+    except Exception as exc:
+        logger.warning("[启动] IPv6 代理池启动失败: %s", exc)
+
+    thread = threading.Thread(target=_auto_check_loop, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        logger.info("[lifespan] stopping")
+        _auto_check_stop.set()
+        try:
+            _pw_executor.stop()
+        except Exception as exc:
+            logger.warning("[lifespan] stopping Playwright executor failed: %s", exc)
+        try:
+            from autoteam.ipv6_pool import ipv6_pool
+
+            ipv6_pool.stop_all()
+        except Exception as exc:
+            logger.warning("[lifespan] stopping IPv6 proxy pool failed: %s", exc)
+
 
 app = FastAPI(
     title="AutoTeam API",
     description="ChatGPT Team 账号自动轮转管理 API",
     version="0.1.0",
+    lifespan=app_lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# 版本端点 (SPEC-3 §5) - 不鉴权,纯只读
+# ---------------------------------------------------------------------------
+
+
+class VersionResponse(BaseModel):
+    """镜像版本指纹响应 - 来自 Dockerfile build args。"""
+
+    git_sha: str
+    build_time: str
+
+
+@app.get(
+    "/api/version",
+    response_model=VersionResponse,
+    summary="返回镜像构建期注入的 git-sha 与时间戳",
+    tags=["meta"],
+)
+def api_version() -> VersionResponse:
+    return VersionResponse(
+        git_sha=os.getenv("AUTOTEAM_GIT_SHA", "unknown"),
+        build_time=os.getenv("AUTOTEAM_BUILD_TIME", "unknown"),
+    )
+
 
 # ---------------------------------------------------------------------------
 # API Key 鉴权中间件
 # ---------------------------------------------------------------------------
 
-_AUTH_SKIP_PATHS = {"/api/auth/check", "/api/setup/status", "/api/setup/save"}
+_AUTH_SKIP_PATHS = {
+    "/api/auth/check",
+    "/api/setup/status",
+    "/api/setup/save",
+    "/api/version",
+    "/api/setup/dns/check",  # Read-only setup diagnostic; route enforces Bearer once API_KEY exists.
+    "/api/mail-provider/probe",  # SPEC-1 §3.5 — 条件鉴权:API_KEY 配置后路由内强制 Bearer
+}
 
 
 @app.middleware("http")
@@ -68,32 +267,185 @@ def check_auth(request: Request):
 
 
 class SetupConfig(BaseModel):
+    """`/api/setup/save` 请求体。SPEC-1 §2.1 — 含 cf_temp_email + maillab 两套 mail 字段。"""
+
+    MAIL_PROVIDER: Literal["cf_temp_email", "cloudflare_temp_email", "maillab"] = "cf_temp_email"
     CLOUDMAIL_BASE_URL: str = ""
     CLOUDMAIL_EMAIL: str = ""
     CLOUDMAIL_PASSWORD: str = ""
     CLOUDMAIL_DOMAIN: str = ""
+    MAILLAB_API_URL: str = ""
+    MAILLAB_USERNAME: str = ""
+    MAILLAB_PASSWORD: str = ""
+    MAILLAB_DOMAIN: str = ""
     CPA_URL: str = "http://127.0.0.1:8317"
     CPA_KEY: str = ""
+    ROTATE_NEW_ACCOUNT_MODE: str = "domain_auto_join_first"
+    AUTOTEAM_AUTO_JOIN_DOMAINS: str = "auto"
+    ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE: str | bool = "true"
     PLAYWRIGHT_PROXY_URL: str = ""
     PLAYWRIGHT_PROXY_BYPASS: str = ""
     API_KEY: str = ""
 
 
+class ProbeErrorCode(str, Enum):
+    ROUTE_NOT_FOUND = "ROUTE_NOT_FOUND"
+    PROVIDER_MISMATCH = "PROVIDER_MISMATCH"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    FORBIDDEN_DOMAIN = "FORBIDDEN_DOMAIN"
+    CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
+    NETWORK = "NETWORK"
+    TIMEOUT = "TIMEOUT"
+    EMPTY_DOMAIN_LIST = "EMPTY_DOMAIN_LIST"
+    UNKNOWN = "UNKNOWN"
+
+
+class MailProviderProbeRequest(BaseModel):
+    """`/api/mail-provider/probe` 请求体。SPEC-1 §2.1。"""
+
+    provider: Literal["cf_temp_email", "maillab"]
+    step: Literal["fingerprint", "credentials", "domain_ownership"]
+    base_url: str = Field(..., min_length=1, max_length=512)
+    admin_password: str = ""
+    username: str = ""
+    password: str = ""
+    domain: str = ""
+    bearer_token: str = ""
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalize_base_url(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("base_url 必须以 http:// 或 https:// 开头")
+        return v
+
+    @field_validator("domain")
+    @classmethod
+    def _normalize_domain(cls, v: str) -> str:
+        return (v or "").strip().lstrip("@")
+
+
+class MailProviderProbeResponse(BaseModel):
+    ok: bool
+    step: Literal["fingerprint", "credentials", "domain_ownership"]
+    error_code: ProbeErrorCode | None = None
+    message: str | None = None
+    hint: str | None = None
+    warnings: list[str] = []
+    detected_provider: Literal["cf_temp_email", "maillab", "unknown"] | None = None
+    domain_list: list[str] | None = None
+    add_verify_open: bool | None = None
+    register_verify_open: bool | None = None
+    is_admin: bool | None = None
+    user_email: str | None = None
+    token_preview: str | None = None
+    probe_email: str | None = None
+    probe_account_id: int | None = None
+    cleaned: bool | None = None
+    leaked_probe: dict | None = None
+
+
+class DNSRecordCheck(BaseModel):
+    type: Literal["A", "AAAA", "CNAME", "MX", "TXT"]
+    name: str = Field(..., min_length=1, max_length=253)
+    expected: str = Field(..., min_length=1, max_length=2048)
+
+
+class DNSDiagnosticRequest(BaseModel):
+    domain: str = ""
+    mail_host: str = ""
+    mail_ip: str = ""
+    mx_target: str = ""
+    spf_value: str = ""
+    openai_domain_verification: str = ""
+    records: list[DNSRecordCheck] = Field(default_factory=list)
+
+    @field_validator("domain", "mail_host", "mx_target")
+    @classmethod
+    def _normalize_dns_name(cls, v: str) -> str:
+        return (v or "").strip().lstrip("@").rstrip(".").lower()
+
+
+class DNSCheckResponse(BaseModel):
+    type: Literal["A", "AAAA", "CNAME", "MX", "TXT"]
+    name: str
+    expected: str
+    observed: list[str] = Field(default_factory=list)
+    ok: bool
+    error: str | None = None
+
+
+class DNSDiagnosticResponse(BaseModel):
+    ok: bool
+    domain: str = ""
+    checks: list[DNSCheckResponse] = Field(default_factory=list)
+    all_ok: bool = False
+    safe_read_only: bool = True
+    error_code: str | None = None
+    message: str | None = None
+
+
+_CF_MAIL_KEYS = {"CLOUDMAIL_BASE_URL", "CLOUDMAIL_PASSWORD", "CLOUDMAIL_DOMAIN"}
+_MAILLAB_KEYS = {"MAILLAB_API_URL", "MAILLAB_USERNAME", "MAILLAB_PASSWORD", "MAILLAB_DOMAIN"}
+_ROTATE_NEW_ACCOUNT_MODES = {"domain_auto_join_first", "invite_first", "direct_first"}
+
+
+def _normalize_setup_bool(value, *, field: str) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled", "y", "t"}:
+        return "true"
+    if text in {"0", "false", "no", "off", "disabled", "n", "f"}:
+        return "false"
+    raise ValueError(f"{field} 必须是 true 或 false")
+
+
+def _normalize_rotation_setup_values(data: dict) -> None:
+    mode = str(data.get("ROTATE_NEW_ACCOUNT_MODE", "") or "").strip().lower()
+    if mode:
+        if mode not in _ROTATE_NEW_ACCOUNT_MODES:
+            raise ValueError("ROTATE_NEW_ACCOUNT_MODE 必须是 domain_auto_join_first、invite_first 或 direct_first")
+        data["ROTATE_NEW_ACCOUNT_MODE"] = mode
+
+    domains = str(data.get("AUTOTEAM_AUTO_JOIN_DOMAINS", "") or "").strip()
+    if domains:
+        data["AUTOTEAM_AUTO_JOIN_DOMAINS"] = ",".join(
+            part.strip().lower().lstrip("@").rstrip(".")
+            for part in domains.split(",")
+            if part.strip()
+        ) or "auto"
+    else:
+        data["AUTOTEAM_AUTO_JOIN_DOMAINS"] = ""
+
+    data["ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE"] = _normalize_setup_bool(
+        data.get("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", "true"),
+        field="ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE",
+    )
+
+
 @app.get("/api/setup/status")
 def get_setup_status():
-    """检查配置是否完整"""
+    """检查配置是否完整 — SPEC-1 §3.6:按 provider 动态标 optional。"""
     from autoteam.setup_wizard import REQUIRED_CONFIGS, _read_env
 
     env = _read_env()
+    provider = (env.get("MAIL_PROVIDER") or os.environ.get("MAIL_PROVIDER") or "cf_temp_email").strip().lower()
     fields = []
     all_ok = True
     for key, prompt, default, optional in REQUIRED_CONFIGS:
+        # 不属于当前 provider 的 mail 字段强制 optional
+        if provider == "maillab" and key in _CF_MAIL_KEYS:
+            optional = True
+        elif provider in ("cf_temp_email", "cloudflare_temp_email") and key in _MAILLAB_KEYS:
+            optional = True
         val = env.get(key, "") or os.environ.get(key, "")
         ok = bool(val)
         if not ok and not optional:
             all_ok = False
         fields.append({"key": key, "prompt": prompt, "default": default, "optional": optional, "configured": ok})
-    return {"configured": all_ok, "fields": fields}
+    return {"configured": all_ok, "fields": fields, "provider": provider}
 
 
 @app.post("/api/setup/save")
@@ -109,9 +461,25 @@ def post_setup_save(config: SetupConfig):
         data["CPA_URL"] = defaults.get("CPA_URL", "http://127.0.0.1:8317")
     if not data.get("API_KEY"):
         data["API_KEY"] = _secrets.token_urlsafe(24)
+    try:
+        _normalize_rotation_setup_values(data)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"message": str(exc), "api_key": data["API_KEY"]})
 
-    clearable_fields = {"PLAYWRIGHT_PROXY_URL", "PLAYWRIGHT_PROXY_BYPASS"}
+    # SPEC-1 §3.6 — 按 provider 互斥写入,避免无关字段污染 .env
+    provider = (data.get("MAIL_PROVIDER") or "cf_temp_email").strip().lower()
+    if provider in ("cf_temp_email", "cloudflare_temp_email"):
+        skip_keys = set(_MAILLAB_KEYS)
+    elif provider == "maillab":
+        # CLOUDMAIL_DOMAIN 保留作 maillab 的 fallback;仅跳过 base_url/password
+        skip_keys = {"CLOUDMAIL_BASE_URL", "CLOUDMAIL_PASSWORD"}
+    else:
+        skip_keys = set()
+
+    clearable_fields = {"AUTOTEAM_AUTO_JOIN_DOMAINS", "PLAYWRIGHT_PROXY_URL", "PLAYWRIGHT_PROXY_BYPASS"}
     for key, value in data.items():
+        if key in skip_keys:
+            continue
         if value or key in clearable_fields:
             _write_env(key, value)
             os.environ[key] = value
@@ -149,6 +517,119 @@ def post_setup_save(config: SetupConfig):
 
 
 # ---------------------------------------------------------------------------
+# Mail Provider 在线探测 (SPEC-1 §3.5) — 三步分阶段验证
+# ---------------------------------------------------------------------------
+
+_probe_rate_buckets: dict[str, list[float]] = {}
+_probe_rate_lock = threading.Lock()
+
+
+def _enforce_probe_rate_limit(request: Request, max_per_min: int = 60):
+    """SPEC §NFR-速率限制:setup 阶段 (无 API_KEY) 单 IP 60 req/min,防扫描。"""
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    with _probe_rate_lock:
+        bucket = _probe_rate_buckets.setdefault(ip, [])
+        bucket[:] = [t for t in bucket if now - t < 60]
+        if len(bucket) >= max_per_min:
+            raise HTTPException(status_code=429, detail="probe 请求过频,请稍后再试")
+        bucket.append(now)
+
+
+def _enforce_setup_probe_access(request: Request):
+    """Setup diagnostics are open before API_KEY exists and Bearer-gated after setup."""
+    from autoteam.config import API_KEY as _key
+
+    if _key:
+        auth_header = request.headers.get("authorization", "")
+        if not (auth_header.startswith("Bearer ") and auth_header[7:] == _key):
+            raise HTTPException(status_code=401, detail="API_KEY 已配置,请提供 Bearer token")
+    else:
+        _enforce_probe_rate_limit(request)
+
+
+@app.post("/api/mail-provider/probe", response_model=MailProviderProbeResponse)
+def post_mail_provider_probe(req: MailProviderProbeRequest, request: Request):
+    """SPEC-1 §3.5 — 三步分阶段:fingerprint → credentials → domain_ownership。
+
+    鉴权策略:
+      - API_KEY 未配置(setup 阶段):放行,但走 IP 速率限制
+      - API_KEY 已配置:强制 Bearer(_AUTH_SKIP_PATHS 已加白,这里手工二次校验)
+    """
+    _enforce_setup_probe_access(request)
+
+    from autoteam.mail import probe as mail_probe
+
+    try:
+        if req.step == "fingerprint":
+            result = mail_probe.probe_fingerprint(req.base_url, req.provider)
+        elif req.step == "credentials":
+            result = mail_probe.probe_credentials(
+                req.base_url,
+                req.provider,
+                username=req.username,
+                password=req.password,
+                admin_password=req.admin_password,
+            )
+        else:  # domain_ownership
+            result = mail_probe.probe_domain_ownership(
+                req.base_url,
+                req.provider,
+                bearer_token=req.bearer_token,
+                admin_password=req.admin_password,
+                domain=req.domain,
+                username=req.username,
+                password=req.password,
+            )
+    except mail_probe.ProbeError as exc:
+        return MailProviderProbeResponse(
+            ok=False,
+            step=req.step,
+            error_code=ProbeErrorCode(exc.error_code) if exc.error_code in ProbeErrorCode.__members__ else ProbeErrorCode.UNKNOWN,
+            message=exc.message,
+            hint=exc.hint,
+        )
+    except Exception as exc:  # noqa: BLE001 — 兜底
+        logger.exception("[probe] %s 异常: %s", req.step, exc)
+        return MailProviderProbeResponse(
+            ok=False,
+            step=req.step,
+            error_code=ProbeErrorCode.UNKNOWN,
+            message=str(exc),
+        )
+
+    # ProbeResult → ProbeResponse(忽略内部 bearer_token,前端不持有)
+    payload = {k: v for k, v in vars(result).items() if k != "bearer_token"}
+    if "error_code" in payload and payload["error_code"]:
+        try:
+            payload["error_code"] = ProbeErrorCode(payload["error_code"])
+        except ValueError:
+            payload["error_code"] = ProbeErrorCode.UNKNOWN
+    return MailProviderProbeResponse(**payload)
+
+
+@app.post("/api/setup/dns/check", response_model=DNSDiagnosticResponse)
+def post_setup_dns_check(req: DNSDiagnosticRequest, request: Request):
+    """Read-only DNS diagnostics for setup/domain verification records."""
+    _enforce_setup_probe_access(request)
+
+    from autoteam import dns_diagnostics
+
+    admin_payload = req.model_dump(exclude={"records"})
+    admin_payload["email_domain"] = admin_payload.pop("domain", "")
+    extra_checks = [record.model_dump() for record in req.records]
+    try:
+        result = dns_diagnostics.check_admin_dns(admin_payload, extra_checks=extra_checks)
+    except dns_diagnostics.DNSDiagnosticError as exc:
+        return DNSDiagnosticResponse(ok=False, error_code="INVALID_REQUEST", message=str(exc))
+    except Exception as exc:  # noqa: BLE001 - endpoint must not expose stack traces during setup
+        logger.exception("[dns] setup DNS check failed: %s", exc)
+        return DNSDiagnosticResponse(ok=False, error_code="UNKNOWN", message=str(exc))
+
+    return DNSDiagnosticResponse(ok=bool(result.get("all_ok")), **result)
+
+
+# ---------------------------------------------------------------------------
 # 后台任务管理
 # ---------------------------------------------------------------------------
 
@@ -159,8 +640,10 @@ _admin_login_api = None
 _admin_login_step: str | None = None
 _main_codex_flow = None
 _main_codex_step: str | None = None
+_main_codex_action: str | None = None
 _manual_account_flow = None
 MAX_TASK_HISTORY = 50
+MAX_TASK_PROGRESS_HISTORY = 200
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +651,8 @@ MAX_TASK_HISTORY = 50
 # ---------------------------------------------------------------------------
 
 import queue as _queue
+
+from autoteam._playwright_guard import assert_sync_context
 
 
 class _PlaywrightExecutor:
@@ -178,6 +663,8 @@ class _PlaywrightExecutor:
         self._thread: threading.Thread | None = None
 
     def _worker(self):
+        # SPEC-4 §3.2: worker 线程入口必须在普通线程,不允许 asyncio loop
+        assert_sync_context()
         while True:
             item = self._queue.get()
             if item is None:
@@ -207,6 +694,8 @@ class _PlaywrightExecutor:
         后续通过 _pw_executor 提交的调用会在队列里等它自然完成。调用方需要自己
         确保不会越过 _playwright_lock 边界并发触发这种情况。
         """
+        # SPEC-4 §3.2: 主线程前置检查,拦下 asyncio loop 误入
+        assert_sync_context()
         self.ensure_started()
         result_event = threading.Event()
         result_holder: dict = {}
@@ -241,11 +730,12 @@ def _current_busy_detail(default_message: str):
         }
 
     if _main_codex_flow:
+        command = "main-codex-login" if _main_codex_action == "login" else "main-codex-sync"
         return {
             "message": default_message,
             "running_task": {
-                "task_id": "main-codex-sync",
-                "command": "main-codex-sync",
+                "task_id": command,
+                "command": command,
                 "started_at": None,
             },
         }
@@ -271,6 +761,236 @@ def _prune_tasks():
             del _tasks[tid]
 
 
+_TASK_VALIDATION_COMMANDS = {"auto-fill", "auto-rotate", "rotate", "cleanup", "fill"}
+_ROTATION_VALIDATION_COMMANDS = {"auto-fill", "auto-rotate", "rotate", "fill"}
+_rotation_validation_cooldown = {
+    "next_rotate_after": 0.0,
+    "recorded_at": 0.0,
+    "severity": "",
+    "reason": "",
+}
+
+
+def _auto_check_int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _validation_reasons(validation: dict | None) -> list[str]:
+    if not isinstance(validation, dict):
+        return []
+    reasons = validation.get("reasons")
+    if isinstance(reasons, list):
+        return [str(item) for item in reasons if str(item)]
+    reason = validation.get("reason")
+    return [str(reason)] if reason else []
+
+
+def _validation_failure_reason(validation: dict | None) -> str:
+    reasons = _validation_reasons(validation)
+    return "; ".join(reasons) if reasons else "unknown"
+
+
+def _validation_is_hard_failure(validation: dict | None) -> bool:
+    if not isinstance(validation, dict):
+        return False
+    if validation.get("severity") == "degraded":
+        return False
+    return not validation.get("ok", True)
+
+
+def _record_rotation_validation_decision(command: str, validation: dict | None) -> None:
+    if command not in _ROTATION_VALIDATION_COMMANDS or not isinstance(validation, dict):
+        return
+
+    severity = str(validation.get("severity") or ("ok" if validation.get("ok", True) else "failed"))
+    if severity == "ok":
+        _rotation_validation_cooldown.update(
+            {
+                "next_rotate_after": 0.0,
+                "recorded_at": time.time(),
+                "severity": "ok",
+                "reason": "",
+            }
+        )
+        return
+
+    seconds = _auto_check_int_env(
+        "AUTO_CHECK_DEGRADED_COOLDOWN_SECONDS" if severity == "degraded" else "AUTO_CHECK_FAILED_COOLDOWN_SECONDS",
+        120 if severity == "degraded" else 300,
+    )
+    now = time.time()
+    next_rotate_after = now + seconds if seconds > 0 else 0.0
+    reason = _validation_failure_reason(validation)
+    _rotation_validation_cooldown.update(
+        {
+            "next_rotate_after": next_rotate_after,
+            "recorded_at": now,
+            "severity": severity,
+            "reason": reason,
+        }
+    )
+    followup = validation.setdefault("followup", {})
+    followup["cooldown_seconds"] = seconds
+    followup["next_eligible_rotation_at"] = next_rotate_after
+
+
+def _rotation_validation_cooldown_remaining() -> float:
+    next_rotate_after = float(_rotation_validation_cooldown.get("next_rotate_after") or 0.0)
+    if next_rotate_after <= 0:
+        return 0.0
+    return max(0.0, next_rotate_after - time.time())
+
+
+def _log_task_runtime_validation(command: str) -> dict | None:
+    """Record post-task runtime truth so completed tasks do not hide broken pool state."""
+    if command not in _TASK_VALIDATION_COMMANDS:
+        return None
+
+    try:
+        from autoteam.accounts import STATUS_ACTIVE, STATUS_AUTH_INVALID, is_account_disabled, load_accounts
+        from autoteam.codex_auth import check_codex_quota
+        from autoteam.manager import _pool_active_target
+
+        accounts = load_accounts()
+        target_seats = _resolve_auto_check_target_seats(_auto_check_config)
+        pool_target = _pool_active_target(target_seats)
+        team_count = _auto_check_team_member_count(timeout_seconds=20, retries=1)
+
+        active_with_auth = 0
+        auth_pending = 0
+        auth_file_count = 0
+        quota_ok = 0
+        quota_exhausted = 0
+        quota_auth_error = 0
+        quota_unknown = 0
+        primary_pcts: list[int] = []
+
+        for acc in accounts:
+            if _is_main_account_email(acc.get("email")) or is_account_disabled(acc):
+                continue
+            status = acc.get("status")
+            auth_path = _resolve_status_auth_file(acc)
+            if status == STATUS_AUTH_INVALID:
+                auth_pending += 1
+            if auth_path:
+                auth_file_count += 1
+            if status != STATUS_ACTIVE or not auth_path:
+                continue
+
+            active_with_auth += 1
+            try:
+                auth_data = json.loads(read_text(Path(auth_path)))
+                access_token = auth_data.get("access_token")
+                if not access_token:
+                    quota_unknown += 1
+                    continue
+                quota_status, info = check_codex_quota(access_token)
+                if quota_status == "ok":
+                    quota_ok += 1
+                elif quota_status == "exhausted":
+                    quota_exhausted += 1
+                elif quota_status == "auth_error":
+                    quota_auth_error += 1
+                else:
+                    quota_unknown += 1
+                if isinstance(info, dict) and isinstance(info.get("primary_pct"), (int, float)):
+                    primary_pcts.append(int(info["primary_pct"]))
+            except Exception:
+                quota_unknown += 1
+
+        logger.info(
+            "[验收] %s 后: team=%s/%s active_with_auth=%d/%d auth_invalid=%d auth_files=%d "
+            "quota_ok=%d exhausted=%d auth_error=%d unknown=%d primary_pct=%s",
+            command,
+            team_count if team_count >= 0 else "unknown",
+            target_seats,
+            active_with_auth,
+            pool_target,
+            auth_pending,
+            auth_file_count,
+            quota_ok,
+            quota_exhausted,
+            quota_auth_error,
+            quota_unknown,
+            ",".join(str(v) for v in primary_pcts[:8]) or "-",
+        )
+        validation = {
+            "ok": True,
+            "severity": "ok",
+            "operation_success": True,
+            "pool_health_ok": True,
+            "followup_required": False,
+            "reasons": [],
+            "team_count": team_count,
+            "target_seats": target_seats,
+            "pool_target": pool_target,
+            "active_with_auth": active_with_auth,
+            "auth_pending": auth_pending,
+            "auth_file_count": auth_file_count,
+            "quota_ok": quota_ok,
+            "quota_exhausted": quota_exhausted,
+            "quota_auth_error": quota_auth_error,
+            "quota_unknown": quota_unknown,
+            "primary_pct": primary_pcts[:8],
+        }
+        hard_reasons: list[str] = []
+        followup_reasons: list[str] = []
+
+        if team_count >= 0 and team_count != target_seats:
+            hard_reasons.append(f"team_count={team_count}/{target_seats}")
+        if active_with_auth < pool_target:
+            hard_reasons.append(f"active_with_auth={active_with_auth}/{pool_target}")
+        if quota_auth_error > 0:
+            hard_reasons.append(f"quota_auth_error={quota_auth_error}")
+        if quota_ok < pool_target:
+            followup_reasons.append(f"quota_ok={quota_ok}/{pool_target}")
+
+        cpa_credential_gate = _collect_cpa_credential_gate()
+        if cpa_credential_gate.get("enabled"):
+            validation["cpa_credential_gate"] = cpa_credential_gate
+            validation["provider_auth_available"] = cpa_credential_gate.get("available")
+            if _cpa_provider_auth_below_pool_target(cpa_credential_gate, pool_target):
+                available = int(cpa_credential_gate.get("available") or 0)
+                followup_reasons.append(f"provider_auth_available={available}/{pool_target}")
+
+        if hard_reasons:
+            validation.update(
+                {
+                    "ok": False,
+                    "severity": "failed",
+                    "operation_success": False,
+                    "pool_health_ok": False,
+                    "followup_required": True,
+                    "reasons": hard_reasons + followup_reasons,
+                    "reason": "; ".join(hard_reasons + followup_reasons),
+                }
+            )
+        elif followup_reasons:
+            validation.update(
+                {
+                    "ok": False,
+                    "severity": "degraded",
+                    "operation_success": True,
+                    "pool_health_ok": False,
+                    "followup_required": True,
+                    "reasons": followup_reasons,
+                    "reason": "; ".join(followup_reasons),
+                    "followup": {
+                        "recommended_command": "rotate",
+                        "reason": "; ".join(followup_reasons),
+                    },
+                }
+            )
+
+        return validation
+    except Exception as exc:
+        logger.warning("[验收] %s 后运行态核查失败: %s", command, exc)
+        return None
+
+
 def _run_task(task_id: str, func, *args, **kwargs):
     """在后台线程中执行任务"""
     from autoteam import cancel_signal
@@ -286,6 +1006,9 @@ def _run_task(task_id: str, func, *args, **kwargs):
     _current_task_id = task_id
     task["status"] = "running"
     task["started_at"] = time.time()
+    task["last_progress_at"] = task["started_at"]
+    task["progress"] = "started"
+    _record_task_progress(task, "started", task["started_at"])
 
     try:
         result = func(*args, **kwargs)
@@ -297,9 +1020,55 @@ def _run_task(task_id: str, func, *args, **kwargs):
         task["error"] = str(e)
         logger.error("[API] 任务 %s %s: %s", task_id[:8], task["status"], e)
     finally:
+        _record_task_progress(task, "runtime_validation")
+        validation = _log_task_runtime_validation(task.get("command", ""))
         task["finished_at"] = time.time()
+        task["last_progress_at"] = task["finished_at"]
+        if validation is not None:
+            task["validation"] = validation
+            _record_rotation_validation_decision(task.get("command", ""), validation)
+            if task["status"] == "completed" and _validation_is_hard_failure(validation):
+                task["status"] = "failed"
+                task["error"] = f"runtime validation failed: {_validation_failure_reason(validation)}"
+        _record_task_progress(task, "finished", task["finished_at"])
         _current_task_id = None
         _playwright_lock.release()
+
+
+def _record_task_progress(task: dict, stage: str, now: float | None = None) -> None:
+    """Record task stage timings for live diagnostics."""
+    timestamp = time.time() if now is None else now
+    stage_name = str(stage or task.get("progress") or "progress")
+    history = task.setdefault("progress_history", [])
+
+    if history and history[-1].get("stage") == stage_name:
+        history[-1]["last_at"] = timestamp
+        history[-1]["duration_sec"] = round(timestamp - float(history[-1].get("started_at", timestamp)), 3)
+        return
+
+    if history:
+        previous = history[-1]
+        previous["ended_at"] = timestamp
+        previous["duration_sec"] = round(timestamp - float(previous.get("started_at", timestamp)), 3)
+
+    history.append({"stage": stage_name, "started_at": timestamp, "last_at": timestamp})
+    if len(history) > MAX_TASK_PROGRESS_HISTORY:
+        del history[: len(history) - MAX_TASK_PROGRESS_HISTORY]
+
+
+def bump_task_progress(stage: str = "") -> None:
+    """Update the current background task heartbeat and optional stage label."""
+    tid = _current_task_id
+    if not tid:
+        return
+    task = _tasks.get(tid)
+    if not task:
+        return
+    now = time.time()
+    task["last_progress_at"] = now
+    if stage:
+        task["progress"] = stage
+        _record_task_progress(task, stage, now)
 
 
 def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
@@ -319,6 +1088,9 @@ def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
         "finished_at": None,
         "result": None,
         "error": None,
+        "last_progress_at": time.time(),
+        "progress": "pending",
+        "progress_history": [],
     }
     _tasks[task_id] = task
     _prune_tasks()
@@ -335,8 +1107,16 @@ def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
 
 
 class TaskParams(BaseModel):
-    target: int = 5
+    target: int = 3
     leave_workspace: bool = False  # cmd_fill 专用：True 表示生产免费号（注册后退出 Team 走 personal OAuth）
+
+
+class MultiMasterFillParams(BaseModel):
+    target: int = 3
+    owner_workers: int | None = None
+    direct_parallel: int | None = None
+    workspace_ids: list[str] | None = None
+    dry_run: bool = False
 
 
 class CleanupParams(BaseModel):
@@ -379,9 +1159,24 @@ class RegisterDomainParams(BaseModel):
     verify: bool = True  # 默认写入前试探一次 CloudMail 是否接受该域
 
 
+class PreferredSeatTypeParams(BaseModel):
+    """SPEC-2 FR-G — 邀请席位偏好。"default"(优先 PATCH 升级 ChatGPT 完整席位) | "codex"(锁 codex-only)"""
+    value: str  # "default" | "codex"
+
+
+class SyncProbeParams(BaseModel):
+    """SPEC-2 FR-E — sync_account_states 被踢探测的并发上限和去重冷却。"""
+    concurrency: int | None = None  # 1..16
+    cooldown_minutes: int | None = None  # 1..1440
+
+
 class DeleteBatchParams(BaseModel):
     emails: list[str]
     continue_on_error: bool = True  # 部分失败时继续剩余账号,False 则遇错即停
+
+
+class AccountDisableParams(BaseModel):
+    emails: list[str]
 
 
 def _normalized_email(value: str | None) -> str:
@@ -425,8 +1220,12 @@ def _resolve_status_auth_file(acc: dict) -> str:
 
 
 def _display_account_status(acc: dict, quota_snapshot: dict | None = None) -> str:
+    from autoteam.accounts import is_account_disabled
+
     status = acc.get("status", "")
     if not _is_main_account_email(acc.get("email")):
+        if is_account_disabled(acc):
+            return "disabled"
         return status
 
     quota_status = _quota_snapshot_status(quota_snapshot) or _quota_snapshot_status(acc.get("last_quota"))
@@ -440,6 +1239,7 @@ def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
     sanitized = {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id")}
     sanitized["is_main_account"] = _is_main_account_email(acc.get("email"))
+    sanitized["raw_status"] = acc.get("status", "")
     sanitized["status"] = _display_account_status(acc, quota_snapshot)
     return sanitized
 
@@ -461,6 +1261,7 @@ def _main_codex_status():
     return {
         "in_progress": _main_codex_flow is not None,
         "step": _main_codex_step,
+        "action": _main_codex_action,
     }
 
 
@@ -511,7 +1312,7 @@ def _finish_admin_login(completed: dict):
                 logger.warning("[API] 管理员登录完成，但刷新主号认证文件失败: %s", exc)
         if _playwright_lock.locked():
             _playwright_lock.release()
-    return {"status": "completed", "admin": _admin_status(), "info": info}
+    return {"status": "completed", "admin": _admin_status(), "codex": _main_codex_status(), "info": info}
 
 
 def _set_pending_admin_login(api, step):
@@ -521,9 +1322,10 @@ def _set_pending_admin_login(api, step):
     return {"status": step, "admin": _admin_status()}
 
 
-def _finish_main_codex_sync():
-    global _main_codex_flow, _main_codex_step
+def _finish_main_codex_flow():
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     flow = _main_codex_flow
+    action = _main_codex_action or "sync"
     try:
         info = _pw_executor.run(flow.complete)
     finally:
@@ -534,21 +1336,44 @@ def _finish_main_codex_sync():
                 pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
+
+    if action == "login":
+        message = "主号 Codex 已登录"
+    else:
+        from autoteam.sync_targets import describe_sync_targets, get_enabled_sync_targets
+
+        enabled_targets = get_enabled_sync_targets()
+        target_label = describe_sync_targets(enabled_targets)
+        message = (
+            f"主号 Codex 已同步到 {target_label}"
+            if enabled_targets
+            else "主号 Codex 已保存，本轮未启用远端同步目标"
+        )
     return {
         "status": "completed",
-        "message": "主号 Codex 已同步到 CPA",
+        "message": message,
         "codex": _main_codex_status(),
         "info": info,
     }
 
 
-def _set_pending_main_codex_sync(flow, step):
-    global _main_codex_flow, _main_codex_step
+def _finish_main_codex_sync():
+    return _finish_main_codex_flow()
+
+
+def _set_pending_main_codex_flow(flow, step, action):
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     _main_codex_flow = flow
     _main_codex_step = step
+    _main_codex_action = action
     return {"status": step, "codex": _main_codex_status()}
+
+
+def _set_pending_main_codex_sync(flow, step):
+    return _set_pending_main_codex_flow(flow, step, "sync")
 
 
 def _finish_manual_account_flow(result: dict):
@@ -720,18 +1545,165 @@ def get_admin_diagnose():
                 r = api._api_fetch("GET", path)
                 probes[name] = {"status": r.get("status"), "body": (r.get("body") or "")[:500]}
 
+            # Round 8 — SPEC-2 v1.5 §6.2:diagnose 内嵌 master_subscription_state(read-only,5min cache)
+            try:
+                from autoteam.master_health import is_master_subscription_healthy
+                healthy, reason, evidence = is_master_subscription_healthy(api)
+                master_state = {
+                    "healthy": healthy,
+                    "reason": reason,
+                    "evidence": evidence,
+                }
+            except Exception as exc:
+                master_state = {
+                    "healthy": None,
+                    "reason": "probe_exception",
+                    "evidence": {"detail": str(exc)[:200]},
+                }
+
             return {
                 "admin_email": get_admin_email(),
                 "account_id": account_id,
                 "access_token_present": bool(api.access_token),
                 "access_token_prefix": (api.access_token or "")[:30],
                 "probes": probes,
+                "master_subscription_state": master_state,
             }
         finally:
             try:
                 api.stop()
             except Exception:
                 pass
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行"))
+    try:
+        return _pw_executor.run(_do)
+    finally:
+        _playwright_lock.release()
+
+
+@app.get("/api/admin/master-health")
+def get_admin_master_health(request: Request):
+    """Round 8 — 母号订阅健康度独立端点。
+
+    Round 9 SPEC v1.1 §13 endpoint 守恒:任何场景**永不返回 5xx**,
+    全部异常映射到 200 OK + business field(reason='auth_invalid' / 'network_error')。
+
+    查询参数:
+        force_refresh=1 → 跳过 5min cache 直接重测
+    返回 is_master_subscription_healthy() 的完整 (healthy, reason, evidence) 三元组。
+    UI 用于"立即重测"按钮。
+    """
+    force_refresh = str(request.query_params.get("force_refresh", "")).strip().lower() in (
+        "1", "true", "yes",
+    )
+
+    def _do():
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+        from autoteam.master_health import is_master_subscription_healthy
+
+        api = None
+        try:
+            try:
+                api = ChatGPTTeamAPI()
+                api.start()
+            except Exception as exc:
+                # spec §13.2 — start() 失败映射 auth_invalid 200 OK
+                logger.warning("[master-health] ChatGPTTeamAPI start failed: %s", exc)
+                return {
+                    "healthy": False,
+                    "reason": "auth_invalid",
+                    "evidence": {
+                        "http_status": None,
+                        "detail": f"chatgpt_api_start_failed:{type(exc).__name__}",
+                        "cache_hit": False,
+                        "probed_at": time.time(),
+                    },
+                    "force_refresh": force_refresh,
+                }
+            try:
+                healthy, reason, evidence = is_master_subscription_healthy(
+                    api, force_refresh=force_refresh,
+                )
+                # Round 12 wire-up (C2) — feed every "force-refresh re-probe"
+                # into WorkspacePool so connect 3 unhealthy → auto failover.
+                # apply_pool_health_signal swallows internally (M-I1).
+                try:
+                    from autoteam.master_health import apply_pool_health_signal
+                    apply_pool_health_signal(healthy, reason, evidence)
+                except Exception as pool_exc:  # pragma: no cover — defensive
+                    logger.warning(
+                        "[master-health] pool signal failed: %s", pool_exc,
+                    )
+                return {
+                    "healthy": healthy,
+                    "reason": reason,
+                    "evidence": evidence,
+                    "force_refresh": force_refresh,
+                }
+            except Exception as exc:
+                # spec §13.2 — probe 双保险,is_master_subscription_healthy 自身永不抛,
+                # 这里兜底把任何意外异常映射 network_error 200 OK
+                logger.warning(
+                    "[master-health] probe unexpected exception: %s", exc,
+                )
+                return {
+                    "healthy": False,
+                    "reason": "network_error",
+                    "evidence": {
+                        "http_status": None,
+                        "detail": f"probe_unexpected_exception:{type(exc).__name__}",
+                        "cache_hit": False,
+                        "probed_at": time.time(),
+                    },
+                    "force_refresh": force_refresh,
+                }
+        finally:
+            try:
+                if api is not None:
+                    api.stop()
+            except Exception:
+                pass
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行"))
+    try:
+        try:
+            return _pw_executor.run(_do)
+        except Exception as exc:
+            # spec §13.3 — _pw_executor 调度异常兜底,仍按 endpoint 守恒返回 200
+            logger.error("[master-health] _pw_executor.run failed: %s", exc)
+            return {
+                "healthy": False,
+                "reason": "network_error",
+                "evidence": {
+                    "http_status": None,
+                    "detail": f"executor_failed:{type(exc).__name__}",
+                    "cache_hit": False,
+                    "probed_at": time.time(),
+                },
+                "force_refresh": force_refresh,
+            }
+    finally:
+        _playwright_lock.release()
+
+
+@app.post("/api/admin/reconcile")
+def post_admin_reconcile(request: Request):
+    """对账 Team 实际成员 vs 本地状态,修复残废 / 错位 / 耗尽未抛弃 / ghost。
+
+    与 /api/admin/diagnose 使用同款鉴权模式(auth_middleware 已处理 API_KEY)。
+    查询参数:
+        dry_run=1 → 只诊断,不 KICK、不改 accounts.json
+    返回 _reconcile_team_members 的完整结果 dict。
+    """
+    from autoteam.manager import cmd_reconcile
+
+    dry_run = str(request.query_params.get("dry_run", "")).strip().lower() in ("1", "true", "yes")
+
+    def _do():
+        return cmd_reconcile(dry_run=dry_run)
 
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行"))
@@ -780,8 +1752,12 @@ def post_admin_login_start(params: AdminEmailParams):
 
         def _do_start(email):
             api = ChatGPTTeamAPI()
-            result = api.begin_admin_login(email)
-            return api, result
+            try:
+                result = api.begin_admin_login(email)
+                return api, result
+            except Exception:
+                api.stop()
+                raise
 
         api, result = _pw_executor.run(_do_start, params.email.strip())
         step = result["step"]
@@ -980,10 +1956,8 @@ def post_admin_logout():
     return {"message": "管理员登录态已清除", "admin": _admin_status()}
 
 
-@app.post("/api/main-codex/start")
-def post_main_codex_start():
-    """开始主号 Codex 登录并同步到 CPA。"""
-    global _main_codex_flow, _main_codex_step
+def _clear_active_main_codex_flow():
+    global _main_codex_flow, _main_codex_step, _main_codex_action
 
     if _main_codex_flow:
         try:
@@ -992,18 +1966,61 @@ def post_main_codex_start():
             pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
 
+
+def _start_main_codex_flow(action="sync"):
+    from autoteam.codex_auth import MainCodexLoginFlow, MainCodexSyncFlow
+
+    flow_cls = MainCodexSyncFlow if action == "sync" else MainCodexLoginFlow
+
+    def _do_start():
+        flow = flow_cls()
+        try:
+            result = flow.start()
+        except Exception:
+            try:
+                flow.stop()
+            except Exception:
+                pass
+            raise
+        return flow, result
+
+    flow, result = _pw_executor.run(_do_start)
+    step = result["step"]
+    if step == "completed":
+        _set_pending_main_codex_flow(flow, step, action)
+        return step, _finish_main_codex_flow()
+    if step in ("password_required", "code_required"):
+        return step, _set_pending_main_codex_flow(flow, step, action)
+
+    _pw_executor.run(flow.stop)
+    raise RuntimeError(result.get("detail") or "无法识别主号 Codex 登录步骤")
+
+
+@app.post("/api/main-codex/start")
+def post_main_codex_start():
+    """开始主号 Codex 登录并同步到已启用远端。"""
+    _clear_active_main_codex_flow()
+    _require_sync_target_configs("同步主号 Codex")
+
     from autoteam.codex_auth import get_saved_main_auth_file
-    from autoteam.cpa_sync import sync_main_codex_to_cpa
+    from autoteam.sync_targets import (
+        describe_sync_targets,
+        get_enabled_sync_targets,
+        sync_main_codex_to_configured_targets,
+    )
 
     saved_auth_file = get_saved_main_auth_file()
     if saved_auth_file:
-        sync_main_codex_to_cpa(saved_auth_file)
+        sync_main_codex_to_configured_targets(saved_auth_file)
+        enabled_targets = get_enabled_sync_targets()
+        target_label = describe_sync_targets(enabled_targets)
         return {
             "status": "completed",
-            "message": "主号 Codex 已同步到 CPA",
+            "message": f"主号 Codex 已同步到 {target_label}",
             "codex": _main_codex_status(),
             "info": {"auth_file": saved_auth_file},
         }
@@ -1011,26 +2028,32 @@ def post_main_codex_start():
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(
             status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再同步主号 Codex")
+    )
+
+    try:
+        _step, result = _start_main_codex_flow(action="sync")
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/main-codex/login")
+def post_main_codex_login():
+    """开始主号 Codex 登录，仅保存本地认证文件。"""
+    _clear_active_main_codex_flow()
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再登录主号 Codex")
         )
 
     try:
-        from autoteam.codex_auth import MainCodexSyncFlow
-
-        def _do_start():
-            flow = MainCodexSyncFlow()
-            result = flow.start()
-            return flow, result
-
-        flow, result = _pw_executor.run(_do_start)
-        step = result["step"]
-        if step == "completed":
-            _main_codex_flow = flow
-            return _finish_main_codex_sync()
-        if step in ("password_required", "code_required"):
-            return _set_pending_main_codex_sync(flow, step)
-        _pw_executor.run(flow.stop)
-        _playwright_lock.release()
-        raise HTTPException(status_code=400, detail=result.get("detail") or "无法识别主号 Codex 登录步骤")
+        _step, result = _start_main_codex_flow(action="login")
+        return result
     except HTTPException:
         raise
     except Exception as exc:
@@ -1042,7 +2065,7 @@ def post_main_codex_start():
 @app.post("/api/main-codex/password")
 def post_main_codex_password(params: AdminPasswordParams):
     """提交主号 Codex 登录密码。"""
-    global _main_codex_flow, _main_codex_step
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     if not _main_codex_flow or _main_codex_step != "password_required":
         raise HTTPException(status_code=409, detail="当前没有等待密码的主号 Codex 登录流程")
 
@@ -1064,6 +2087,7 @@ def post_main_codex_password(params: AdminPasswordParams):
             pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1072,7 +2096,7 @@ def post_main_codex_password(params: AdminPasswordParams):
 @app.post("/api/main-codex/code")
 def post_main_codex_code(params: AdminCodeParams):
     """提交主号 Codex 登录验证码。"""
-    global _main_codex_flow, _main_codex_step
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     if not _main_codex_flow or _main_codex_step != "code_required":
         raise HTTPException(status_code=409, detail="当前没有等待验证码的主号 Codex 登录流程")
 
@@ -1094,6 +2118,7 @@ def post_main_codex_code(params: AdminCodeParams):
             pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1102,7 +2127,7 @@ def post_main_codex_code(params: AdminCodeParams):
 @app.post("/api/main-codex/cancel")
 def post_main_codex_cancel():
     """取消主号 Codex 登录流程。"""
-    global _main_codex_flow, _main_codex_step
+    global _main_codex_flow, _main_codex_step, _main_codex_action
     if _main_codex_flow:
         try:
             _pw_executor.run(_main_codex_flow.stop)
@@ -1110,9 +2135,52 @@ def post_main_codex_cancel():
             pass
         _main_codex_flow = None
         _main_codex_step = None
+        _main_codex_action = None
         if _playwright_lock.locked():
             _playwright_lock.release()
     return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
+
+
+def _delete_main_codex_from_enabled_targets():
+    from autoteam.sync_targets import (
+        delete_main_codex_from_configured_targets,
+        describe_sync_targets,
+        get_enabled_sync_targets,
+    )
+
+    _require_sync_target_configs("删除主号 Codex 远端文件")
+
+    enabled_targets = get_enabled_sync_targets()
+    results = delete_main_codex_from_configured_targets()
+    deleted: list[str] = []
+    total_count = 0
+
+    for target in enabled_targets:
+        target_result = results.get(target) or {}
+        target_deleted = [str(item) for item in (target_result.get("deleted") or [])]
+        deleted.extend(target_deleted)
+        try:
+            total_count += int(target_result.get("count", len(target_deleted)) or 0)
+        except (TypeError, ValueError):
+            total_count += len(target_deleted)
+
+    return {
+        "message": f"已从 {describe_sync_targets(enabled_targets)} 删除 {total_count} 个主号认证文件",
+        "deleted": deleted,
+        "results": results,
+    }
+
+
+@app.post("/api/main-codex/delete-remote-files")
+def post_main_codex_delete_remote_files():
+    """删除已启用远端中已上传的主号 Codex 认证文件。"""
+    return _delete_main_codex_from_enabled_targets()
+
+
+@app.post("/api/main-codex/delete-cpa")
+def post_main_codex_delete_cpa():
+    """兼容旧接口：删除已启用远端中的主号 Codex 认证文件。"""
+    return _delete_main_codex_from_enabled_targets()
 
 
 @app.post("/api/manual-account/start")
@@ -1241,6 +2309,118 @@ def get_standby():
     return [_sanitize_account(a) for a in accounts]
 
 
+def _toggle_account_disabled(email: str, disabled: bool):
+    from autoteam.accounts import find_account, load_accounts, update_account
+
+    email = _normalized_email(email)
+    if not email:
+        raise HTTPException(status_code=400, detail="请提供有效邮箱")
+    if _is_main_account_email(email):
+        raise HTTPException(status_code=400, detail="主号不允许禁用或启用")
+
+    accounts = load_accounts()
+    acc = find_account(accounts, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    update_account(email, disabled=bool(disabled))
+    refreshed = find_account(load_accounts(), email)
+    action = "禁用" if disabled else "启用"
+    return {
+        "message": f"已{action} {email}",
+        "email": email,
+        "disabled": bool(disabled),
+        "account": _sanitize_account(refreshed or {**acc, "disabled": bool(disabled)}),
+    }
+
+
+def _toggle_accounts_disabled(emails: list[str], disabled: bool):
+    from autoteam.accounts import load_accounts, save_accounts
+
+    normalized_emails = []
+    seen = set()
+    for value in emails or []:
+        email = _normalized_email(value)
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        normalized_emails.append(email)
+
+    if not normalized_emails:
+        raise HTTPException(status_code=400, detail="请至少提供一个有效邮箱")
+
+    accounts = load_accounts()
+    by_email = {_normalized_email(acc.get("email")): acc for acc in accounts if acc.get("email")}
+
+    updated = []
+    unchanged = []
+    missing = []
+    skipped_main = []
+
+    for email in normalized_emails:
+        if _is_main_account_email(email):
+            skipped_main.append(email)
+            continue
+        acc = by_email.get(email)
+        if not acc:
+            missing.append(email)
+            continue
+        if bool(acc.get("disabled", False)) == bool(disabled):
+            unchanged.append(email)
+            continue
+        acc["disabled"] = bool(disabled)
+        updated.append(email)
+
+    if updated:
+        save_accounts(accounts)
+        accounts = load_accounts()
+        by_email = {_normalized_email(acc.get("email")): acc for acc in accounts if acc.get("email")}
+
+    action = "禁用" if disabled else "启用"
+    parts = [f"已{action} {len(updated)} 个账号"]
+    if unchanged:
+        parts.append(f"{len(unchanged)} 个已是目标状态")
+    if skipped_main:
+        parts.append(f"跳过主号 {len(skipped_main)} 个")
+    if missing:
+        parts.append(f"未找到 {len(missing)} 个")
+
+    return {
+        "message": "，".join(parts),
+        "disabled": bool(disabled),
+        "updated_count": len(updated),
+        "updated_emails": updated,
+        "unchanged_emails": unchanged,
+        "skipped_main_accounts": skipped_main,
+        "missing_emails": missing,
+        "accounts": [_sanitize_account(by_email[email]) for email in updated if email in by_email],
+    }
+
+
+@app.post("/api/accounts/bulk/disable")
+def post_bulk_disable_accounts(params: AccountDisableParams):
+    """批量禁用账号：保留本地记录，但自动巡检、轮转和 CPA 同步会跳过。"""
+    return _toggle_accounts_disabled(params.emails, True)
+
+
+@app.post("/api/accounts/bulk/enable")
+def post_bulk_enable_accounts(params: AccountDisableParams):
+    """批量启用账号：恢复参与自动巡检、轮转和 CPA 同步。"""
+    return _toggle_accounts_disabled(params.emails, False)
+
+
+@app.post("/api/accounts/{email}/disable")
+def post_disable_account(email: str):
+    """禁用账号：保留本地记录，但自动巡检、轮转和 CPA 同步会跳过。"""
+    return _toggle_account_disabled(email, True)
+
+
+@app.post("/api/accounts/{email}/enable")
+def post_enable_account(email: str):
+    """启用账号：恢复参与自动巡检、轮转和 CPA 同步。"""
+    return _toggle_account_disabled(email, False)
+
+
 @app.delete("/api/accounts/{email}")
 def delete_account(email: str):
     """删除本地管理账号及其关联资源。"""
@@ -1289,7 +2469,7 @@ def delete_accounts_batch(params: DeleteBatchParams):
     from autoteam.accounts import load_accounts
     from autoteam.chatgpt_api import ChatGPTTeamAPI
     from autoteam.cloudmail import CloudMailClient
-    from autoteam.cpa_sync import sync_to_cpa
+    from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
 
     raw_emails = [(e or "").strip() for e in (params.emails or [])]
     emails = [e for e in raw_emails if e]
@@ -1315,19 +2495,47 @@ def delete_accounts_batch(params: DeleteBatchParams):
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再批量删除"))
 
     def _run():
+        from autoteam.accounts import STATUS_AUTH_INVALID, STATUS_PERSONAL
+
         accounts = load_accounts()
         existing = {(a.get("email") or "").lower(): a for a in accounts}
+
+        # SPEC-2 §3.5.2 + Round 6 PRD-5 FR-P1.4:批量删除若整批都是 personal/auth_invalid,
+        # 整批跳过 ChatGPTTeamAPI 启动 — 这两类不需要 remote_state(成员/邀请),纯本地清理。
+        # 关键:bool(targets_in_pool) 守卫空 list,避免 all([]) == True 误判;
+        # 同时如果传入 emails 全部不存在(existing 没匹配),也不应短路(走原 chatgpt_api 路径
+        # 让循环里给每条返回"账号不存在")。
+        targets_in_pool = [
+            existing[e.lower()]
+            for e in emails
+            if e.lower() in existing
+        ]
+        all_local_only = bool(targets_in_pool) and all(
+            (a.get("status") in (STATUS_PERSONAL, STATUS_AUTH_INVALID))
+            for a in targets_in_pool
+        )
 
         chatgpt_api = None
         mail_client = None
         results = []
         try:
-            chatgpt_api = ChatGPTTeamAPI()
-            chatgpt_api.start()
-            mail_client = CloudMailClient()
-            mail_client.login()
-            # 整批共享一次 Team 状态快照,避免每个删除都重查一次
-            remote_state = fetch_team_state(chatgpt_api)
+            remote_state = None
+            if not all_local_only:
+                # 至少一个号需要 Team 远端同步 — 启动共享 ChatGPTTeamAPI / mail_client
+                chatgpt_api = ChatGPTTeamAPI()
+                chatgpt_api.start()
+                mail_client = CloudMailClient()
+                mail_client.login()
+                # 整批共享一次 Team 状态快照,避免每个删除都重查一次
+                remote_state = fetch_team_state(chatgpt_api)
+            else:
+                # 全 personal/auth_invalid 路径:cloudmail 仍可能要清理(personal 有 cloudmail_account_id),
+                # 但 mail_client 由 delete_managed_account 内部按需懒加载(own_mail_client 路径),
+                # 这里不预启动 ChatGPTTeamAPI。
+                logger.info(
+                    "[批量删除] 整批 %d 个账号均为 personal/auth_invalid,跳过 ChatGPTTeamAPI 启动(FR-P1.4 短路)",
+                    len(targets_in_pool),
+                )
 
             for email in emails:
                 if email.lower() not in existing:
@@ -1338,10 +2546,10 @@ def delete_accounts_batch(params: DeleteBatchParams):
                 try:
                     cleanup = delete_managed_account(
                         email,
-                        chatgpt_api=chatgpt_api,
-                        mail_client=mail_client,
-                        remote_state=remote_state,
-                        sync_cpa_after=False,  # 整批结束后统一同步
+                        chatgpt_api=chatgpt_api,        # all_local_only=True 时为 None
+                        mail_client=mail_client,        # 同上,delete_managed_account 内部懒加载
+                        remote_state=remote_state,      # 同上
+                        sync_cpa_after=False,            # 整批结束后统一同步
                     )
                     results.append({"email": email, "ok": True, "cleanup": cleanup})
                 except Exception as exc:
@@ -1380,6 +2588,208 @@ def delete_accounts_batch(params: DeleteBatchParams):
         _playwright_lock.release()
 
 
+# ---------------------------------------------------------------------------
+# Round 11 — 子号实时探活 + 模型列表(用户 Q3 痛点)
+# ---------------------------------------------------------------------------
+
+
+class ProbeAccountParams(BaseModel):
+    """`/api/accounts/{email}/probe` 请求体。"""
+
+    force_codex_smoke: bool = True
+
+
+@app.post("/api/accounts/{email}/probe")
+def post_account_probe(email: str, params: ProbeAccountParams = ProbeAccountParams()):
+    """Round 11 AC5 — 子号实时探活:并行 check_codex_quota + cheap_codex_smoke。
+
+    用 access_token 直接探,不进队列,不抢 Playwright 锁(纯 HTTP 请求)。
+    落 last_quota_check_at + last_quota,返回 status_before / status_after。
+    """
+    from autoteam.accounts import find_account, load_accounts, update_account
+    from autoteam.codex_auth import cheap_codex_smoke, check_codex_quota
+
+    email = email.strip().lower()
+    if _is_main_account_email(email):
+        raise HTTPException(status_code=400, detail="主号不属于子号探活对象,请用 /api/admin/master-health")
+
+    accounts = load_accounts()
+    acc = find_account(accounts, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    auth_file = acc.get("auth_file")
+    if not auth_file or not Path(auth_file).exists():
+        raise HTTPException(status_code=422, detail={
+            "error": "auth_file_missing",
+            "message": "账号无可用 auth_file,无法探活",
+        })
+
+    try:
+        auth_data = json.loads(Path(auth_file).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail={
+            "error": "auth_file_unreadable",
+            "message": f"auth_file 解析失败: {type(exc).__name__}",
+        })
+
+    access_token = auth_data.get("access_token") or (auth_data.get("tokens") or {}).get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=422, detail={
+            "error": "access_token_missing",
+            "message": "auth_file 中缺 access_token,无法探活",
+        })
+
+    account_id = (
+        auth_data.get("account_id")
+        or (auth_data.get("tokens") or {}).get("account_id")
+        or acc.get("workspace_account_id")
+    )
+
+    status_before = acc.get("status")
+
+    # 并行不强求,顺序也行 — quota 后跑 smoke
+    try:
+        quota_status, quota_info = check_codex_quota(access_token, account_id=account_id)
+    except Exception as exc:
+        logger.warning("[probe %s] check_codex_quota 异常: %s", email, exc)
+        quota_status, quota_info = "network_error", None
+
+    try:
+        smoke_result, smoke_detail = cheap_codex_smoke(
+            access_token,
+            account_id=account_id,
+            force=bool(params.force_codex_smoke),
+        )
+    except Exception as exc:
+        logger.warning("[probe %s] cheap_codex_smoke 异常: %s", email, exc)
+        smoke_result, smoke_detail = "uncertain", f"exception:{type(exc).__name__}"
+
+    # 落 last_quota_check_at;quota_info 是 quota 快照才落
+    update_fields = {"last_quota_check_at": time.time()}
+    if quota_status == "ok" and isinstance(quota_info, dict):
+        update_fields["last_quota"] = quota_info
+    try:
+        update_account(email, **update_fields)
+    except Exception as exc:
+        logger.warning("[probe %s] update_account 失败: %s", email, exc)
+
+    # 重新读最新状态
+    accounts2 = load_accounts()
+    acc2 = find_account(accounts2, email) or acc
+
+    return {
+        "email": email,
+        "status_before": status_before,
+        "status_after": acc2.get("status"),
+        "quota_status": quota_status,
+        "quota_info": quota_info if isinstance(quota_info, dict) else None,
+        "smoke_result": smoke_result,
+        "smoke_detail": smoke_detail,
+        "last_quota_check_at": update_fields["last_quota_check_at"],
+    }
+
+
+@app.get("/api/accounts/{email}/models")
+def get_account_models(email: str):
+    """Round 11 AC7 — 用 access_token 调 /backend-api/models 拿可用模型列表。
+
+    返回 {email, plan_type, models: [{slug, name, description, ...}, ...]}
+    401/403 → 401 + auth_invalid;timeout → 503;其他 → 502。
+    """
+    import requests
+
+    from autoteam.accounts import find_account, load_accounts
+
+    email = email.strip().lower()
+    accounts = load_accounts()
+    acc = find_account(accounts, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    auth_file = acc.get("auth_file")
+    if not auth_file or not Path(auth_file).exists():
+        raise HTTPException(status_code=422, detail={
+            "error": "auth_file_missing",
+            "message": "账号无可用 auth_file",
+        })
+
+    try:
+        auth_data = json.loads(Path(auth_file).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail={
+            "error": "auth_file_unreadable",
+            "message": f"auth_file 解析失败: {type(exc).__name__}",
+        })
+
+    access_token = auth_data.get("access_token") or (auth_data.get("tokens") or {}).get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=422, detail={
+            "error": "access_token_missing",
+        })
+
+    account_id = (
+        auth_data.get("account_id")
+        or (auth_data.get("tokens") or {}).get("account_id")
+        or acc.get("workspace_account_id")
+    )
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    if account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+
+    try:
+        resp = requests.get(
+            "https://chatgpt.com/backend-api/models",
+            headers=headers,
+            timeout=10.0,
+        )
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=503, detail={"error": "timeout"})
+    except requests.exceptions.RequestException as exc:
+        raise HTTPException(status_code=502, detail={
+            "error": "network_error",
+            "message": f"{type(exc).__name__}",
+        })
+
+    if resp.status_code in (401, 403):
+        raise HTTPException(status_code=401, detail={
+            "error": "auth_invalid",
+            "http_status": resp.status_code,
+        })
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail={
+            "error": f"upstream_status_{resp.status_code}",
+            "body_preview": (resp.text or "")[:200],
+        })
+
+    try:
+        body = resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={
+            "error": "json_parse_error",
+            "message": f"{type(exc).__name__}",
+        })
+
+    models = body.get("models") if isinstance(body, dict) else None
+    if not isinstance(models, list):
+        models = []
+
+    plan_type = None
+    if isinstance(body, dict):
+        plan_type = body.get("plan_type") or body.get("category") or None
+
+    return {
+        "email": email,
+        "plan_type": plan_type,
+        "models": models,
+        "raw_keys": list(body.keys()) if isinstance(body, dict) else [],
+    }
+
+
 @app.post("/api/accounts/{email}/kick")
 def post_kick_account(email: str):
     """将账号从 Team 中移出，状态变为 standby"""
@@ -1404,8 +2814,8 @@ def post_kick_account(email: str):
             from autoteam.chatgpt_api import ChatGPTTeamAPI
 
             chatgpt = ChatGPTTeamAPI()
-            chatgpt.start()
             try:
+                chatgpt.start()
                 return remove_from_team(chatgpt, email)
             finally:
                 chatgpt.stop()
@@ -1446,18 +2856,56 @@ def post_account_login(params: LoginAccountParams):
             quota_result_resets_at,
             save_auth_file,
         )
+        from autoteam.invite import RegisterBlocked
+        from autoteam.register_failures import record_failure
 
         # 账号状态决定登录模式：PERSONAL 走 use_personal=True 补个人号 OAuth；其他走 Team 模式
         use_personal = acc.get("status") == STATUS_PERSONAL
 
         mail_client = CloudMailClient()
         mail_client.login()
-        bundle = login_codex_via_browser(
-            email,
-            acc.get("password", ""),
-            mail_client=mail_client,
-            use_personal=use_personal,
-        )
+        # SPEC-2 §3.5.3 + Round 6 PRD-5 FR-P1.3:RegisterBlocked 转 409 phone_required / register_blocked
+        # 注意:此函数在 _run_task 后台线程中运行,raise HTTPException 由 _run_task 转录到 task["error"];
+        # task error 字符串携带 "phone_required" / "register_blocked" 关键字供前端解析(api.ts §SPEC-2 §1)
+        try:
+            bundle = login_codex_via_browser(
+                email,
+                acc.get("password", ""),
+                mail_client=mail_client,
+                use_personal=use_personal,
+            )
+        except RegisterBlocked as blocked:
+            if blocked.is_phone:
+                record_failure(
+                    email,
+                    category="oauth_phone_blocked",
+                    reason=f"补登录触发 add-phone (step={blocked.step})",
+                    step=blocked.step,
+                    stage="api_login",
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "phone_required",
+                        "step": blocked.step,
+                        "reason": blocked.reason,
+                    },
+                )
+            record_failure(
+                email,
+                category="exception",
+                reason=f"补登录意外 RegisterBlocked: {blocked.reason}",
+                step=blocked.step,
+                stage="api_login",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "register_blocked",
+                    "step": blocked.step,
+                    "reason": blocked.reason,
+                },
+            )
         if bundle:
             auth_file = save_auth_file(bundle)
             update_account(email, auth_file=auth_file, last_active_at=time.time())
@@ -1467,7 +2915,9 @@ def post_account_login(params: LoginAccountParams):
                 # personal 补登录：不改状态（保持 PERSONAL），只刷新 auth_file
                 update_account(email, status=STATUS_PERSONAL)
             elif plan_type == "team":
-                update_account(email, status=STATUS_ACTIVE)
+                from autoteam.admin_state import get_chatgpt_account_id
+
+                update_account(email, status=STATUS_ACTIVE, workspace_account_id=get_chatgpt_account_id() or None)
                 token = bundle.get("access_token")
                 if token:
                     st, info = check_codex_quota(token)
@@ -1484,7 +2934,7 @@ def post_account_login(params: LoginAccountParams):
                             quota_resets_at=quota_result_resets_at(info) or int(time.time() + 18000),
                         )
             # 同步到 CPA
-            from autoteam.cpa_sync import sync_to_cpa
+            from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
 
             sync_to_cpa()
             return {
@@ -1500,14 +2950,17 @@ def post_account_login(params: LoginAccountParams):
 
 
 @app.get("/api/status")
-def get_status():
+def get_status(fast: bool = False):
     """获取所有账号状态 + active 账号实时额度"""
     from autoteam.accounts import (
         STATUS_ACTIVE,
+        STATUS_AUTH_INVALID,
         STATUS_EXHAUSTED,
+        STATUS_ORPHAN,
         STATUS_PENDING,
         STATUS_PERSONAL,
         STATUS_STANDBY,
+        is_account_disabled,
         load_accounts,
     )
     from autoteam.codex_auth import check_codex_quota, quota_result_quota_info
@@ -1515,27 +2968,30 @@ def get_status():
     accounts = load_accounts()
     quota_cache = {}
 
-    for acc in accounts:
-        if acc["status"] not in (STATUS_ACTIVE, STATUS_PERSONAL) and not _is_main_account_email(acc.get("email")):
-            continue
+    if not fast:
+        for acc in accounts:
+            if not _is_main_account_email(acc.get("email")) and is_account_disabled(acc):
+                continue
+            if acc["status"] not in (STATUS_ACTIVE, STATUS_PERSONAL) and not _is_main_account_email(acc.get("email")):
+                continue
 
-        auth_file = _resolve_status_auth_file(acc)
-        if not auth_file:
-            continue
+            auth_file = _resolve_status_auth_file(acc)
+            if not auth_file:
+                continue
 
-        try:
-            auth_data = json.loads(read_text(Path(auth_file)))
-            access_token = auth_data.get("access_token")
-            if access_token:
-                status, info = check_codex_quota(access_token)
-                if status == "ok" and isinstance(info, dict):
-                    quota_cache[acc["email"]] = info
-                elif status == "exhausted":
-                    quota_info = quota_result_quota_info(info)
-                    if quota_info:
-                        quota_cache[acc["email"]] = quota_info
-        except Exception:
-            pass
+            try:
+                auth_data = json.loads(read_text(Path(auth_file)))
+                access_token = auth_data.get("access_token")
+                if access_token:
+                    status, info = check_codex_quota(access_token)
+                    if status == "ok" and isinstance(info, dict):
+                        quota_cache[acc["email"]] = info
+                    elif status == "exhausted":
+                        quota_info = quota_result_quota_info(info)
+                        if quota_info:
+                            quota_cache[acc["email"]] = quota_info
+            except Exception:
+                pass
 
     sanitized_accounts = [_sanitize_account(a, quota_cache.get(a.get("email"))) for a in accounts]
 
@@ -1545,6 +3001,9 @@ def get_status():
         "exhausted": sum(1 for a in sanitized_accounts if a["status"] == STATUS_EXHAUSTED),
         "pending": sum(1 for a in sanitized_accounts if a["status"] == STATUS_PENDING),
         "personal": sum(1 for a in sanitized_accounts if a["status"] == STATUS_PERSONAL),
+        "auth_invalid": sum(1 for a in sanitized_accounts if a["status"] == STATUS_AUTH_INVALID),
+        "orphan": sum(1 for a in sanitized_accounts if a["status"] == STATUS_ORPHAN),
+        "disabled": sum(1 for a in sanitized_accounts if a["status"] == "disabled"),
         "total": len(sanitized_accounts),
     }
 
@@ -1552,13 +3011,26 @@ def get_status():
         "accounts": sanitized_accounts,
         "summary": summary,
         "quota_cache": quota_cache,
+        "runtime_resources": _safe_runtime_resource_snapshot(),
+        "ipv6_pool": _safe_ipv6_pool_status(),
+        "cliproxy": _safe_cliproxy_health(timeout=0.5, cache_ttl=30.0) if fast else _safe_cliproxy_health(),
+        "multi_master": _safe_multi_master_status(),
+        "status_mode": {
+            "fast": fast,
+            "quota_budget_seconds": 0 if fast else None,
+            "live_quota": not fast,
+        },
+        "rotation_validation": {
+            **_rotation_validation_cooldown,
+            "cooldown_remaining_seconds": int(_rotation_validation_cooldown_remaining()),
+        },
     }
 
 
 @app.post("/api/sync")
 def post_sync():
     """同步认证文件到 CPA"""
-    from autoteam.cpa_sync import sync_to_cpa
+    from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
 
     sync_to_cpa()
     return {"message": "同步完成"}
@@ -1603,6 +3075,11 @@ def put_register_domain_api(params: RegisterDomainParams):
     """
     更新子号注册域名。verify=True（默认）会试探性调用 CloudMail new_address 验证服务端是否接受此域，
     成功则立即删除探测地址再保存；失败把 CloudMail 原始错误透传给前端。
+
+    SPEC-1 §FR-005 — 与 `/api/mail-provider/probe?step=domain_ownership` 共享回收语义:
+    本路径走 `CloudMailClient` 抽象(已对齐 maillab/cf_temp_email),
+    `probe.probe_domain_ownership` 走无状态 HTTP 直连,二者最终行为一致(创建 + 立即 DELETE,
+    回收失败 leaked_probe 透传)。改 probe 时需同步检查本函数。
     """
     from autoteam.cloudmail import CloudMailClient
     from autoteam.runtime_config import set_register_domain
@@ -1643,6 +3120,55 @@ def put_register_domain_api(params: RegisterDomainParams):
     return resp
 
 
+@app.get("/api/config/preferred-seat-type")
+def get_preferred_seat_type_api():
+    """SPEC-2 FR-G — 读取邀请席位偏好。"""
+    from autoteam.runtime_config import get_preferred_seat_type
+    return {"value": get_preferred_seat_type()}
+
+
+@app.put("/api/config/preferred-seat-type")
+def put_preferred_seat_type_api(params: PreferredSeatTypeParams):
+    """SPEC-2 FR-G — 切换邀请席位偏好(default | codex)。"""
+    from autoteam.runtime_config import set_preferred_seat_type
+    val = (params.value or "").strip().lower()
+    if val not in ("default", "codex"):
+        raise HTTPException(status_code=400, detail="value 必须为 'default' 或 'codex'")
+    saved = set_preferred_seat_type(val)
+    logger.info("[config] preferred_seat_type 已切换为 %s", saved)
+    return {"value": saved, "message": f"邀请席位偏好已设为 {saved}"}
+
+
+@app.get("/api/config/sync-probe")
+def get_sync_probe_api():
+    """SPEC-2 FR-E — 读取 sync_account_states 被踢探测的并发/冷却配置。"""
+    from autoteam.runtime_config import get_sync_probe_concurrency, get_sync_probe_cooldown_minutes
+    return {
+        "concurrency": get_sync_probe_concurrency(),
+        "cooldown_minutes": get_sync_probe_cooldown_minutes(),
+    }
+
+
+@app.put("/api/config/sync-probe")
+def put_sync_probe_api(params: SyncProbeParams):
+    """SPEC-2 FR-E — 更新 sync_account_states 被踢探测的并发/冷却(任一非空字段都生效)。"""
+    from autoteam.runtime_config import (
+        get_sync_probe_concurrency,
+        get_sync_probe_cooldown_minutes,
+        set_sync_probe_concurrency,
+        set_sync_probe_cooldown_minutes,
+    )
+    if params.concurrency is not None:
+        set_sync_probe_concurrency(params.concurrency)
+    if params.cooldown_minutes is not None:
+        set_sync_probe_cooldown_minutes(params.cooldown_minutes)
+    return {
+        "concurrency": get_sync_probe_concurrency(),
+        "cooldown_minutes": get_sync_probe_cooldown_minutes(),
+        "message": "sync 探测配置已更新",
+    }
+
+
 @app.post("/api/sync/accounts")
 def post_sync_accounts():
     """从 auths 目录和 Team 成员同步账号到 accounts.json"""
@@ -1676,30 +3202,36 @@ def get_team_members():
     try:
 
         def _fetch_team_members():
-            from autoteam.account_ops import fetch_team_state
+            from autoteam.account_ops import (
+                fetch_team_state,
+                team_invite_email,
+                team_member_email,
+                team_member_role,
+                team_member_user_id,
+            )
             from autoteam.accounts import load_accounts
             from autoteam.chatgpt_api import ChatGPTTeamAPI
 
             chatgpt = ChatGPTTeamAPI()
-            chatgpt.start()
             try:
+                chatgpt.start()
                 members, invites = fetch_team_state(chatgpt)
                 local_emails = {a["email"].lower() for a in load_accounts()}
 
                 result = []
                 for m in members:
-                    email = (m.get("email") or "").lower()
+                    email = team_member_email(m)
                     result.append(
                         {
-                            "email": m.get("email", ""),
-                            "role": m.get("role", ""),
-                            "user_id": m.get("user_id") or m.get("id", ""),
+                            "email": email,
+                            "role": team_member_role(m) or "",
+                            "user_id": team_member_user_id(m) or "",
                             "is_local": email in local_emails,
                             "type": "member",
                         }
                     )
                 for inv in invites:
-                    email = (inv.get("email_address") or inv.get("email") or "").lower()
+                    email = team_invite_email(inv)
                     result.append(
                         {
                             "email": email,
@@ -1713,7 +3245,12 @@ def get_team_members():
             finally:
                 chatgpt.stop()
 
-        return _pw_executor.run(_fetch_team_members)
+        try:
+            return _pw_executor.run(_fetch_team_members)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:
         _playwright_lock.release()
 
@@ -1749,8 +3286,8 @@ def post_team_member_remove(params: TeamMemberRemoveParams):
             from autoteam.chatgpt_api import ChatGPTTeamAPI
 
             chatgpt = ChatGPTTeamAPI()
-            chatgpt.start()
             try:
+                chatgpt.start()
                 if member_type == "invite":
                     path = f"/backend-api/accounts/{account_id}/invites/{user_id}"
                     action_text = "取消邀请"
@@ -1820,7 +3357,7 @@ def get_logs(limit: int = 100, since: float = 0):
 
 @app.post("/api/sync/main-codex")
 def post_sync_main_codex():
-    """兼容旧接口：开始主号 Codex 登录并同步到 CPA。"""
+    """兼容旧接口：开始主号 Codex 登录并同步到已启用远端目标。"""
     return post_main_codex_start()
 
 
@@ -1837,16 +3374,22 @@ def get_cpa_files():
 # ---------------------------------------------------------------------------
 
 
+class CheckParams(BaseModel):
+    include_standby: bool = False  # True 时额外探测 standby 池(限速+24h 去重)
+
+
 @app.post("/api/tasks/check", status_code=202)
-def post_check():
-    """检查所有 active 账号额度（后台执行）"""
+def post_check(params: CheckParams = CheckParams()):
+    """检查所有 active 账号额度（后台执行）。include_standby=True 时追加探测 standby 池。"""
     from autoteam.manager import cmd_check
 
+    include_standby = bool(params.include_standby)
+
     def _run():
-        exhausted = cmd_check()
+        exhausted = cmd_check(include_standby=include_standby)
         return {"exhausted": [a["email"] for a in exhausted]}
 
-    task = _start_task("check", _run, {})
+    task = _start_task("check", _run, {"include_standby": include_standby})
     return task
 
 
@@ -1855,7 +3398,12 @@ def post_rotate(params: TaskParams = TaskParams()):
     """智能轮转（后台执行）"""
     from autoteam.manager import cmd_rotate
 
-    task = _start_task("rotate", cmd_rotate, {"target": params.target}, params.target)
+    task = _start_task(
+        "rotate",
+        lambda target: cmd_rotate(target, force_auth_repair=True, background_post_sync=True),
+        {"target": params.target},
+        params.target,
+    )
     return task
 
 
@@ -1902,12 +3450,17 @@ def post_fill(params: TaskParams = TaskParams()):
     则直接返回 409,不启动后台任务(队列化拒绝,Solution C)。本地状态足够用,无需启动
     Playwright 远程查询,避免给前端按错按钮带来额外开销。
     """
-    from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP, cmd_fill
+    from autoteam.manager import (
+        TEAM_SUB_ACCOUNT_HARD_CAP,
+        _count_local_team_seat_accounts,
+        _schedule_post_task_sync,
+        cmd_fill,
+    )
 
     if params.leave_workspace:
-        from autoteam.accounts import STATUS_ACTIVE, STATUS_EXHAUSTED, list_accounts
+        from autoteam.accounts import load_accounts
 
-        in_team_local = sum(1 for a in list_accounts() if a.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED))
+        in_team_local = _count_local_team_seat_accounts(load_accounts())
         if in_team_local >= TEAM_SUB_ACCOUNT_HARD_CAP:
             raise HTTPException(
                 status_code=409,
@@ -1917,13 +3470,98 @@ def post_fill(params: TaskParams = TaskParams()):
                 ),
             )
 
+    # Round 8 M-T3 + Round 9 AC-B4 — fill 任务起点统一 master probe,Team / Personal 都 fail-fast。
+    # cancel 状态下整批 fill 必拿 plan_type=team,直接 503 fail-fast 不启动 task。
+    try:
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+        from autoteam.master_health import is_master_subscription_healthy
+
+        def _probe_master():
+            api = ChatGPTTeamAPI()
+            try:
+                api.start()
+                return is_master_subscription_healthy(api)
+            finally:
+                try:
+                    api.stop()
+                except Exception:
+                    pass
+
+        if _playwright_lock.acquire(blocking=False):
+            try:
+                healthy, reason, evidence = _pw_executor.run(_probe_master)
+            finally:
+                _playwright_lock.release()
+            if not healthy and reason == "subscription_cancelled":
+                msg = (
+                    "母号 ChatGPT Team 订阅已 cancel(eligible_for_auto_reactivation=true),"
+                    "fill 必拿 plan_type=team / free。请先续订或更换母号"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "master_subscription_degraded",
+                        "reason": reason,
+                        "evidence": evidence,
+                        "message": msg,
+                        "leave_workspace": params.leave_workspace,
+                    },
+                )
+        else:
+            # playwright 锁拿不到 → 别阻塞 fill,放行让任务自身的 M-T1 / M-T2 兜底
+            pass
+    except HTTPException:
+        raise
+    except Exception:
+        # probe 异常按 spec §6.1 不阻塞 — M-T1 / M-T2 在 _run_post_register_oauth 兜底
+        pass
+
+    def _cmd_fill_api_task(target: int, *, leave_workspace: bool = False):
+        if leave_workspace:
+            return cmd_fill(target, leave_workspace=True)
+        result = cmd_fill(target, leave_workspace=False, post_sync=False, print_status=False)
+        _schedule_post_task_sync("[填充]")
+        return result
+
     command = "fill-personal" if params.leave_workspace else "fill"
     task = _start_task(
         command,
-        cmd_fill,
+        _cmd_fill_api_task,
         {"target": params.target, "leave_workspace": params.leave_workspace},
         params.target,
         leave_workspace=params.leave_workspace,
+    )
+    return task
+
+
+@app.post("/api/tasks/multi-master/fill", status_code=202)
+def post_multi_master_fill(params: MultiMasterFillParams = MultiMasterFillParams()):
+    """多母号并行补齐 Team 子号。"""
+    from autoteam.multi_master import run_multi_master_fill
+
+    payload = params.model_dump()
+
+    def _run():
+        return run_multi_master_fill(
+            target_seats=params.target,
+            owner_workers=params.owner_workers,
+            direct_parallel=params.direct_parallel,
+            workspace_ids=params.workspace_ids,
+            dry_run=params.dry_run,
+        )
+
+    if params.dry_run:
+        return {
+            "task_id": None,
+            "command": "multi-master-fill",
+            "status": "completed",
+            "params": payload,
+            "result": _run(),
+        }
+    task = _start_task(
+        "multi-master-fill",
+        _run,
+        payload,
     )
     return task
 
@@ -1934,6 +3572,15 @@ def post_cleanup(params: CleanupParams = CleanupParams()):
     from autoteam.manager import cmd_cleanup
 
     task = _start_task("cleanup", cmd_cleanup, {"max_seats": params.max_seats}, params.max_seats)
+    return task
+
+
+@app.post("/api/tasks/reset-quota", status_code=202)
+def post_reset_quota():
+    """清空本地额度恢复记录，并恢复 exhausted 账号为可检查状态（后台执行）"""
+    from autoteam.manager import cmd_reset_quota_recovery
+
+    task = _start_task("reset-quota", cmd_reset_quota_recovery, {})
     return task
 
 
@@ -1977,6 +3624,109 @@ def post_task_cancel():
 
 
 # ---------------------------------------------------------------------------
+# Round 12 F2 — SSE: rotate 实时进度推送
+# ---------------------------------------------------------------------------
+# 订阅 S1 commit ef1637c 的事件总线 (default_machine.subscribe),把每次状态
+# 转移序列化为 SSE event 行 (data: {...}\n\n)。心跳 15s 一次 (": heartbeat\n\n")
+# 维持 EventSource 连接、绕过 proxy idle timeout。
+#
+# 设计要点:
+# - subscribe 回调在调用线程上同步执行 (S1 实现);用线程安全 SimpleQueue 把事件
+#   中转给 sync generator,避免 generator 阻塞而 callback 被持续触发导致 OOM。
+# - 客户端断开 (浏览器 close / refresh / 进程退出) 时 FastAPI 关闭 generator,
+#   try/finally 块负责 unsubscribe 防泄漏。
+# - generator 是 sync 而非 async,FastAPI 用 anyio threadpool 跑,uvicorn 不会被阻塞。
+# - 每条 event payload schema (与 account_state.Transition.to_jsonl 对齐):
+#     {"email":..., "from":..., "to":..., "reason":..., "ts":..., "extra":{...}}
+# - 没有 manager.py 改动 (本任务范围外);S3/S4 任务把 transition 调用塞进
+#   manager.py 的 rotate 路径,本端点会自动看到事件。
+
+import queue as _sse_queue
+
+
+def _build_sse_event_stream(machine, *, heartbeat_seconds: float = 15.0):
+    """Return a sync generator yielding SSE-formatted bytes from machine subscriber.
+
+    Pulled out of the route so unit tests can drive it without spinning up
+    Starlette/uvicorn — see ``tests/unit/test_round12_rotate_sse_stream.py``.
+    """
+    q: _sse_queue.Queue = _sse_queue.Queue(maxsize=1024)
+    _SENTINEL = object()
+
+    def _on_transition(transition):
+        try:
+            payload = {
+                "email": transition.email,
+                "from": transition.from_state.value if transition.from_state else None,
+                "to": transition.to_state.value,
+                "reason": transition.reason or "",
+                "ts": transition.timestamp,
+                "extra": dict(transition.extra or {}),
+            }
+            # Round 12 wire-up (minor m7) — bounded queue. If the slow SSE
+            # client lets the buffer fill, drop oldest to make room rather
+            # than growing unbounded memory.
+            try:
+                q.put_nowait(payload)
+            except _sse_queue.Full:
+                try:
+                    q.get_nowait()  # drop oldest
+                except _sse_queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(payload)
+                except _sse_queue.Full:
+                    logger.warning("[sse] queue still full after drop, event lost")
+        except Exception:
+            logger.exception("[sse] failed to enqueue transition %r", transition)
+
+    machine.subscribe(_on_transition)
+
+    def _generator():
+        try:
+            # 立刻发一次 retry 提示 + 心跳,让前端尽早确认连接成功
+            yield b"retry: 5000\n\n"
+            yield b": connected\n\n"
+            while True:
+                try:
+                    payload = q.get(timeout=heartbeat_seconds)
+                except _sse_queue.Empty:
+                    yield b": heartbeat\n\n"
+                    continue
+                if payload is _SENTINEL:
+                    break
+                line = "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+                yield line.encode("utf-8")
+        finally:
+            machine.unsubscribe(_on_transition)
+
+    return _generator(), q, _on_transition
+
+
+@app.get("/api/rotate/stream")
+def get_rotate_stream(request: Request):
+    """Server-Sent Events: 推送账号状态转移事件到前端 (rotate 实时进度面板)。
+
+    Content-Type: text/event-stream
+    Cache-Control: no-cache (代理不要缓存)
+    X-Accel-Buffering: no (Nginx 不要缓冲,确保 chunk 及时落地浏览器)
+    """
+    from autoteam.account_state import default_machine
+
+    generator, _q, _cb = _build_sse_event_stream(default_machine)
+
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # 后台自动巡检
 # ---------------------------------------------------------------------------
 
@@ -1987,17 +3737,28 @@ from autoteam.config import (
     AUTO_CHECK_MIN_LOW as _DEFAULT_MIN_LOW,
 )
 from autoteam.config import (
+    AUTO_CHECK_TARGET_SEATS as _DEFAULT_TARGET_SEATS,
+)
+from autoteam.config import (
     AUTO_CHECK_THRESHOLD as _DEFAULT_THRESHOLD,
 )
 
 # 运行时可修改的巡检配置
 _auto_check_config = {
     "interval": _DEFAULT_INTERVAL,
+    "target_seats": _DEFAULT_TARGET_SEATS,
     "threshold": _DEFAULT_THRESHOLD,
     "min_low": _DEFAULT_MIN_LOW,
 }
 _auto_check_stop = threading.Event()
 _auto_check_restart = threading.Event()  # 配置变更时通知线程重启
+
+
+def _resolve_auto_check_target_seats(cfg: dict[str, int | bool]) -> int:
+    try:
+        return max(1, min(3, int(cfg.get("target_seats", 3))))
+    except Exception:
+        return 3
 
 # auto-fill watchdog 冷却:防止反复触发 cmd_rotate 导致 OpenAI 对短时间内
 # 多次 invite/kick 的子号批量 revoke token。30 分钟内只触发一次,给 OpenAI
@@ -2006,9 +3767,232 @@ _auto_fill_last_trigger_ts = 0.0
 _AUTO_FILL_COOLDOWN_SECONDS = 1800  # 30 min
 
 
+def _playwright_probe_command(*args: str) -> list[str]:
+    return [sys.executable, "-m", "autoteam.playwright_probe", *args]
+
+
+def _kill_subprocess_group(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _parse_playwright_probe_stdout(stdout: str) -> dict:
+    text = (stdout or "").strip()
+    if not text:
+        return {}
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if not line.startswith(("{", "[")):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        return parsed if isinstance(parsed, dict) else {"result": parsed}
+
+    parsed = json.loads(text)
+    return parsed if isinstance(parsed, dict) else {"result": parsed}
+
+
+def _run_playwright_probe(*args: str, timeout_seconds: float = 30) -> dict:
+    cmd = _playwright_probe_command(*args)
+    env = os.environ.copy()
+    env["AUTOTEAM_PROBE_MODE"] = "1"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=max(1.0, float(timeout_seconds)))
+    except subprocess.TimeoutExpired as exc:
+        _kill_subprocess_group(proc)
+        try:
+            proc.communicate(timeout=1)
+        except Exception:
+            pass
+        raise TimeoutError(f"Playwright probe timeout: {' '.join(args)}") from exc
+
+    stdout = (stdout or "").strip()
+    stderr = (stderr or "").strip()
+    if proc.returncode != 0:
+        detail = stderr or stdout or f"exit={proc.returncode}"
+        raise RuntimeError(detail)
+
+    return _parse_playwright_probe_stdout(stdout) if stdout else {}
+
+
+class _TeamMemberCount(int):
+    def __new__(cls, count: int, *, invites: int = 0, occupancy: int | None = None):
+        obj = int.__new__(cls, count)
+        obj.invites = max(0, int(invites or 0))
+        obj.occupancy = int(occupancy) if occupancy is not None else int(count) + obj.invites
+        return obj
+
+
+def _team_member_invite_count(team_count) -> int:
+    try:
+        return max(0, int(getattr(team_count, "invites", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _team_member_occupancy(team_count) -> int:
+    try:
+        count = int(team_count)
+    except (TypeError, ValueError):
+        return -1
+    if count < 0:
+        return -1
+    try:
+        occupancy = int(team_count.occupancy)
+    except (AttributeError, TypeError, ValueError):
+        occupancy = count + _team_member_invite_count(team_count)
+    return max(count, occupancy)
+
+
+def _auto_check_team_member_count(timeout_seconds: float = 30, retries: int = 2) -> int:
+    """Return Team member count via a killable subprocess probe; -1 means unknown."""
+
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            result = _run_playwright_probe("team-member-count", timeout_seconds=timeout_seconds)
+        except TimeoutError:
+            if attempt < retries:
+                logger.warning(
+                    "[巡检] Team 人数探针超时（>%ss），准备重试第 %d/%d 次",
+                    timeout_seconds,
+                    attempt + 1,
+                    retries,
+                )
+                continue
+            logger.warning("[巡检] Team 人数探针超时（>%ss，已重试 %d 次），本轮视为未知", timeout_seconds, retries)
+            return -1
+        except Exception as exc:
+            logger.warning("[巡检] Team 人数探针失败: %s", exc)
+            return -1
+
+        try:
+            count = int(result.get("count", -1))
+            invites = int(result.get("invites", 0) or 0)
+            occupancy = int(result.get("occupancy", count + invites if count >= 0 else -1))
+            return _TeamMemberCount(count, invites=invites, occupancy=occupancy)
+        except Exception:
+            return -1
+
+
+def _collect_cpa_credential_gate() -> dict:
+    """Read-only CPA provider-auth gate for auto-check decisions."""
+    try:
+        from autoteam.sync_targets import SYNC_TARGET_CPA, is_sync_target_enabled
+
+        enabled = is_sync_target_enabled(SYNC_TARGET_CPA)
+    except Exception as exc:
+        logger.warning("[巡检] CPA 可用凭证 gate 配置检查失败: %s", exc)
+        return {
+            "enabled": False,
+            "safe_read_only": True,
+            "management_ok": False,
+            "available": None,
+            "total": None,
+            "reason": "config_check_failed",
+            "zero_available": False,
+            "error": str(exc),
+        }
+
+    if not enabled:
+        return {
+            "enabled": False,
+            "safe_read_only": True,
+            "management_ok": False,
+            "available": None,
+            "total": None,
+            "reason": "cpa_sync_disabled",
+            "zero_available": False,
+        }
+
+    try:
+        from autoteam.cliproxy_health import get_cliproxy_health
+
+        health = get_cliproxy_health(cache_ttl=0.0, force_refresh=True)
+    except Exception as exc:
+        logger.warning("[巡检] CPA 可用凭证 gate 只读检查失败: %s", exc)
+        return {
+            "enabled": True,
+            "safe_read_only": True,
+            "management_ok": False,
+            "available": None,
+            "total": None,
+            "reason": "health_check_exception",
+            "zero_available": False,
+            "error": str(exc),
+        }
+
+    management_api = health.get("management_api") if isinstance(health, dict) else {}
+    provider_auth = health.get("provider_auth") if isinstance(health, dict) else {}
+    management_ok = bool(isinstance(management_api, dict) and management_api.get("ok"))
+    safe_read_only = bool(isinstance(health, dict) and health.get("safe_read_only", True))
+    if not isinstance(provider_auth, dict):
+        provider_auth = {}
+
+    try:
+        available = int(provider_auth.get("available") or 0)
+    except (TypeError, ValueError):
+        available = 0
+    try:
+        total = int(provider_auth.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+
+    reason = str(
+        provider_auth.get("reason")
+        or (management_api.get("reason") if isinstance(management_api, dict) else "")
+        or "unknown"
+    )
+    return {
+        "enabled": True,
+        "safe_read_only": safe_read_only,
+        "management_ok": management_ok,
+        "available": available,
+        "total": total,
+        "reason": reason,
+        "zero_available": safe_read_only and management_ok and available <= 0,
+    }
+
+
+def _cpa_provider_auth_below_pool_target(gate: dict | None, pool_target: int) -> bool:
+    if not isinstance(gate, dict):
+        return False
+    if not gate.get("enabled") or not gate.get("safe_read_only") or not gate.get("management_ok"):
+        return False
+    try:
+        available = int(gate.get("available"))
+        target = max(1, int(pool_target))
+    except (TypeError, ValueError):
+        return False
+    return available < target
+
+
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
-    from autoteam.accounts import STATUS_ACTIVE, load_accounts
+    from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
     from autoteam.codex_auth import check_codex_quota
 
     while not _auto_check_stop.is_set():
@@ -2026,60 +4010,266 @@ def _auto_check_loop():
         if _auto_check_restart.is_set():
             continue  # 配置变更，跳到下一轮重新读取配置
 
+        if _playwright_lock.locked() or _current_task_id:
+            logger.info("[巡检] 有任务正在执行，跳过本轮自动巡检昂贵探测")
+            continue
+
         try:
             cfg = _auto_check_config  # 重新读取
+            target_seats = _resolve_auto_check_target_seats(cfg)
+            sub_account_target = max(0, target_seats - 1)
+            log_runtime_resource_snapshot(logger, label="auto-check")
             accounts = load_accounts()
             active = [
                 a
                 for a in accounts
                 if a["status"] == STATUS_ACTIVE
                 and not _is_main_account_email(a.get("email"))
+                and not is_account_disabled(a)
                 and a.get("auth_file")
                 and Path(a["auth_file"]).exists()
             ]
+            try:
+                from autoteam.manager import _replaceable_pool_blocker_reason
 
-            # Watchdog:active 账号数 < TEAM_SUB_ACCOUNT_HARD_CAP 时自动补位。
-            # 之前的 `if not active: continue` 在 4 个 active 全 kick 进 standby
+                replaceable_blockers = [
+                    {
+                        "email": a.get("email"),
+                        "reason": reason,
+                    }
+                    for a in accounts
+                    if not _is_main_account_email(a.get("email"))
+                    and not is_account_disabled(a)
+                    and (reason := _replaceable_pool_blocker_reason(a))
+                ]
+            except Exception as exc:
+                logger.warning("[巡检] 本地占席 blocker 分类失败: %s", exc)
+                replaceable_blockers = []
+            cpa_credential_gate = _collect_cpa_credential_gate()
+            if cpa_credential_gate.get("enabled"):
+                logger.info(
+                    "[巡检] CPA 可用凭证 gate: management_ok=%s available=%s/%s reason=%s safe_read_only=%s",
+                    cpa_credential_gate.get("management_ok"),
+                    cpa_credential_gate.get("available"),
+                    cpa_credential_gate.get("total"),
+                    cpa_credential_gate.get("reason"),
+                    cpa_credential_gate.get("safe_read_only"),
+                )
+
+            provider_auth_below_target = _cpa_provider_auth_below_pool_target(cpa_credential_gate, sub_account_target)
+            actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
+            actual_invite_count = _team_member_invite_count(actual_team_count)
+            actual_team_occupancy = _team_member_occupancy(actual_team_count)
+
+            if actual_team_occupancy > target_seats:
+                if not _playwright_lock.acquire(blocking=False):
+                    logger.info("[巡检] Team 远端占用超出目标，但有任务在跑，本轮跳过自动清理")
+                    continue
+                _playwright_lock.release()
+
+                logger.warning(
+                    "[巡检] Team 远端占用超出目标: members=%d invites=%d total=%d/%d，触发自动清理",
+                    int(actual_team_count),
+                    actual_invite_count,
+                    actual_team_occupancy,
+                    target_seats,
+                )
+                from autoteam.manager import cmd_cleanup
+
+                try:
+                    _start_task(
+                        "auto-cleanup",
+                        cmd_cleanup,
+                        {
+                            "max_seats": target_seats,
+                            "trigger": "auto-check",
+                            "team_count": int(actual_team_count),
+                            "invite_count": actual_invite_count,
+                            "team_occupancy": actual_team_occupancy,
+                        },
+                        target_seats,
+                    )
+                except Exception as e:
+                    logger.error("[巡检] 自动清理失败: %s", e)
+                continue
+
+            # Watchdog:active 账号数 < 子号目标时自动补位。
+            # 之前的 `if not active: continue` 在 active 全 kick 进 standby
             # 之后会让 Team 永远萎缩。但触发频率必须节制 —— OpenAI 对短时间内反复
             # invite/kick 同一批子号会 revoke token(token_revoked 错误),所以加
             # 30 分钟冷却,避免巡检每 5 分钟无脑触发 cmd_rotate 把账号全洗成废号。
-            from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP
-
             global _auto_fill_last_trigger_ts
-            if len(active) < TEAM_SUB_ACCOUNT_HARD_CAP:
+            if len(active) < sub_account_target:
                 now_ts = time.time()
+                should_start_auto_fill = False
                 cooldown_remaining = (_auto_fill_last_trigger_ts + _AUTO_FILL_COOLDOWN_SECONDS) - now_ts
                 if cooldown_remaining > 0:
                     logger.info(
                         "[巡检] active=%d < %d,但 auto-fill 冷却中(还剩 %d 分钟)",
                         len(active),
-                        TEAM_SUB_ACCOUNT_HARD_CAP,
+                        sub_account_target,
                         int(cooldown_remaining / 60),
                     )
                     # 冷却期内仍然继续做"低额度替换"(下面的 low_accounts 逻辑),
-                    # 只是不触发全量 cmd_rotate
+                    # 只是不触发全量 cmd_rotate。例外:Team 真实人数不足时必须继续补位,
+                    # 否则 cooldown 会把实际席位缺口拖到下一轮甚至 4h backoff 之后。
+                    if actual_team_count >= target_seats:
+                        if replaceable_blockers:
+                            logger.warning(
+                                "[巡检] auto-fill 冷却中但 Team 已满且存在 %d 个不可用占席子号，继续触发轮转: %s",
+                                len(replaceable_blockers),
+                                ", ".join(
+                                    f"{item['email']}({item['reason']})" for item in replaceable_blockers[:5]
+                                ),
+                            )
+                            should_start_auto_fill = True
+                        elif cpa_credential_gate.get("zero_available"):
+                            logger.warning(
+                                "[巡检] auto-fill 冷却中但 Team 已满、本地 active=%d/%d，且 CPA 可用凭证为 0/%s，继续补位",
+                                len(active),
+                                sub_account_target,
+                                cpa_credential_gate.get("total"),
+                            )
+                            should_start_auto_fill = True
+                        elif provider_auth_below_target:
+                            logger.warning(
+                                "[巡检] auto-fill 冷却中但 CPA/CLIProxy provider-auth 可用凭证低水位: "
+                                "available=%s/%d local_active=%d/%d，继续补位/同步",
+                                cpa_credential_gate.get("available"),
+                                sub_account_target,
+                                len(active),
+                                sub_account_target,
+                            )
+                            should_start_auto_fill = True
+                        else:
+                            logger.info(
+                                "[巡检] auto-fill 冷却中且 Team 实际成员数=%d 已满；本轮只保留低额度替换检查",
+                                actual_team_count,
+                            )
+                    elif actual_team_count >= 0:
+                        logger.info(
+                            "[巡检] auto-fill 冷却中但 Team 实际成员不足（%d/%d），继续补位",
+                            actual_team_count,
+                            target_seats,
+                        )
+                        should_start_auto_fill = True
+                    else:
+                        logger.info("[巡检] auto-fill 冷却中且 Team 实际成员数未知；本轮不触发全量补位")
                 else:
+                    # Round 11 — OAuth 连续失败 backoff:
+                    # 最近 2 小时内 master workspace 累积 ≥3 个 auth_invalid 账号 → fill 已稳定失败,
+                    # 延长有效冷却到 4 小时,避免每 30 分钟无脑循环浪费 cloudmail 邮箱 + 累积僵尸账号。
+                    # 触发条件用 status=auth_invalid + workspace_account_id=master 简单可靠,
+                    # 不依赖具体 OAuth 失败原因(根因可能是 ChatGPT consent 页面变化或 master 订阅问题)。
+                    backoff_triggered = False
+                    try:
+                        from autoteam.accounts import STATUS_AUTH_INVALID
+                        from autoteam.admin_state import get_chatgpt_account_id
+
+                        master_aid = get_chatgpt_account_id() or ""
+                        recent_window = 2 * 3600  # 2 小时
+                        recent_failures = [
+                            a for a in accounts
+                            if a.get("status") == STATUS_AUTH_INVALID
+                            and (a.get("workspace_account_id") or "") == master_aid
+                            and (a.get("created_at") or 0) >= now_ts - recent_window
+                        ]
+                        if len(recent_failures) >= 3:
+                            # 强制延长冷却,记 last_trigger_ts 让下次巡检也走 cooldown 分支
+                            _auto_fill_last_trigger_ts = now_ts - _AUTO_FILL_COOLDOWN_SECONDS + 4 * 3600
+                            logger.warning(
+                                "[巡检] active=%d < %d 但近 2h 累积 %d 个 OAuth 失败账号 → "
+                                "backoff 生效,延长冷却到 4h(避免无谓循环)。"
+                                "请检查 codex_auth consent 页面或 master 订阅",
+                                len(active),
+                                sub_account_target,
+                                len(recent_failures),
+                            )
+                            backoff_triggered = True
+                    except Exception as exc:
+                        logger.warning("[巡检] OAuth backoff 检查异常: %s,按原逻辑继续", exc)
+
+                    if backoff_triggered:
+                        continue
+
+                    if actual_team_count >= target_seats:
+                        if replaceable_blockers:
+                            logger.warning(
+                                "[巡检] Team 已满但本地 active=%d/%d 且存在不可用占席子号，触发 auto-fill 修复: %s",
+                                len(active),
+                                sub_account_target,
+                                ", ".join(
+                                    f"{item['email']}({item['reason']})" for item in replaceable_blockers[:5]
+                                ),
+                            )
+                        elif cpa_credential_gate.get("zero_available"):
+                            logger.warning(
+                                "[巡检] Team 已满但本地 active=%d/%d，且 CPA 可用凭证为 0/%s，触发 auto-fill 补位",
+                                len(active),
+                                sub_account_target,
+                                cpa_credential_gate.get("total"),
+                            )
+                        elif provider_auth_below_target:
+                            logger.warning(
+                                "[巡检] Team 已满且 CPA/CLIProxy provider-auth 可用凭证低水位: "
+                                "available=%s/%d local_active=%d/%d，触发 auto-fill 补位/同步",
+                                cpa_credential_gate.get("available"),
+                                sub_account_target,
+                                len(active),
+                                sub_account_target,
+                            )
+                        else:
+                            logger.info(
+                                "[巡检] 本地 active=%d < %d,但 Team 实际成员数=%d 已满；先跳过 auto-fill,等待同步/对账稳定",
+                                len(active),
+                                sub_account_target,
+                                actual_team_count,
+                            )
+                            continue
+                    should_start_auto_fill = True
+
+                if should_start_auto_fill:
                     if not _playwright_lock.acquire(blocking=False):
                         logger.info(
                             "[巡检] active=%d < %d 但有任务在跑,本轮先跳过自动补位",
                             len(active),
-                            TEAM_SUB_ACCOUNT_HARD_CAP,
+                            sub_account_target,
                         )
                         continue
                     _playwright_lock.release()
                     logger.warning(
                         "[巡检] active 账号 %d < %d,触发 auto-fill(cmd_rotate 全流程补位)",
                         len(active),
-                        TEAM_SUB_ACCOUNT_HARD_CAP,
+                        sub_account_target,
                     )
                     from autoteam.manager import cmd_rotate
 
                     try:
+                        task_params = {"target_seats": target_seats}
+                        if cpa_credential_gate.get("enabled"):
+                            try:
+                                provider_available = int(cpa_credential_gate.get("available") or 0)
+                            except (TypeError, ValueError):
+                                provider_available = 0
+                            task_params.update(
+                                {
+                                    "trigger": "auto-check",
+                                    "shortage": max(
+                                        0,
+                                        sub_account_target - min(len(active), provider_available),
+                                    ),
+                                    "cpa_credential_gate": cpa_credential_gate,
+                                    "provider_auth_below_target": provider_auth_below_target,
+                                    "provider_auth_available": cpa_credential_gate.get("available"),
+                                    "provider_auth_target": sub_account_target,
+                                }
+                            )
                         _start_task(
                             "auto-fill",
                             cmd_rotate,
-                            {"target_seats": TEAM_SUB_ACCOUNT_HARD_CAP + 1},
-                            TEAM_SUB_ACCOUNT_HARD_CAP + 1,
+                            task_params,
+                            target_seats,
+                            background_post_sync=True,
                         )
                         _auto_fill_last_trigger_ts = now_ts
                     except Exception as e:
@@ -2152,15 +4342,78 @@ def _auto_check_loop():
                     )
                 except Exception as e:
                     logger.error("[巡检] 即时替换启动失败: %s", e)
+            elif provider_auth_below_target and actual_team_count >= target_seats:
+                try:
+                    provider_available = int(cpa_credential_gate.get("available") or 0)
+                except (TypeError, ValueError):
+                    provider_available = 0
+                shortage = max(1, sub_account_target - min(len(active), provider_available))
+
+                if not _playwright_lock.acquire(blocking=False):
+                    logger.info("[巡检] CPA/CLIProxy provider-auth 低水位，但有任务在跑，本轮跳过预防性轮转")
+                    continue
+                _playwright_lock.release()
+
+                logger.warning(
+                    "[巡检] CPA/CLIProxy provider-auth 可用凭证低水位: "
+                    "available=%d/%d local_active=%d/%d; trigger preventive auto-rotate/sync",
+                    provider_available,
+                    sub_account_target,
+                    len(active),
+                    sub_account_target,
+                )
+                from autoteam.manager import cmd_rotate
+
+                try:
+                    _start_task(
+                        "auto-rotate",
+                        cmd_rotate,
+                        {
+                            "target": target_seats,
+                            "trigger": "auto-check",
+                            "shortage": shortage,
+                            "low_accounts": 0,
+                            "cpa_credential_gate": cpa_credential_gate,
+                            "provider_auth_below_target": True,
+                            "provider_auth_available": cpa_credential_gate.get("available"),
+                            "provider_auth_target": sub_account_target,
+                        },
+                        target_seats,
+                        background_post_sync=True,
+                    )
+                except Exception as e:
+                    logger.error("[巡检] provider-auth 低水位自动轮转失败: %s", e)
+            elif provider_auth_below_target:
+                logger.info(
+                    "[巡检] CPA/CLIProxy provider-auth 低水位，但 Team 实际成员数=%s 未满或未知，本轮不做预防性轮转",
+                    actual_team_count if actual_team_count >= 0 else "unknown",
+                )
             else:
                 logger.info("[巡检] 额度正常，无需替换")
 
         except Exception as e:
             logger.error("[巡检] 巡检异常: %s", e)
 
+        # Round 9 RT-2 — 后台巡检每 interval 跑一次 retroactive(走 5min cache,失败 warning)。
+        # spec/shared/master-subscription-health.md v1.1 §11.3。
+        try:
+            from autoteam.master_health import _apply_master_degraded_classification
+
+            retro = _apply_master_degraded_classification()
+            if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+                logger.info(
+                    "[巡检] retroactive: GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                    len(retro.get("marked_grace") or []),
+                    len(retro.get("marked_standby") or []),
+                    len(retro.get("reverted_active") or []),
+                )
+        except Exception as exc:
+            logger.warning("[巡检] retroactive helper 异常: %s", exc)
+
 
 class AutoCheckConfig(BaseModel):
     interval: int = 300  # 巡检间隔（秒）
+    target_seats: int = 3  # 自动巡检目标 Team seat 数，最多 1 母 + 2 子
     threshold: int = 10  # 额度阈值（%）
     min_low: int = 2  # 触发轮转的最少账号数
 
@@ -2175,35 +4428,20 @@ def get_auto_check_config():
 def set_auto_check_config(cfg: AutoCheckConfig):
     """修改巡检配置（运行时生效）"""
     _auto_check_config["interval"] = max(60, cfg.interval)  # 最少 1 分钟
+    _auto_check_config["target_seats"] = max(1, min(3, cfg.target_seats))
     _auto_check_config["threshold"] = max(1, min(100, cfg.threshold))
     _auto_check_config["min_low"] = max(1, cfg.min_low)
     _auto_check_restart.set()  # 唤醒巡检线程，立即应用新配置
     logger.info(
-        "[巡检] 配置已更新: 间隔=%ds 阈值=%d%%（min_low 已废弃,任意失效立即 1v1 替换）",
+        "[巡检] 配置已更新: 间隔=%ds 目标 seat=%d 阈值=%d%%（min_low 已废弃,任意失效立即 1v1 替换）",
         _auto_check_config["interval"],
+        _auto_check_config["target_seats"],
         _auto_check_config["threshold"],
     )
     return _auto_check_config.copy()
 
 
-@app.on_event("startup")
-def _start_auto_check():
-    try:
-        from autoteam.auth_storage import ensure_auth_file_permissions
-
-        fixed = ensure_auth_file_permissions()
-        if fixed:
-            logger.info("[启动] 已修复 %d 个 auths 认证文件权限", fixed)
-    except Exception as exc:
-        logger.warning("[启动] 修复 auths 认证文件权限失败: %s", exc)
-
-    thread = threading.Thread(target=_auto_check_loop, daemon=True)
-    thread.start()
-
-
-@app.on_event("shutdown")
-def _stop_auto_check():
-    _auto_check_stop.set()
+# Round 7 P2.4 — startup/shutdown 已迁移到顶部 app_lifespan,这里不再重复挂 handler。
 
 
 # ---------------------------------------------------------------------------

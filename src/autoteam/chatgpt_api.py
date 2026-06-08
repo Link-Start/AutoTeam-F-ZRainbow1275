@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import random
 import re
 import time
 import uuid
@@ -12,12 +13,15 @@ from playwright.sync_api import sync_playwright
 
 import autoteam.display  # noqa: F401
 from autoteam.admin_state import (
+    get_admin_email,
     get_admin_session_token,
     get_chatgpt_account_id,
     get_chatgpt_workspace_name,
     update_admin_state,
 )
-from autoteam.config import get_playwright_launch_options
+from autoteam.chatgpt_transport import build_chatgpt_transport
+from autoteam.config import get_playwright_context_options, get_playwright_launch_options
+from autoteam.playwright_lifecycle import close_playwright_objects
 from autoteam.textio import read_text
 
 logger = logging.getLogger(__name__)
@@ -25,6 +29,48 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 BASE_DIR = PROJECT_ROOT
 SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
+
+_WORKSPACE_IGNORE_LABELS = {
+    "choose a workspace",
+    "select a workspace",
+    "选择一个工作空间",
+    "选择工作空间",
+    "workspace",
+    "terms of use",
+    "privacy policy",
+    "使用条款",
+    "隐私政策",
+}
+_WORKSPACE_FALLBACK_LABELS = (
+    "personal account",
+    "personal",
+    "个人账户",
+    "个人账号",
+    "free",
+    "免费",
+    "new organization",
+    "新组织",
+    "create organization",
+    "创建组织",
+)
+
+
+def _normalize_workspace_label(text: str | None) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _workspace_candidate_kind(text: str | None) -> str | None:
+    """Classify a visible workspace label as preferred, fallback, or noise."""
+    label = _normalize_workspace_label(text)
+    if not label:
+        return None
+
+    lowered = label.lower()
+    if lowered in _WORKSPACE_IGNORE_LABELS or len(label) <= 3:
+        return None
+    if any(key in lowered for key in _WORKSPACE_FALLBACK_LABELS):
+        return "fallback"
+    return "preferred"
 
 
 class ChatGPTTeamAPI:
@@ -93,6 +139,10 @@ class ChatGPTTeamAPI:
         self.login_email = None
         self.login_password = None
         self.workspace_options_cache = []
+        self.http_transport = None
+        self.transport_name = None
+        self.proxy_url = ""
+        self.local_proxy_url = ""
 
     def _visible_locator_in_frames(self, selectors, timeout_ms=5000):
         selector = ", ".join(selectors)
@@ -114,13 +164,60 @@ class ChatGPTTeamAPI:
 
     def _launch_browser(self):
         SCREENSHOT_DIR.mkdir(exist_ok=True)
-        self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(**get_playwright_launch_options())
-        self.context = self.browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        self.page = self.context.new_page()
+        if self.playwright or self.browser or self.context or self.page:
+            self.stop()
+
+        try:
+            self.playwright = sync_playwright().start()
+            try:
+                launch_options = get_playwright_launch_options(proxy_url=self.local_proxy_url)
+            except TypeError as exc:
+                if "proxy_url" not in str(exc):
+                    raise
+                launch_options = get_playwright_launch_options()
+            self.browser = self.playwright.chromium.launch(**launch_options)
+            self.context = self.browser.new_context(**get_playwright_context_options())
+            self.page = self.context.new_page()
+        except Exception:
+            self.stop()
+            raise
+
+    def _ensure_admin_ipv6_proxy(self) -> None:
+        admin_email = (get_admin_email() or "").strip().lower()
+        self.proxy_url = ""
+        self.local_proxy_url = ""
+        if not admin_email:
+            required = False
+            try:
+                from autoteam import config as runtime_config
+
+                required = bool(getattr(runtime_config, "AUTOTEAM_IPV6_POOL_REQUIRED", False))
+            except Exception:
+                pass
+            if required:
+                raise RuntimeError("IPv6 pool is required but admin email is unavailable")
+            return
+
+        required = False
+        try:
+            from autoteam import config as runtime_config
+            from autoteam.ipv6_pool import ipv6_pool
+
+            required = bool(getattr(runtime_config, "AUTOTEAM_IPV6_POOL_REQUIRED", False))
+            self.proxy_url = ipv6_pool.ensure(admin_email) or ""
+            self.local_proxy_url = ipv6_pool.get_local_proxy_url(admin_email) or self.proxy_url
+            if self.local_proxy_url:
+                logger.info("[ChatGPT] admin %s using IPv6 proxy %s", admin_email, self.local_proxy_url)
+                return
+            if required:
+                raise RuntimeError("IPv6 pool is required but no admin proxy was assigned")
+        except Exception as exc:
+            if required:
+                logger.error("[ChatGPT] admin IPv6 proxy required but unavailable: %s", exc)
+                raise
+            self.proxy_url = ""
+            self.local_proxy_url = ""
+            logger.warning("[ChatGPT] admin IPv6 proxy unavailable, falling back to direct: %s", exc)
 
     def _log_login_state(self, label):
         try:
@@ -436,18 +533,6 @@ class ChatGPTTeamAPI:
 
         candidates = []
         seen_texts = set()
-        exclude_keywords = (
-            "personal account",
-            "personal",
-            "个人账户",
-            "个人账号",
-            "free",
-            "免费",
-            "new organization",
-            "新组织",
-            "create organization",
-            "创建组织",
-        )
 
         # 先用 JS 从 DOM 提取可见的 workspace 选项（只取叶子级别文本）
         try:
@@ -485,17 +570,16 @@ class ChatGPTTeamAPI:
                 "chatgpt",
             )
             for text in js_candidates or []:
+                text = _normalize_workspace_label(text)
                 if text in seen_texts:
                     continue
-                text_l = text.lower()
                 # 跳过标题类文本
-                if text_l in (k.lower() for k in title_keywords):
+                if text.lower() in (k.lower() for k in title_keywords):
                     continue
-                # 跳过太短的（用户名缩写、头像字母等）
-                if len(text) <= 3:
+                kind = _workspace_candidate_kind(text)
+                if not kind:
                     continue
                 seen_texts.add(text)
-                kind = "fallback" if any(key in text_l for key in exclude_keywords) else "preferred"
                 candidates.append({"id": str(len(candidates)), "label": text, "kind": kind})
         except Exception as e:
             logger.warning("[ChatGPT] JS 提取 workspace 候选失败: %s", e)
@@ -508,14 +592,15 @@ class ChatGPTTeamAPI:
                         try:
                             if not loc.is_visible(timeout=200):
                                 continue
-                            text = loc.inner_text(timeout=500).strip()
+                            text = _normalize_workspace_label(loc.inner_text(timeout=500))
                         except Exception:
                             continue
                         if not text or text in seen_texts or len(text) > 80:
                             continue
+                        kind = _workspace_candidate_kind(text)
+                        if not kind:
+                            continue
                         seen_texts.add(text)
-                        text_l = text.lower()
-                        kind = "fallback" if any(key in text_l for key in exclude_keywords) else "preferred"
                         candidates.append({"id": str(len(candidates)), "label": text, "kind": kind})
                 except Exception:
                     pass
@@ -669,6 +754,49 @@ class ChatGPTTeamAPI:
         logger.warning("[ChatGPT] workspace 点击后仍停留在选择页 | URL=%s", last_url)
         return False
 
+    def _is_chatgpt_ready_url(self):
+        if not self.page:
+            return False
+        url = (self.page.url or "").lower()
+        return "chatgpt.com" in url and "auth" not in url
+
+    def _wait_for_post_workspace_ready(self, timeout=12):
+        deadline = time.time() + timeout
+        last_url = self.page.url if self.page else ""
+        consecutive_chatgpt_ready = 0
+
+        while time.time() < deadline:
+            if not self.page:
+                return False
+            try:
+                self.page.wait_for_load_state("domcontentloaded", timeout=1000)
+            except Exception:
+                pass
+
+            url = (self.page.url or "").lower()
+            if "challenge" in url:
+                self._wait_for_cloudflare()
+
+            session_token = self._extract_session_token()
+            if session_token:
+                return True
+
+            if self._is_chatgpt_ready_url():
+                consecutive_chatgpt_ready += 1
+                if self._body_excerpt(limit=120):
+                    return True
+                if consecutive_chatgpt_ready >= 3:
+                    logger.info("[ChatGPT] workspace 跳转后已到达 ChatGPT 页面，继续后续登录检测")
+                    return True
+            else:
+                consecutive_chatgpt_ready = 0
+
+            last_url = self.page.url
+            time.sleep(0.5)
+
+        logger.warning("[ChatGPT] workspace 跳转后页面仍未稳定 | URL=%s", last_url)
+        return False
+
     def select_workspace_option(self, option_id):
         options = self._list_workspace_options()
         for option in options:
@@ -692,8 +820,12 @@ class ChatGPTTeamAPI:
                 self.page.wait_for_load_state("domcontentloaded", timeout=5000)
             except Exception:
                 pass
+            self._wait_for_post_workspace_ready(timeout=12)
             self.workspace_options_cache = []
             self._log_login_state("选择 workspace 后")
+            if self._is_chatgpt_ready_url():
+                logger.info("[ChatGPT] 选择 workspace 后结果: completed(chatgpt) | detail=None")
+                return {"step": "completed", "detail": None}
             step, detail = self._detect_login_step()
             logger.info("[ChatGPT] 选择 workspace 后结果: %s | detail=%s", step, detail)
             return {"step": step, "detail": detail}
@@ -1147,6 +1279,20 @@ class ChatGPTTeamAPI:
             account_id=self.account_id,
             workspace_name=self.workspace_name,
         )
+        try:
+            from autoteam.workspace_pool import default_pool
+
+            default_pool.upsert(
+                f"ws-{self.account_id}",
+                email,
+                self.account_id,
+                workspace_name=self.workspace_name,
+                session_token=session_token,
+                enabled=True,
+                parallel=True,
+            )
+        except Exception as exc:
+            logger.warning("[ChatGPT] workspace pool 记录母号失败: %s", exc)
         logger.info("[ChatGPT] 管理员 session_token 已保存")
 
         return {
@@ -1165,15 +1311,97 @@ class ChatGPTTeamAPI:
         self.workspace_name = get_chatgpt_workspace_name()
         self.start_with_session(session_token, self.account_id, self.workspace_name)
 
-    def start_with_session(self, session_token, account_id, workspace_name=""):
-        """用指定的 session/account 启动浏览器上下文。"""
-        if not session_token:
-            raise FileNotFoundError("缺少会话信息")
-        self.account_id = account_id or ""
-        self.workspace_name = workspace_name or ""
-        if not self.account_id:
-            raise RuntimeError("缺少 workspace/account ID")
+    def is_started(self):
+        return bool(self.browser or self.http_transport)
 
+    def _build_api_headers(self, include_auth=True):
+        raw_headers = {
+            "Content-Type": "application/json",
+            "chatgpt-account-id": self.account_id,
+            "oai-device-id": self.oai_device_id,
+            "oai-language": "en-US",
+        }
+        if include_auth and self.access_token:
+            raw_headers["authorization"] = f"Bearer {self.access_token}"
+
+        # Browser fetch headers must be ISO-8859-1 (Latin1). Sanitize here so
+        # Playwright and optional HTTP transports share the Round 11 header fix.
+        headers = {}
+        for key, value in raw_headers.items():
+            if value is None:
+                continue
+            if isinstance(value, bytes):
+                value = value.decode("ascii", errors="replace")
+            else:
+                value = str(value)
+            sanitized = value.encode("latin-1", errors="replace").decode("latin-1")
+            if sanitized != value:
+                logger.warning(
+                    "[ChatGPT] _api_fetch header %s 含非 ISO-8859-1 字符已被替换: %r -> %r",
+                    key,
+                    value[:60],
+                    sanitized[:60],
+                )
+            headers[key] = sanitized
+        return headers
+
+    def _start_transport_session(self, session_token):
+        self.http_transport = build_chatgpt_transport(
+            session_token=session_token,
+            account_id=self.account_id,
+            oai_device_id=self.oai_device_id,
+            proxy_url=self.local_proxy_url,
+        )
+        if self.http_transport:
+            self.transport_name = getattr(self.http_transport, "name", "curl_cffi")
+            logger.info("[ChatGPT] Team API transport: %s", self.transport_name)
+            return True
+        return False
+
+    def _close_http_transport(self, *, reason: str = "") -> None:
+        transport = getattr(self, "http_transport", None)
+        try:
+            if transport is not None:
+                transport.close()
+        except Exception as exc:
+            if reason:
+                logger.debug("[ChatGPT] close curl_cffi transport failed (%s): %s", reason, exc)
+            else:
+                logger.debug("[ChatGPT] close curl_cffi transport failed: %s", exc)
+        finally:
+            self.http_transport = None
+            self.transport_name = None
+
+    @staticmethod
+    def _transport_body_looks_like_html(body):
+        text = str(body or "").lower()
+        return "<html" in text or "<!doctype" in text or "<body" in text
+
+    def _transport_response_requires_browser_fallback(self, response):
+        if not isinstance(response, dict):
+            return True
+
+        status = int(response.get("status") or 0)
+        body = response.get("body", "")
+        if status <= 0 or status >= 500:
+            return True
+        if not self._transport_body_looks_like_html(body):
+            return False
+
+        lower = str(body or "").lower()
+        return any(
+            marker in lower
+            for marker in (
+                "verify you are human",
+                "cloudflare",
+                "challenge",
+                "auth/login",
+                "log in",
+                "unable to load site",
+            )
+        )
+
+    def _start_browser_session(self, session_token):
         self._launch_browser()
         logger.info("[ChatGPT] 访问 chatgpt.com 过 Cloudflare...")
         self.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
@@ -1182,6 +1410,114 @@ class ChatGPTTeamAPI:
         self._inject_session(session_token)
         self._fetch_access_token()
         self._auto_detect_workspace()
+
+    def _ensure_browser_session(self):
+        if self.browser:
+            return
+        if not self.session_token:
+            self.stop()
+            raise RuntimeError("缺少 session_token，无法回退到 Playwright transport")
+        try:
+            self._start_browser_session(self.session_token)
+        except Exception:
+            self.stop()
+            raise
+
+    def _fetch_access_token_via_transport(self, allow_bearer_file=True):
+        if not getattr(self, "http_transport", None):
+            return None
+
+        try:
+            result = self.http_transport.request(
+                "GET",
+                "/api/auth/session",
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "oai-device-id": self.oai_device_id,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[ChatGPT] curl_cffi 获取 access token 失败: %s", exc)
+            result = None
+
+        if result and int(result.get("status") or 0) == 200:
+            try:
+                data = json.loads(result.get("body") or "{}")
+            except Exception:
+                data = {}
+            if "accessToken" in data:
+                self.access_token = data["accessToken"]
+                logger.info("[ChatGPT] 已通过 curl_cffi 获取 access token")
+                return "curl_cffi"
+
+        if allow_bearer_file:
+            bearer_file = BASE_DIR / "bearer_token"
+            if bearer_file.exists():
+                self.access_token = read_text(bearer_file).strip()
+                logger.info("[ChatGPT] 从 bearer_token 文件加载 access token")
+                return "file"
+
+        return None
+
+    def _auto_detect_workspace_via_transport(self):
+        if self.workspace_name or not getattr(self, "http_transport", None) or not self.account_id:
+            return self.workspace_name
+
+        try:
+            result = self.http_transport.request(
+                "GET",
+                f"/backend-api/accounts/{self.account_id}/settings",
+                headers=self._build_api_headers(),
+            )
+        except Exception as exc:
+            logger.warning("[ChatGPT] curl_cffi 自动检测 workspace 失败: %s", exc)
+            return ""
+
+        if int(result.get("status") or 0) != 200:
+            return ""
+
+        try:
+            data = json.loads(result.get("body") or "{}")
+        except Exception:
+            return ""
+
+        workspace_name = (data or {}).get("workspace_name", "") if isinstance(data, dict) else ""
+        if workspace_name:
+            self.workspace_name = workspace_name
+            update_admin_state(workspace_name=self.workspace_name, account_id=self.account_id)
+            logger.info("[ChatGPT] 自动检测到 workspace 名称: %s", self.workspace_name)
+        return self.workspace_name
+
+    def start_with_session(self, session_token, account_id, workspace_name="", require_browser=False):
+        """用指定的 session/account 启动浏览器上下文。"""
+        if not session_token:
+            raise FileNotFoundError("缺少会话信息")
+        self.stop()
+        self.account_id = account_id or ""
+        self.workspace_name = workspace_name or ""
+        self.session_token = session_token
+        self.access_token = None
+        if not self.account_id:
+            raise RuntimeError("缺少 workspace/account ID")
+
+        try:
+            self._ensure_admin_ipv6_proxy()
+            if not require_browser and self._start_transport_session(session_token):
+                token_source = self._fetch_access_token_via_transport()
+                if token_source:
+                    self._auto_detect_workspace_via_transport()
+                    return
+                logger.warning("[ChatGPT] curl_cffi 未能直接获取 access token，回退 Playwright transport")
+                self._close_http_transport(reason="before browser fallback")
+        except Exception:
+            self.stop()
+            raise
+
+        try:
+            self._start_browser_session(session_token)
+        except Exception:
+            self.stop()
+            raise
 
     def _auto_detect_workspace(self):
         if self.workspace_name:
@@ -1273,16 +1609,9 @@ class ChatGPTTeamAPI:
             logger.warning("[ChatGPT] 未能获取 access token，将尝试无 token 调用")
             return None
 
-    def _api_fetch(self, method, path, body=None):
-        headers_js = {
-            "Content-Type": "application/json",
-            "chatgpt-account-id": self.account_id,
-            "oai-device-id": self.oai_device_id,
-            "oai-language": "en-US",
-        }
-        if self.access_token:
-            headers_js["authorization"] = f"Bearer {self.access_token}"
-
+    def _browser_api_fetch(self, method, path, body=None):
+        if not self.page:
+            raise RuntimeError("Playwright 页面未初始化")
         js_code = """async ([method, url, headers, body]) => {
             try {
                 const opts = { method, headers };
@@ -1297,10 +1626,192 @@ class ChatGPTTeamAPI:
 
         return self.page.evaluate(
             js_code,
-            [method, f"https://chatgpt.com{path}", headers_js, json.dumps(body) if body else None],
+            [method, f"https://chatgpt.com{path}", self._build_api_headers(), json.dumps(body) if body else None],
         )
 
-    def invite_member(self, email, seat_type="usage_based"):
+    def _direct_api_fetch(self, method, path, body=None):
+        if not getattr(self, "http_transport", None):
+            raise RuntimeError("curl_cffi transport 未初始化")
+
+        try:
+            response = self.http_transport.request(
+                method,
+                path,
+                headers=self._build_api_headers(),
+                body=body,
+            )
+        except Exception as exc:
+            logger.warning("[ChatGPT] curl_cffi request failed，回退 Playwright transport: %s", exc)
+            self._close_http_transport(reason="request failed")
+            self._ensure_browser_session()
+            return self._browser_api_fetch(method, path, body)
+        status = int(response.get("status") or 0)
+        body_text = str(response.get("body") or "")
+        lower_body = body_text.lower()
+
+        if status == 401 and path != "/api/auth/session":
+            refreshed = self._fetch_access_token_via_transport(allow_bearer_file=False)
+            if refreshed:
+                try:
+                    response = self.http_transport.request(
+                        method,
+                        path,
+                        headers=self._build_api_headers(),
+                        body=body,
+                    )
+                except Exception as exc:
+                    logger.warning("[ChatGPT] curl_cffi retry failed，回退 Playwright transport: %s", exc)
+                    self._close_http_transport(reason="retry failed")
+                    self._ensure_browser_session()
+                    return self._browser_api_fetch(method, path, body)
+                status = int(response.get("status") or 0)
+                body_text = str(response.get("body") or "")
+                lower_body = body_text.lower()
+
+        if self._transport_response_requires_browser_fallback(response):
+            logger.warning("[ChatGPT] curl_cffi 返回异常响应，回退 Playwright transport")
+            self._close_http_transport(reason="fallback response")
+            self._ensure_browser_session()
+            return self._browser_api_fetch(method, path, body)
+
+        if status == 401 and (
+            "access token is missing" in lower_body or self._transport_body_looks_like_html(body_text)
+        ):
+            logger.warning("[ChatGPT] curl_cffi 鉴权异常，回退 Playwright transport")
+            self._close_http_transport(reason="auth fallback")
+            self._ensure_browser_session()
+            return self._browser_api_fetch(method, path, body)
+
+        return response
+
+    def _api_fetch(self, method, path, body=None):
+        if getattr(self, "http_transport", None):
+            return self._direct_api_fetch(method, path, body)
+
+        if not self.page and self.session_token:
+            self._ensure_browser_session()
+        return self._browser_api_fetch(method, path, body)
+
+    # POST /invites 失败时的重试间隔(秒)。rate_limited / network 类错误按此序列退避。
+    _INVITE_POST_RETRY_DELAYS = (5, 15)
+    # PATCH /invites/{id} 失败时的重试间隔(秒)。次数 = len(_INVITE_PATCH_RETRY_DELAYS)
+    _INVITE_PATCH_RETRY_DELAYS = (5,)
+
+    # 明确表示"目标域名被 workspace 拒绝"的短语。注意这里**不能**单独放 "domain" 这个 token —
+    # 服务端有大量包含 "domain" 字面量的无关错误(rate-limit 提示里的 "your domain ...",
+    # 甚至 errored_emails 里 email 自身的 "@gmail.com" 都会让 "domain" 命中),会把可重试错误
+    # 误判成 domain_blocked 直接返回给上层,导致整批账号被错误地放弃。
+    _DOMAIN_BLOCKED_KEYWORDS = (
+        "not allowed",
+        "domain blocked",
+        "domain is not allowed",
+        "forbidden domain",
+        "domain not permitted",
+    )
+
+    @staticmethod
+    def _classify_invite_error(status, data, resp_body):
+        """将 POST /invites 的响应归类为 domain_blocked / rate_limited / server_error / network / other。
+
+        - status == 0 视为 network(fetch 抛异常,可重试)
+        - 429 或 body 含 rate_limit/too many 视为 rate_limited(可重试)
+        - 5xx(500/502/503/504) 视为 server_error(可重试)
+        - 4xx 且 **明确字段**(detail/error/message + errored_emails[].error/code)命中
+          domain_blocked 关键词时归为 domain_blocked
+        - 其他非 200 为 other(不重试,交上层换号)
+        """
+        if status == 0:
+            return "network"
+        if status == 429:
+            return "rate_limited"
+        if status in (500, 502, 503, 504):
+            return "server_error"
+        # 只在明确字段拼接 body_text;不再 fallthrough 到 resp_body —
+        # 否则 email 中的 "gmail.com" 之类会被旧逻辑的 "domain" 关键词命中。
+        body_text = ""
+        if isinstance(data, dict):
+            for key in ("detail", "error", "message"):
+                val = data.get(key)
+                if isinstance(val, str):
+                    body_text += " " + val
+                elif isinstance(val, dict):
+                    inner = val.get("message") or val.get("code") or ""
+                    if isinstance(inner, str):
+                        body_text += " " + inner
+            # MEDIUM-1: errored_emails 内层 error/code 字段也算明确字段
+            for item in data.get("errored_emails", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                for inner_key in ("error", "code", "message"):
+                    val = item.get(inner_key)
+                    if isinstance(val, str):
+                        body_text += " " + val
+        lowered = body_text.lower()
+        if any(kw in lowered for kw in ("rate_limit", "rate limit", "too many", "throttle")):
+            return "rate_limited"
+        if any(kw in lowered for kw in ChatGPTTeamAPI._DOMAIN_BLOCKED_KEYWORDS):
+            return "domain_blocked"
+        return "other"
+
+    def invite_member(self, email, seat_type="usage_based", *, allow_patch_upgrade=True):
+        """邀请成员加入 Team(自带 default → usage_based 兜底 + errored_emails 处理)。
+
+        返回 `(status, data)`,其中 `data` 一定是 dict(解析失败封装为 `{"_raw": <text>}`),
+        必含字段:
+        - `_seat_type` ∈ {"chatgpt","usage_based","unknown"}
+            * "chatgpt"     POST 200 + (PATCH default 成功 或 直接 default 邀请成功)
+            * "usage_based" POST 200 但 PATCH 全部失败 / allow_patch_upgrade=False,仅 codex 席位
+            * "unknown"     POST 本身失败/被业务拒绝(domain/errored)
+        - `_error_kind`     最后一次失败的分类(成功时不写)
+        - `_errored_emails` POST 200 但 errored_emails 非空时,原样保留 errored_emails 数组,
+                             供上游记录失败原因。
+
+        参数:
+        - allow_patch_upgrade: True(默认) 走 usage_based POST + PATCH default 升级;
+          False 表示锁定 codex-only 席位,跳过 PATCH(对应 PREFERRED_SEAT_TYPE="codex")。
+
+        兜底逻辑(所有 fallback 都在本函数内完成,调用方拿到结果就是终态):
+        - seat_type="default" 时,若 POST 200 但 errored_emails 命中或 PATCH 失败,
+          自动重试一次 seat_type="usage_based"(整套 retry 计数重新算)。
+        - 顶层 HTTP 失败 + err_kind ∈ {network, rate_limited, server_error}:
+          按 _INVITE_POST_RETRY_DELAYS 退避(带 jitter)重试。
+        """
+        # default 邀请失败时下降到 usage_based(只翻一次,避免无限递归)
+        return self._invite_member_with_fallback(
+            email, seat_type, allow_fallback=True, allow_patch_upgrade=allow_patch_upgrade
+        )
+
+    def _invite_member_with_fallback(self, email, seat_type, *, allow_fallback, allow_patch_upgrade=True):
+        status, data = self._invite_member_once(email, seat_type, allow_patch_upgrade=allow_patch_upgrade)
+
+        # default 路径:有任何业务级失败迹象都尝试 usage_based 兜底
+        # 1) HTTP 非 200 且不是 domain_blocked(domain_blocked 直接返回让上层换号)
+        # 2) HTTP 200 但 errored_emails 非空(账号被业务规则拒绝)
+        # 3) HTTP 200 但 _seat_type=="unknown"(理论上 _invite_member_once 不会返回这种,但兜底)
+        if seat_type == "default" and allow_fallback:
+            errored = data.get("errored_emails") if isinstance(data, dict) else None
+            err_kind = data.get("_error_kind") if isinstance(data, dict) else None
+            should_fallback = False
+            if status != 200 and err_kind not in ("domain_blocked",):
+                should_fallback = True
+            elif status == 200 and errored:
+                should_fallback = True
+            if should_fallback:
+                logger.info(
+                    "[ChatGPT] %s default 邀请失败(status=%d kind=%s errored=%s),尝试 usage_based 兜底",
+                    email,
+                    status,
+                    err_kind,
+                    bool(errored),
+                )
+                return self._invite_member_with_fallback(
+                    email, "usage_based", allow_fallback=False, allow_patch_upgrade=allow_patch_upgrade
+                )
+
+        return status, data
+
+    def _invite_member_once(self, email, seat_type, *, allow_patch_upgrade=True):
+        """单一 seat_type 的完整邀请尝试(POST retry → PATCH 升级)。"""
         path = f"/backend-api/accounts/{self.account_id}/invites"
         body = {
             "email_addresses": [email],
@@ -1309,40 +1820,126 @@ class ChatGPTTeamAPI:
             "resend_emails": True,
         }
 
-        logger.info("[ChatGPT] 发送邀请到 %s (seat_type=%s)...", email, seat_type)
-        result = self._api_fetch("POST", path, body)
+        status = 0
+        data = {}
+        resp_body = ""
+        attempts = 1 + len(self._INVITE_POST_RETRY_DELAYS)
+        for attempt in range(attempts):
+            logger.info(
+                "[ChatGPT] 发送邀请到 %s (seat_type=%s, attempt=%d/%d)...",
+                email,
+                seat_type,
+                attempt + 1,
+                attempts,
+            )
+            result = self._api_fetch("POST", path, body)
+            status = result["status"]
+            resp_body = result["body"]
+            logger.info("[ChatGPT] 响应状态: %d", status)
 
-        status = result["status"]
-        resp_body = result["body"]
-        logger.info("[ChatGPT] 响应状态: %d", status)
+            try:
+                parsed = json.loads(resp_body)
+                logger.debug("[ChatGPT] 响应内容: %s", json.dumps(parsed, indent=2)[:500])
+            except Exception:
+                parsed = {"_raw": resp_body}
+                logger.debug("[ChatGPT] 响应内容(非 JSON): %s", (resp_body or "")[:500])
+            data = parsed if isinstance(parsed, dict) else {"_raw": parsed}
 
-        try:
-            data = json.loads(resp_body)
-            logger.debug("[ChatGPT] 响应内容: %s", json.dumps(data, indent=2)[:500])
-        except Exception:
-            data = resp_body
-            logger.debug("[ChatGPT] 响应内容: %s", resp_body[:500])
+            if status == 200:
+                break
 
-        if status == 200 and seat_type == "usage_based" and isinstance(data, dict):
-            invites = data.get("account_invites", [])
+            err_kind = self._classify_invite_error(status, data, resp_body)
+            logger.warning(
+                "[ChatGPT] 邀请 %s 失败: status=%d kind=%s body=%s",
+                email,
+                status,
+                err_kind,
+                (resp_body or "")[:200],
+            )
+            # domain_blocked / other: 不 retry,直接返回让上层换号
+            if err_kind in ("domain_blocked", "other"):
+                data.setdefault("_seat_type", "unknown")
+                data.setdefault("_error_kind", err_kind)
+                return status, data
+            # rate_limited / network / server_error: 按退避表(带 jitter)retry
+            if attempt < len(self._INVITE_POST_RETRY_DELAYS):
+                base_delay = self._INVITE_POST_RETRY_DELAYS[attempt]
+                # MEDIUM-2: 30% jitter 避免多客户端被同一 rate-limit 窗口拒绝后同时唤醒
+                delay = base_delay + random.uniform(0, base_delay * 0.3)
+                logger.info("[ChatGPT] %s 类错误,%.1fs 后重试邀请 %s", err_kind, delay, email)
+                time.sleep(delay)
+                continue
+            data.setdefault("_seat_type", "unknown")
+            data.setdefault("_error_kind", err_kind)
+            return status, data
+
+        # status == 200 → 检查 errored_emails / 处理 PATCH 升级
+        errored = data.get("errored_emails", []) if isinstance(data, dict) else []
+        if errored:
+            err_msg = errored[0].get("error", "unknown") if isinstance(errored[0], dict) else "unknown"
+            logger.warning("[ChatGPT] 邀请 %s 被 errored_emails 拒绝: %s", email, err_msg)
+            data["_seat_type"] = "unknown"
+            data["_error_kind"] = "errored_emails"
+            data["_errored_emails"] = errored
+            return status, data
+
+        # 默认标 usage_based,PATCH 成功再升级为 chatgpt
+        data["_seat_type"] = "usage_based"
+        if seat_type == "usage_based" and allow_patch_upgrade:
+            invites = data.get("account_invites", []) if isinstance(data, dict) else []
+            any_patched = False
+            any_invite = False
             for inv in invites:
-                invite_id = inv.get("id")
-                if invite_id:
-                    self._update_invite_seat_type(invite_id, "default")
+                invite_id = inv.get("id") if isinstance(inv, dict) else None
+                if not invite_id:
+                    continue
+                any_invite = True
+                if self._update_invite_seat_type(invite_id, "default"):
+                    any_patched = True
+            if any_invite and any_patched:
+                data["_seat_type"] = "chatgpt"
+            elif any_invite and not any_patched:
+                logger.error(
+                    "[ChatGPT] %s PATCH seat_type 全部失败,保留 codex 席位(_seat_type=usage_based)",
+                    email,
+                )
+        elif seat_type == "usage_based" and not allow_patch_upgrade:
+            # PREFERRED_SEAT_TYPE="codex" 路径:跳过 PATCH 升级,锁定 codex-only 席位
+            logger.info("[ChatGPT] %s 已锁 codex-only 席位(allow_patch_upgrade=False)", email)
+        elif seat_type == "default":
+            # 直接 default 邀请,只要 POST 200 + 无 errored 即完整 ChatGPT 席位
+            data["_seat_type"] = "chatgpt"
 
         return status, data
 
     def _update_invite_seat_type(self, invite_id, seat_type):
+        """PATCH 修改 invite 的 seat_type。返回 True 表示成功,False 表示重试后仍失败。"""
         path = f"/backend-api/accounts/{self.account_id}/invites/{invite_id}"
         body = {"seat_type": seat_type}
 
-        logger.info("[ChatGPT] 修改邀请 seat_type -> %s...", seat_type)
-        result = self._api_fetch("PATCH", path, body)
-
-        if result["status"] == 200:
-            logger.info("[ChatGPT] seat_type 已改为 %s", seat_type)
-        else:
-            logger.error("[ChatGPT] 修改 seat_type 失败: %d %s", result["status"], result["body"][:200])
+        attempts = 1 + len(self._INVITE_PATCH_RETRY_DELAYS)
+        for attempt in range(attempts):
+            logger.info(
+                "[ChatGPT] 修改邀请 seat_type -> %s (attempt=%d/%d)...",
+                seat_type,
+                attempt + 1,
+                attempts,
+            )
+            result = self._api_fetch("PATCH", path, body)
+            status = result["status"]
+            if status == 200:
+                logger.info("[ChatGPT] seat_type 已改为 %s", seat_type)
+                return True
+            logger.error(
+                "[ChatGPT] 修改 seat_type 失败: %d %s",
+                status,
+                (result.get("body") or "")[:200],
+            )
+            if attempt < len(self._INVITE_PATCH_RETRY_DELAYS):
+                delay = self._INVITE_PATCH_RETRY_DELAYS[attempt]
+                logger.info("[ChatGPT] PATCH 失败,%ds 后重试", delay)
+                time.sleep(delay)
+        return False
 
     def list_invites(self):
         path = f"/backend-api/accounts/{self.account_id}/invites"
@@ -1353,17 +1950,18 @@ class ChatGPTTeamAPI:
             return result["body"]
 
     def stop(self):
-        try:
-            if self.browser:
-                self.browser.close()
-        except Exception:
-            pass
-        try:
-            if self.playwright:
-                self.playwright.stop()
-        except Exception:
-            pass
+        self._close_http_transport(reason="stop")
+        close_playwright_objects(
+            page=self.page,
+            context=self.context,
+            browser=self.browser,
+            playwright=self.playwright,
+            logger=logger,
+            label="ChatGPTTeamAPI.stop",
+        )
         self.browser = None
         self.context = None
         self.page = None
         self.playwright = None
+        self.http_transport = None
+        self.transport_name = None

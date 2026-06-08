@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "ruff + pytest + code review baseline for verification"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "verify IllegalTransitionError raise + propagation patterns"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "verify structured logging on transition/subscriber-failure paths"}
+{"file": ".trellis/tasks/05-11-s1-state-machine-event-bus/prd.md", "reason": "acceptance criteria + DoD checklist"}

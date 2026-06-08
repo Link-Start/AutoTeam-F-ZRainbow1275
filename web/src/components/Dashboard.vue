@@ -1,145 +1,220 @@
 <template>
-  <div v-if="status">
-    <!-- 统计卡片 -->
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+  <div v-if="status" class="space-y-6">
+    <!-- F3 Master health banner -->
+    <MasterHealthBanner
+      :master-health="masterHealth"
+      :min-grace-until="minGraceUntil"
+      :loading="masterHealthBusy"
+      @refresh="onRefreshMasterHealth" />
+
+    <!-- F6 Pool health card -->
+    <PoolHealthCard
+      :accounts="status.accounts || []"
+      :master-health="masterHealth"
+      :min-grace-until="minGraceUntil" />
+
+    <!-- 状态分布卡片(色彩区分明显) -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
       <div v-for="card in cards" :key="card.label"
-        class="bg-gray-900 border border-gray-800 rounded-xl p-4">
-        <div class="text-sm text-gray-400">{{ card.label }}</div>
-        <div class="text-3xl font-bold mt-1" :class="card.color">{{ card.value }}</div>
+        class="glass-soft rounded-lg p-3.5 lift-hover relative overflow-hidden">
+        <div class="text-[10px] uppercase tracking-widest text-ink-500 font-semibold flex items-center gap-1.5">
+          <span class="w-1 h-1 rounded-full" :style="{ background: card.dot }"></span>
+          {{ card.label }}
+        </div>
+        <div class="text-3xl font-extrabold mt-1.5 tabular leading-none" :class="card.color">{{ card.value }}</div>
       </div>
     </div>
 
     <!-- 账号表格 -->
-    <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-      <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between gap-3 flex-wrap">
-        <h2 class="text-lg font-semibold text-white">账号列表</h2>
+    <div class="glass rounded-lg overflow-hidden">
+      <div class="px-5 py-4 border-b border-hairline flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h2 class="text-base font-bold text-ink-950 tracking-tight">账号列表</h2>
+          <p class="text-[11px] text-ink-500 mt-0.5">
+            {{ totalAccounts }} 个账号 · 每页 {{ ACCOUNT_PAGE_SIZE }} 条 · 实时配额来自 quota_cache
+          </p>
+        </div>
         <div class="flex items-center gap-2">
-          <button
-            v-if="selectedEmails.length"
-            @click="batchDelete"
-            :disabled="actionDisabled || batchDeleting"
-            class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-            :class="actionDisabled || batchDeleting
-              ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-              : 'bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20'">
-            {{ batchDeleting ? `批量删除中 ${batchProgress}` : `批量删除 (${selectedEmails.length})` }}
-          </button>
-          <button
-            v-if="selectedEmails.length"
-            @click="clearSelection"
-            class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-xs rounded-lg border border-gray-700 text-gray-400 hover:text-white transition">
+          <AtButton v-if="selectedDisableEmails.length"
+            variant="secondary" size="sm" :loading="bulkToggling" :disabled="actionDisabled"
+            @click="bulkDisableSelected">
+            禁用自动化 ({{ selectedDisableEmails.length }})
+          </AtButton>
+          <AtButton v-if="selectedEnableEmails.length"
+            variant="primary" size="sm" :loading="bulkToggling" :disabled="actionDisabled"
+            @click="bulkEnableSelected">
+            启用自动化 ({{ selectedEnableEmails.length }})
+          </AtButton>
+          <AtButton v-if="selectedEmails.length"
+            variant="danger" size="sm" :loading="batchDeleting" :disabled="actionDisabled"
+            confirm @click="batchDelete">
+            <template #icon>
+              <Trash2 class="w-3.5 h-3.5" :stroke-width="2" />
+            </template>
+            {{ batchDeleting ? `批量删除 ${batchProgress}` : `批量删除 (${selectedEmails.length})` }}
+          </AtButton>
+          <AtButton v-if="selectedEmails.length" variant="ghost" size="sm" @click="clearSelection">
             取消选择
-          </button>
-          <button @click="syncAccounts" :disabled="syncing"
-            class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-xs rounded-lg border border-gray-700 transition disabled:opacity-50 text-gray-400 hover:text-white">
-            {{ syncing ? '同步中...' : '同步账号' }}
-          </button>
+          </AtButton>
+          <AtButton variant="secondary" size="sm" :loading="syncing" @click="syncAccounts">
+            <template #icon>
+              <RefreshCw class="w-3.5 h-3.5" :stroke-width="2" />
+            </template>
+            {{ syncing ? '同步中…' : '同步账号' }}
+          </AtButton>
         </div>
       </div>
-      <div v-if="message" class="mx-4 mt-4 px-4 py-3 rounded-lg text-sm border" :class="messageClass">
+
+      <div v-if="message" class="mx-5 mt-4 px-4 py-2.5 rounded-lg text-sm border animate-rise" :class="messageClass">
         {{ message }}
       </div>
-      <div v-if="!adminReady" class="mx-4 mt-4 px-4 py-3 rounded-lg text-sm border bg-amber-500/10 text-amber-300 border-amber-500/20">
-        请先在「设置」页完成管理员登录后，才能操作账号。
+      <div v-if="!adminReady"
+        class="mx-5 mt-4 px-4 py-2.5 rounded-lg text-sm border bg-amber-50 text-amber-800 border-amber-200">
+        请先在「设置」页完成管理员登录后,才能操作账号。
       </div>
+      <div v-if="hiddenAccountCount"
+        class="mx-5 mt-4 px-4 py-2.5 rounded-lg text-sm border bg-sky-50 text-sky-800 border-sky-200">
+        当前仅渲染第 {{ accountPageStart + 1 }}-{{ accountPageEnd }} 个账号，另有 {{ hiddenAccountCount }} 个账号在其它页，以控制页面资源占用。
+      </div>
+      <div v-if="totalAccountPages > 1"
+        class="mx-5 mt-4 px-3 py-2 rounded-lg border border-hairline bg-ink-50 flex items-center justify-between gap-3 flex-wrap">
+        <div class="text-xs text-ink-600">
+          显示 {{ accountPageStart + 1 }}-{{ accountPageEnd }} / {{ totalAccounts }}
+        </div>
+        <div class="flex items-center gap-2">
+          <AtButton variant="ghost" size="sm" :disabled="accountPage <= 1" @click="goAccountPage(accountPage - 1)">
+            <template #icon>
+              <ChevronLeft class="w-3.5 h-3.5" :stroke-width="2" />
+            </template>
+            上一页
+          </AtButton>
+          <span class="text-xs text-ink-600 tabular">第 {{ accountPage }} / {{ totalAccountPages }} 页</span>
+          <AtButton variant="ghost" size="sm" :disabled="accountPage >= totalAccountPages" @click="goAccountPage(accountPage + 1)">
+            <template #icon>
+              <ChevronRight class="w-3.5 h-3.5" :stroke-width="2" />
+            </template>
+            下一页
+          </AtButton>
+        </div>
+      </div>
+
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead>
-            <tr class="text-gray-400 text-left border-b border-gray-800">
-              <th class="px-3 py-3 font-medium w-8">
+            <tr class="text-ink-500 text-left border-b border-hairline text-[10px] uppercase tracking-widest">
+              <th class="px-3 py-3 font-semibold w-8">
                 <input
                   type="checkbox"
                   :checked="allSelectableChecked"
                   :indeterminate.prop="someSelectableChecked"
                   @change="toggleSelectAll"
                   :disabled="!selectableEmails.length"
-                  class="accent-rose-500 cursor-pointer"
-                  title="全选/取消全选(主号除外)" />
+                  class="accent-indigo-500 cursor-pointer w-3.5 h-3.5"
+                  title="全选/取消全选本页账号(主号除外)" />
               </th>
-              <th class="px-4 py-3 font-medium">#</th>
-              <th class="px-4 py-3 font-medium">邮箱</th>
-              <th class="px-4 py-3 font-medium">状态</th>
-              <th class="px-4 py-3 font-medium text-right">5h 剩余</th>
-              <th class="px-4 py-3 font-medium text-right">周 剩余</th>
-              <th class="px-4 py-3 font-medium">5h 重置</th>
-              <th class="px-4 py-3 font-medium">周 重置</th>
-              <th class="px-4 py-3 font-medium text-right">操作</th>
+              <th class="px-3 py-3 font-semibold">#</th>
+              <th class="px-4 py-3 font-semibold">邮箱</th>
+              <th class="px-4 py-3 font-semibold">状态</th>
+              <th class="px-4 py-3 font-semibold">实际可用</th>
+              <th class="px-4 py-3 font-semibold text-right">5h 剩余</th>
+              <th class="px-4 py-3 font-semibold text-right">周 剩余</th>
+              <th class="px-4 py-3 font-semibold">5h 重置</th>
+              <th class="px-4 py-3 font-semibold">周 重置</th>
+              <th class="px-4 py-3 font-semibold text-right">操作</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="(acc, i) in status.accounts" :key="acc.email"
-              class="border-b border-gray-800/50 hover:bg-gray-800/30 transition"
-              :class="isSelected(acc.email) ? 'bg-rose-500/5' : ''">
-              <td class="px-3 py-3">
+            <tr v-for="(acc, i) in visibleAccounts" :key="acc.email"
+              class="row-hoverable border-b border-hairline hover:bg-ink-50 group"
+              :class="[isSelected(acc.email) ? 'bg-indigo-50' : '', acc.disabled ? 'opacity-75' : '']">
+              <td class="px-3 py-3.5">
                 <input
                   v-if="!acc.is_main_account"
                   type="checkbox"
                   :checked="isSelected(acc.email)"
                   @change="toggleSelect(acc.email)"
-                  class="accent-rose-500 cursor-pointer" />
+                  class="accent-indigo-500 cursor-pointer w-3.5 h-3.5" />
               </td>
-              <td class="px-4 py-3 text-gray-500">{{ i + 1 }}</td>
-              <td class="px-4 py-3 font-mono text-xs">{{ acc.email }}</td>
-              <td class="px-4 py-3">
-                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium"
-                  :class="statusClass(acc.status)">
-                  <span class="w-1.5 h-1.5 rounded-full" :class="dotClass(acc.status)"></span>
-                  {{ statusLabel(acc.status) }}
-                </span>
+              <td class="px-3 py-3.5 text-ink-400 font-mono text-xs">{{ String(accountPageStart + i + 1).padStart(2, '0') }}</td>
+              <td class="px-4 py-3.5">
+                <div class="flex items-center gap-2">
+                  <span v-if="acc.is_main_account"
+                    class="text-[9px] uppercase tracking-widest font-bold px-1.5 py-0.5 rounded
+                           bg-indigo-50 text-indigo-700 border border-indigo-200">
+                    Master
+                  </span>
+                  <span class="font-mono text-[12px] text-ink-900">{{ acc.email }}</span>
+                </div>
               </td>
-              <td class="px-4 py-3 text-right font-mono" :class="pctColor(quota(acc, 'primary'))">
+              <td class="px-4 py-3.5">
+                <StatusBadge :status="acc.status" :grace-until="acc.grace_until" />
+              </td>
+              <td class="px-4 py-3.5">
+                <UsabilityCell :account="acc" />
+              </td>
+              <td class="px-4 py-3.5 text-right font-mono tabular text-[12px]" :class="pctColor(quota(acc, 'primary'))">
                 {{ quotaPct(acc, 'primary') }}
               </td>
-              <td class="px-4 py-3 text-right font-mono" :class="pctColor(quota(acc, 'weekly'))">
+              <td class="px-4 py-3.5 text-right font-mono tabular text-[12px]" :class="pctColor(quota(acc, 'weekly'))">
                 {{ quotaPct(acc, 'weekly') }}
               </td>
-              <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'primary') }}</td>
-              <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'weekly') }}</td>
-              <td class="px-4 py-3 text-right space-x-2">
-                <!-- 缺认证标识：personal 账号没有 auth_file → 在补登录按钮旁提示 -->
-                <span
-                  v-if="acc.status === 'personal' && !acc.auth_file"
-                  class="inline-block px-2 py-0.5 mr-1 rounded text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/30"
-                  title="未拿到 Codex auth_file，请点击补登录">
-                  缺认证
-                </span>
-                <button
-                  v-if="canLogin(acc)"
-                  @click="loginAccount(acc.email)"
-                  :disabled="actionDisabled || actionEmail === acc.email"
-                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-                  :class="actionDisabled || actionEmail === acc.email
-                    ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-                    : 'bg-blue-600/10 text-blue-400 border-blue-500/30 hover:bg-blue-600/20'">
-                  {{ actionEmail === acc.email && actionType === 'login' ? '登录中...' : loginLabel(acc) }}
-                </button>
-                <button
-                  v-if="!acc.is_main_account && acc.status === 'active'"
-                  @click="kickAccount(acc.email)"
-                  :disabled="actionDisabled || actionEmail === acc.email"
-                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-                  :class="actionDisabled || actionEmail === acc.email
-                    ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-                    : 'bg-amber-600/10 text-amber-400 border-amber-500/30 hover:bg-amber-600/20'">
-                  {{ actionEmail === acc.email && actionType === 'kick' ? '移出中...' : '移出' }}
-                </button>
-                <button
-                  v-if="acc.status === 'active' || acc.status === 'personal' || acc.is_main_account"
-                  @click="exportCodexAuth(acc.email)"
-                  :disabled="actionEmail === acc.email"
-                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition bg-cyan-600/10 text-cyan-400 border-cyan-500/30 hover:bg-cyan-600/20">
-                  导出
-                </button>
-                <button
-                  v-if="!acc.is_main_account"
-                  @click="removeAccount(acc.email)"
-                  :disabled="actionDisabled || actionEmail === acc.email"
-                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-                  :class="actionDisabled || actionEmail === acc.email
-                    ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-                    : 'bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20'">
-                  {{ actionEmail === acc.email && actionType === 'delete' ? '删除中...' : '删除' }}
-                </button>
+              <td class="px-4 py-3.5 text-ink-500 font-mono text-[11px]">{{ quotaReset(acc, 'primary') }}</td>
+              <td class="px-4 py-3.5 text-ink-500 font-mono text-[11px]">{{ quotaReset(acc, 'weekly') }}</td>
+              <td class="px-4 py-3.5 text-right">
+                <div class="flex items-center justify-end gap-1.5 flex-wrap">
+                  <span v-if="acc.status === 'personal' && !acc.auth_file"
+                    class="inline-block px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wide
+                           bg-amber-50 text-amber-800 border border-amber-200"
+                    title="未拿到 Codex auth_file,请点击补登录">
+                    缺认证
+                  </span>
+                  <AtButton v-if="canLogin(acc)"
+                    variant="primary" size="sm"
+                    :loading="actionEmail === acc.email && actionType === 'login'"
+                    :disabled="actionDisabled || (actionEmail === acc.email && actionType !== 'login')"
+                    @click="loginAccount(acc.email)">
+                    {{ loginLabel(acc) }}
+                  </AtButton>
+                  <!-- Round 11:子号"立即探活"按钮(spec realtime-probe.md v1.0 §4) -->
+                  <AtButton v-if="canProbe(acc)"
+                    variant="secondary" size="sm"
+                    :loading="actionEmail === acc.email && actionType === 'probe'"
+                    :disabled="actionDisabled || (actionEmail === acc.email && actionType !== 'probe')"
+                    @click="probeAccount(acc.email)"
+                    title="立即调 cheap_codex_smoke + check_codex_quota,绕过 30min 节流">
+                    立即探活
+                  </AtButton>
+                  <AtButton v-if="!acc.is_main_account && !acc.disabled && acc.raw_status === 'active'"
+                    variant="secondary" size="sm"
+                    :loading="actionEmail === acc.email && actionType === 'kick'"
+                    :disabled="actionDisabled || (actionEmail === acc.email && actionType !== 'kick')"
+                    @click="kickAccount(acc.email)">
+                    移出
+                  </AtButton>
+                  <AtButton v-if="acc.raw_status === 'active' || acc.raw_status === 'personal' || acc.is_main_account"
+                    variant="ghost" size="sm"
+                    :disabled="actionEmail === acc.email"
+                    @click="exportCodexAuth(acc.email)">
+                    <template #icon>
+                      <Download class="w-3.5 h-3.5" :stroke-width="2" />
+                    </template>
+                    导出
+                  </AtButton>
+                  <AtButton v-if="!acc.is_main_account"
+                    :variant="acc.disabled ? 'primary' : 'secondary'" size="sm"
+                    :loading="actionEmail === acc.email && actionType === (acc.disabled ? 'enable' : 'disable')"
+                    :disabled="actionDisabled || (actionEmail === acc.email && !['enable', 'disable'].includes(actionType))"
+                    @click="toggleAccountDisabled(acc)">
+                    {{ acc.disabled ? '启用' : '禁用' }}
+                  </AtButton>
+                  <AtButton v-if="!acc.is_main_account"
+                    variant="danger" size="sm" confirm
+                    :loading="actionEmail === acc.email && actionType === 'delete'"
+                    :disabled="actionDisabled || (actionEmail === acc.email && actionType !== 'delete')"
+                    @click="removeAccount(acc.email)">
+                    删除
+                  </AtButton>
+                </div>
               </td>
             </tr>
           </tbody>
@@ -147,47 +222,50 @@
       </div>
 
       <!-- 注册失败明细 -->
-      <div class="mt-6 bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div class="border-t border-hairline p-5 bg-ink-50">
         <div class="flex items-center justify-between mb-3">
           <div>
-            <h2 class="text-lg font-semibold text-white">注册失败明细</h2>
-            <div class="text-xs text-gray-500 mt-0.5">未能入池的注册尝试会写在这里（add-phone / duplicate / OAuth 失败等）</div>
+            <h2 class="text-sm font-bold text-ink-950 tracking-tight">注册失败明细</h2>
+            <div class="text-[11px] text-ink-500 mt-0.5">未能入池的注册尝试 (add-phone / duplicate / OAuth 失败 等)</div>
           </div>
-          <button @click="loadFailures" :disabled="failuresLoading"
-            class="px-3 py-1.5 rounded-lg text-xs border bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700 transition">
-            {{ failuresLoading ? '加载中...' : '刷新' }}
-          </button>
+          <AtButton variant="ghost" size="sm" :loading="failuresLoading" @click="loadFailures">
+            刷新
+          </AtButton>
         </div>
-        <div v-if="failuresCounts && Object.keys(failuresCounts).length" class="flex flex-wrap gap-2 mb-3 text-xs">
+        <div v-if="failuresCounts && Object.keys(failuresCounts).length" class="flex flex-wrap gap-1.5 mb-3 text-[11px]">
           <span v-for="(cnt, cat) in failuresCounts" :key="cat"
-            class="px-2 py-1 rounded border bg-gray-800 border-gray-700 text-gray-300">
-            {{ cat }}: <span class="text-rose-400 font-mono">{{ cnt }}</span>
+            class="px-2 py-0.5 rounded-md border bg-surface border-hairline text-ink-700">
+            {{ cat }}: <span class="text-rose-700 font-mono ml-0.5 tabular">{{ cnt }}</span>
           </span>
         </div>
-        <div class="overflow-x-auto">
+        <div class="overflow-x-auto rounded-lg border border-hairline bg-surface">
+          <div v-if="failuresUnavailable"
+            class="px-3 py-3 text-xs text-amber-800 bg-amber-50 border-b border-amber-200">
+            {{ failuresUnavailable }}
+          </div>
           <table class="w-full text-sm">
-            <thead class="text-xs text-gray-500 border-b border-gray-800">
+            <thead class="text-[10px] uppercase tracking-widest text-ink-500 border-b border-hairline bg-ink-50">
               <tr>
-                <th class="text-left px-3 py-2">时间</th>
-                <th class="text-left px-3 py-2">邮箱</th>
-                <th class="text-left px-3 py-2">类别</th>
-                <th class="text-left px-3 py-2">原因</th>
-                <th class="text-left px-3 py-2">附加</th>
+                <th class="text-left px-3 py-2 font-semibold">时间</th>
+                <th class="text-left px-3 py-2 font-semibold">邮箱</th>
+                <th class="text-left px-3 py-2 font-semibold">类别</th>
+                <th class="text-left px-3 py-2 font-semibold">原因</th>
+                <th class="text-left px-3 py-2 font-semibold">附加</th>
               </tr>
             </thead>
-            <tbody class="divide-y divide-gray-800/60 text-xs">
+            <tbody class="divide-y divide-hairline text-xs">
               <tr v-if="!failuresItems.length">
-                <td class="px-3 py-4 text-gray-500" colspan="5">暂无失败记录</td>
+                <td class="px-3 py-4 text-ink-400 italic" colspan="5">暂无失败记录</td>
               </tr>
-              <tr v-for="(f, idx) in failuresItems" :key="idx">
-                <td class="px-3 py-2 text-gray-400 font-mono">{{ fmtTs(f.timestamp) }}</td>
-                <td class="px-3 py-2 text-gray-300 font-mono">{{ f.email || '-' }}</td>
+              <tr v-for="(f, idx) in failuresItems" :key="idx" class="hover:bg-ink-50">
+                <td class="px-3 py-2 text-ink-500 font-mono">{{ fmtTs(f.timestamp) }}</td>
+                <td class="px-3 py-2 text-ink-700 font-mono">{{ f.email || '-' }}</td>
                 <td class="px-3 py-2">
-                  <span class="px-2 py-0.5 rounded border text-[11px]"
+                  <span class="px-1.5 py-0.5 rounded-md border text-[10px] font-semibold uppercase tracking-wide"
                     :class="failureCategoryClass(f.category)">{{ f.category }}</span>
                 </td>
-                <td class="px-3 py-2 text-gray-400">{{ f.reason }}</td>
-                <td class="px-3 py-2 text-gray-500 font-mono text-[11px]">{{ fmtFailureExtra(f) }}</td>
+                <td class="px-3 py-2 text-ink-600">{{ f.reason }}</td>
+                <td class="px-3 py-2 text-ink-400 font-mono text-[10px]">{{ fmtFailureExtra(f) }}</td>
               </tr>
             </tbody>
           </table>
@@ -195,43 +273,43 @@
       </div>
 
       <!-- Codex 认证导出弹窗 -->
-      <div v-if="exportData" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" @click.self="exportData = null">
-        <div class="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
-          <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-            <h3 class="text-white font-semibold">Codex CLI 认证文件</h3>
-            <button @click="exportData = null" class="text-gray-400 hover:text-white text-lg">&times;</button>
+      <div v-if="exportData"
+        class="fixed inset-0 bg-ink-600/20 z-50 flex items-center justify-center p-4 animate-rise"
+        @click.self="exportData = null">
+        <div class="glass rounded-lg w-full max-w-2xl max-h-[80vh] flex flex-col">
+          <div class="px-5 py-4 border-b border-hairline flex items-center justify-between">
+            <h3 class="text-ink-950 font-bold tracking-tight">Codex CLI 认证文件</h3>
+            <button @click="exportData = null" class="text-ink-500 hover:text-ink-950 transition focus-ring rounded-lg p-1">
+              <X class="w-4 h-4" :stroke-width="2" />
+            </button>
           </div>
-          <div class="p-4 space-y-3 overflow-y-auto flex-1">
-            <div class="px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-sm text-amber-300 space-y-2">
-              <div class="font-medium">使用步骤：</div>
-              <ol class="list-decimal list-inside space-y-1 text-xs text-amber-400/90">
+          <div class="p-5 space-y-3 overflow-y-auto flex-1">
+            <div class="px-3 py-2.5 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800 space-y-2">
+              <div class="font-semibold">使用步骤:</div>
+              <ol class="list-decimal list-inside space-y-1 text-xs text-amber-700">
                 <li>退出当前 Codex CLI 会话</li>
-                <li>删除旧文件：<code class="bg-gray-800 px-1 rounded">rm ~/.codex/auth.json</code></li>
-                <li>将下方内容保存到 <code class="bg-gray-800 px-1 rounded">~/.codex/auth.json</code>（Windows: <code class="bg-gray-800 px-1 rounded">%APPDATA%\codex\auth.json</code>）</li>
+                <li>删除旧文件:<code class="bg-amber-50 border border-amber-200 px-1 rounded">rm ~/.codex/auth.json</code></li>
+                <li>将下方内容保存到 <code class="bg-amber-50 border border-amber-200 px-1 rounded">~/.codex/auth.json</code>(Windows: <code class="bg-amber-50 border border-amber-200 px-1 rounded">%APPDATA%\codex\auth.json</code>)</li>
                 <li>重新启动 Codex CLI</li>
               </ol>
-              <div class="text-xs text-amber-400/60">导出后 Codex CLI 直连 OpenAI，不走 CPA 代理，响应更快。</div>
+              <div class="text-xs text-amber-700">导出后 Codex CLI 直连 OpenAI,不走 CPA 代理,响应更快。</div>
             </div>
             <div class="relative">
-              <pre class="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre">{{ exportJson }}</pre>
-              <button @click="copyExport"
-                class="absolute top-2 right-2 px-2 py-1 rounded border text-xs transition"
-                :class="copied
-                  ? 'bg-green-600/20 text-green-400 border-green-500/30'
-                  : 'bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white border-gray-700'">
-                {{ copied ? '复制成功' : '复制' }}
-              </button>
+              <pre class="bg-ink-50 border border-hairline rounded-lg p-4 text-xs font-mono text-ink-800 overflow-x-auto whitespace-pre">{{ exportJson }}</pre>
+              <AtButton :variant="copied ? 'primary' : 'secondary'" size="sm"
+                class="absolute top-2 right-2" @click="copyExport">
+                {{ copied ? '已复制' : '复制' }}
+              </AtButton>
             </div>
           </div>
-          <div class="px-4 py-3 border-t border-gray-800 flex justify-end gap-3">
-            <button @click="downloadExport"
-              class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition">
+          <div class="px-5 py-4 border-t border-hairline flex justify-end gap-2">
+            <AtButton variant="primary" @click="downloadExport">
+              <template #icon>
+                <Download class="w-3.5 h-3.5" :stroke-width="2" />
+              </template>
               下载 auth.json
-            </button>
-            <button @click="exportData = null"
-              class="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-sm text-gray-300 rounded-lg border border-gray-700 transition">
-              关闭
-            </button>
+            </AtButton>
+            <AtButton variant="secondary" @click="exportData = null">关闭</AtButton>
           </div>
         </div>
       </div>
@@ -241,26 +319,42 @@
   <!-- Loading skeleton -->
   <div v-else-if="loading" class="space-y-4">
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
-      <div v-for="i in 4" :key="i" class="bg-gray-900 border border-gray-800 rounded-xl p-4 h-20 animate-pulse"></div>
+      <div v-for="i in 4" :key="i" class="glass-soft rounded-lg p-4 h-20 shimmer-bg"></div>
     </div>
-    <div class="bg-gray-900 border border-gray-800 rounded-xl h-64 animate-pulse"></div>
+    <div class="glass-soft rounded-lg h-64 shimmer-bg"></div>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api } from '../api.js'
+import StatusBadge from './StatusBadge.vue'
+import UsabilityCell from './UsabilityCell.vue'
+import MasterHealthBanner from './MasterHealthBanner.vue'
+import PoolHealthCard from './PoolHealthCard.vue'
+import AtButton from './AtButton.vue'
+import { ChevronLeft, ChevronRight, Download, RefreshCw, Trash2, X } from 'lucide-vue-next'
+import {
+  quotaRemainingPct as _qr,
+  quotaPctText,
+  formatQuotaReset,
+  quotaPctColor,
+} from '../composables/useStatus.js'
+import { useToast } from '../composables/useToast.js'
+
+const toast = useToast()
 
 const props = defineProps({
   status: Object,
   loading: Boolean,
   runningTask: Object,
-  adminStatus: {
-    type: Object,
-    default: null,
-  },
+  adminStatus: { type: Object, default: null },
+  masterHealth: { type: Object, default: null },
+  registerFailures: { type: Object, default: null },
+  registerFailuresLoading: { type: Boolean, default: false },
+  registerFailuresUnavailable: { type: String, default: '' },
 })
-const emit = defineEmits(['refresh'])
+const emit = defineEmits(['refresh', 'reload-master-health'])
 
 const actionEmail = ref('')
 const actionType = ref('')
@@ -269,28 +363,45 @@ const message = ref('')
 const exportData = ref(null)
 const copied = ref(false)
 const messageClass = ref('')
+const masterHealthBusy = ref(false)
+const accountPage = ref(1)
+const ACCOUNT_PAGE_SIZE = 50
 
 // 批量删除选中态:按邮箱(小写)保存,便于跨刷新复用
 const selectedSet = ref(new Set())
 const batchDeleting = ref(false)
 const batchProgress = ref('')
+const bulkToggling = ref(false)
 
-// 失败日志面板状态
-const failuresItems = ref([])
-const failuresCounts = ref({})
-const failuresLoading = ref(false)
+const failuresItems = computed(() => props.registerFailures?.items || [])
+const failuresCounts = computed(() => props.registerFailures?.counts || {})
+const failuresLoading = computed(() => !!props.registerFailuresLoading)
+const failuresUnavailable = computed(() => props.registerFailuresUnavailable || '')
 
-async function loadFailures() {
-  failuresLoading.value = true
-  try {
-    const r = await api.getRegisterFailures(50)
-    failuresItems.value = r.items || []
-    failuresCounts.value = r.counts || {}
-  } catch (e) {
-    console.error('loadFailures', e)
-  } finally {
-    failuresLoading.value = false
+const accounts = computed(() => props.status?.accounts || [])
+const totalAccounts = computed(() => accounts.value.length)
+const totalAccountPages = computed(() => Math.max(1, Math.ceil(totalAccounts.value / ACCOUNT_PAGE_SIZE)))
+const accountPageStart = computed(() => (accountPage.value - 1) * ACCOUNT_PAGE_SIZE)
+const accountPageEnd = computed(() => Math.min(accountPageStart.value + ACCOUNT_PAGE_SIZE, totalAccounts.value))
+const visibleAccounts = computed(() => accounts.value.slice(accountPageStart.value, accountPageEnd.value))
+const hiddenAccountCount = computed(() => Math.max(0, accounts.value.length - visibleAccounts.value.length))
+
+function goAccountPage(page) {
+  const nextPage = Math.min(Math.max(1, page), totalAccountPages.value)
+  if (nextPage === accountPage.value) return
+  accountPage.value = nextPage
+  clearSelection()
+}
+
+watch(totalAccountPages, pages => {
+  if (accountPage.value > pages) {
+    accountPage.value = pages
+    clearSelection()
   }
+})
+
+function loadFailures() {
+  emit('refresh')
 }
 
 function fmtTs(ts) {
@@ -302,14 +413,15 @@ function fmtTs(ts) {
 
 function failureCategoryClass(cat) {
   const map = {
-    phone_blocked: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
-    duplicate_exhausted: 'bg-orange-500/10 text-orange-400 border-orange-500/30',
-    register_failed: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
-    oauth_failed: 'bg-purple-500/10 text-purple-400 border-purple-500/30',
-    kick_failed: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30',
-    exception: 'bg-red-500/10 text-red-400 border-red-500/30',
+    phone_blocked: 'bg-rose-50 text-rose-700 border-rose-200',
+    duplicate_exhausted: 'bg-orange-50 text-orange-700 border-orange-200',
+    register_failed: 'bg-amber-50 text-amber-700 border-amber-200',
+    oauth_failed: 'bg-sky-50 text-sky-700 border-sky-200',
+    kick_failed: 'bg-yellow-50 text-yellow-700 border-yellow-200',
+    exception: 'bg-red-50 text-red-700 border-red-200',
+    master_subscription_degraded: 'bg-orange-50 text-orange-700 border-orange-200',
   }
-  return map[cat] || 'bg-gray-500/10 text-gray-400 border-gray-500/30'
+  return map[cat] || 'bg-ink-50 text-ink-600 border-hairline'
 }
 
 function fmtFailureExtra(f) {
@@ -321,19 +433,24 @@ function fmtFailureExtra(f) {
   return parts.join(' ') || '-'
 }
 
-onMounted(loadFailures)
-watch(() => props.runningTask, (cur, prev) => {
-  // 有任务完成（从有到无）时自动刷新一次失败日志
-  if (prev && !cur) loadFailures()
-})
 const adminReady = computed(() => !!props.adminStatus?.configured)
-const actionDisabled = computed(() => !!props.runningTask || !adminReady.value)
+const actionDisabled = computed(() => !!props.runningTask || !adminReady.value || bulkToggling.value)
 
 const selectableEmails = computed(() =>
-  (props.status?.accounts || []).filter(a => !a.is_main_account).map(a => a.email)
+  visibleAccounts.value.filter(a => !a.is_main_account).map(a => a.email)
 )
 const selectedEmails = computed(() =>
   selectableEmails.value.filter(e => selectedSet.value.has(e.toLowerCase()))
+)
+const selectedDisableEmails = computed(() =>
+  visibleAccounts.value
+    .filter(a => !a.is_main_account && !a.disabled && selectedSet.value.has((a.email || '').toLowerCase()))
+    .map(a => a.email)
+)
+const selectedEnableEmails = computed(() =>
+  visibleAccounts.value
+    .filter(a => !a.is_main_account && a.disabled && selectedSet.value.has((a.email || '').toLowerCase()))
+    .map(a => a.email)
 )
 const allSelectableChecked = computed(() =>
   selectableEmails.value.length > 0 && selectedEmails.value.length === selectableEmails.value.length
@@ -345,7 +462,6 @@ const someSelectableChecked = computed(() =>
 function isSelected(email) {
   return selectedSet.value.has((email || '').toLowerCase())
 }
-
 function toggleSelect(email) {
   const key = (email || '').toLowerCase()
   const next = new Set(selectedSet.value)
@@ -353,82 +469,51 @@ function toggleSelect(email) {
   else next.add(key)
   selectedSet.value = next
 }
-
 function toggleSelectAll() {
-  if (allSelectableChecked.value) {
-    selectedSet.value = new Set()
-  } else {
-    selectedSet.value = new Set(selectableEmails.value.map(e => e.toLowerCase()))
-  }
+  if (allSelectableChecked.value) selectedSet.value = new Set()
+  else selectedSet.value = new Set(selectableEmails.value.map(e => e.toLowerCase()))
 }
+function clearSelection() { selectedSet.value = new Set() }
 
-function clearSelection() {
-  selectedSet.value = new Set()
-}
+// Round 9 — 派生 minGraceUntil:从所有 GRACE 子号取最早到期者,banner/PoolHealthCard 共用
+const minGraceUntil = computed(() => {
+  let min = null
+  for (const acc of accounts.value) {
+    if (acc.status === 'degraded_grace' && typeof acc.grace_until === 'number') {
+      if (min === null || acc.grace_until < min) min = acc.grace_until
+    }
+  }
+  return min
+})
 
 const cards = computed(() => {
   if (!props.status) return []
-  const s = props.status.summary
+  const s = props.status.summary || {}
+  const dg = s.degraded_grace ?? accounts.value.filter(a => a.status === 'degraded_grace').length
   return [
-    { label: '活跃', value: s.active, color: 'text-green-400' },
-    { label: '待命', value: s.standby, color: 'text-yellow-400' },
-    { label: '额度用完', value: s.exhausted, color: 'text-red-400' },
-    { label: '免费号', value: s.personal || 0, color: 'text-fuchsia-400' },
-    { label: '总计', value: s.total, color: 'text-white' },
+    { label: 'Active', value: s.active || 0, color: 'text-emerald-700', dot: 'rgb(16, 185, 129)' },
+    { label: 'Standby', value: s.standby || 0, color: 'text-amber-700', dot: 'rgb(217, 119, 6)' },
+    { label: 'Grace', value: dg, color: 'text-orange-700', dot: 'rgb(234, 88, 12)' },
+    { label: 'Personal', value: s.personal || 0, color: 'text-sky-700', dot: 'rgb(2, 132, 199)' },
+    { label: 'Disabled', value: s.disabled || 0, color: 'text-stone-700', dot: 'rgb(120, 113, 108)' },
+    { label: 'Total', value: s.total || 0, color: 'text-ink-950', dot: 'rgb(79, 70, 229)' },
   ]
 })
-
-function statusClass(s) {
-  return {
-    active: 'bg-green-500/10 text-green-400',
-    exhausted: 'bg-red-500/10 text-red-400',
-    standby: 'bg-yellow-500/10 text-yellow-400',
-    pending: 'bg-gray-500/10 text-gray-400',
-    personal: 'bg-fuchsia-500/10 text-fuchsia-400',
-  }[s] || 'bg-gray-500/10 text-gray-400'
-}
-
-function dotClass(s) {
-  return {
-    active: 'bg-green-400',
-    exhausted: 'bg-red-400',
-    standby: 'bg-yellow-400',
-    pending: 'bg-gray-400',
-    personal: 'bg-fuchsia-400',
-  }[s] || 'bg-gray-400'
-}
-
-function statusLabel(s) {
-  return { active: 'Active', exhausted: 'Used up', standby: 'Standby', pending: 'Pending', personal: 'Personal' }[s] || s
-}
 
 function quota(acc, type) {
   const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
   if (!qi) return null
-  const pct = type === 'primary' ? qi.primary_pct : qi.weekly_pct
-  return 100 - (pct || 0)
+  return _qr(qi, type)
 }
-
 function quotaPct(acc, type) {
-  const val = quota(acc, type)
-  return val !== null ? `${val}%` : '-'
+  const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
+  return quotaPctText(qi, type)
 }
-
 function quotaReset(acc, type) {
   const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
-  if (!qi) return '-'
-  const ts = type === 'primary' ? qi.primary_resets_at : qi.weekly_resets_at
-  if (!ts) return '-'
-  const d = new Date(ts * 1000)
-  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return formatQuotaReset(qi, type)
 }
-
-function pctColor(val) {
-  if (val === null) return 'text-gray-500'
-  if (val > 30) return 'text-green-400'
-  if (val > 0) return 'text-yellow-400'
-  return 'text-red-400'
-}
+function pctColor(remain) { return quotaPctColor(remain) }
 
 const exportJson = computed(() => {
   if (!exportData.value) return ''
@@ -440,9 +525,7 @@ async function exportCodexAuth(email) {
     exportData.value = await api.getCodexAuth(email)
     copied.value = false
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
-    setTimeout(() => { message.value = '' }, 8000)
+    toast.error('导出失败', e.message)
   }
 }
 
@@ -450,127 +533,201 @@ async function copyExport() {
   try {
     await navigator.clipboard.writeText(exportJson.value)
   } catch {
-    // HTTP 下 clipboard API 不可用，用 textarea fallback
     const ta = document.createElement('textarea')
     ta.value = exportJson.value
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    document.execCommand('copy')
-    document.body.removeChild(ta)
+    ta.style.position = 'fixed'; ta.style.opacity = '0'
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta)
   }
   copied.value = true
-  setTimeout(() => { copied.value = false }, 3000)
+  setTimeout(() => { copied.value = false }, 2400)
 }
 
 function downloadExport() {
   const blob = new Blob([exportJson.value], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
-  a.href = url
-  a.download = 'auth.json'
-  a.click()
+  a.href = url; a.download = 'auth.json'; a.click()
   URL.revokeObjectURL(url)
 }
 
 async function syncAccounts() {
   syncing.value = true
-  message.value = ''
   try {
     const result = await api.postSyncAccounts()
-    message.value = result.message || '同步完成'
-    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    toast.success('同步完成', result.message || '')
     emit('refresh')
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('同步失败', e.message)
   } finally {
     syncing.value = false
-    setTimeout(() => { message.value = '' }, 8000)
   }
 }
 
 function canLogin(acc) {
-  // active 账号已经在 Team 里不需要再登录；personal + 已有 auth_file 也不需要
   if (acc.is_main_account) return false
+  if (acc.disabled) return false
   if (acc.status === 'active') return false
   if (acc.status === 'personal' && acc.auth_file) return false
+  if (acc.status === 'degraded_grace') return false // grace 期内仍可用,无需补登录
   return true
 }
-
+// Round 11 realtime-probe.md v1.0 §4 — 仅对持有 auth_file 的子号显示"立即探活"
+// (主号有自己的"立即重测"按钮在 MasterHealthBanner;orphan/pending 无 token 探不动)
+function canProbe(acc) {
+  if (acc.is_main_account) return false
+  if (acc.disabled) return false
+  if (!acc.auth_file) return false
+  if (acc.status === 'pending' || acc.status === 'orphan') return false
+  return true
+}
 function loginLabel(acc) {
-  // personal 缺认证时文案改为"补登录"，更符合用户语境
-  if (acc.status === 'personal') return '补登录'
+  if (acc.status === 'personal' || acc.status === 'auth_invalid' || acc.status === 'orphan') return '补登录'
   return '登录'
 }
 
 async function loginAccount(email) {
   if (actionDisabled.value) return
-
-  actionEmail.value = email
-  actionType.value = 'login'
-  message.value = ''
+  actionEmail.value = email; actionType.value = 'login'
   try {
     const result = await api.loginAccount(email)
-    message.value = `已提交 ${email} 的登录任务: ${result.task_id}`
-    messageClass.value = 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+    toast.success('登录任务已提交', `${email} · ${result.task_id}`)
     emit('refresh')
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('提交登录任务失败', e.message)
   } finally {
-    actionEmail.value = ''
-    actionType.value = ''
-    setTimeout(() => { message.value = '' }, 8000)
+    actionEmail.value = ''; actionType.value = ''
+  }
+}
+
+// Round 11 realtime-probe.md v1.0 — 子号实时探活
+// 调 POST /api/accounts/{email}/probe (force_codex_smoke=true)
+// 副作用:后端落 last_quota_check_at,绕过 30min 节流;不修改 status (RT-I1)
+async function probeAccount(email) {
+  if (actionDisabled.value) return
+  actionEmail.value = email; actionType.value = 'probe'
+  try {
+    const result = await api.probeAccount(email, true)
+    // 后端 spec RT-I2:probe 永不抛 5xx,smoke_result ∈ {alive, auth_invalid, uncertain}
+    const smoke = result?.smoke_result || result?.last_smoke_result || '-'
+    const lastCheck = result?.last_quota_check_at
+    const checkedAt = lastCheck
+      ? new Date(lastCheck * 1000).toLocaleTimeString()
+      : '刚刚'
+    if (smoke === 'alive') {
+      toast.success('探活成功', `${email} · ${checkedAt} · alive`)
+    } else if (smoke === 'auth_invalid') {
+      toast.warn('探活完成 · token 失效', `${email} · ${checkedAt} · auth_invalid`)
+    } else {
+      toast.info('探活完成', `${email} · ${checkedAt} · ${smoke}`)
+    }
+    emit('refresh')
+  } catch (e) {
+    toast.error('探活失败', e.message)
+  } finally {
+    actionEmail.value = ''; actionType.value = ''
   }
 }
 
 async function kickAccount(email) {
   if (actionDisabled.value) return
-
-  const ok = window.confirm(`确认将 ${email} 移出 Team？\n账号会变为 standby 状态，额度恢复后可重新复用。`)
+  const ok = window.confirm(`确认将 ${email} 移出 Team?\n账号会变为 standby 状态,额度恢复后可重新复用。`)
   if (!ok) return
-
-  actionEmail.value = email
-  actionType.value = 'kick'
-  message.value = ''
+  actionEmail.value = email; actionType.value = 'kick'
   try {
     const result = await api.kickAccount(email)
-    message.value = result.message || `已将 ${email} 移出 Team`
-    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    toast.success('已移出 Team', result.message || email)
     emit('refresh')
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('移出失败', e.message)
   } finally {
-    actionEmail.value = ''
-    actionType.value = ''
-    setTimeout(() => { message.value = '' }, 8000)
+    actionEmail.value = ''; actionType.value = ''
+  }
+}
+
+async function toggleAccountDisabled(acc) {
+  if (actionDisabled.value) return
+  const disabling = !acc.disabled
+  const ok = window.confirm(
+    disabling
+      ? `确认禁用账号 ${acc.email}?\n禁用后会保留本地记录,但自动巡检、轮转和 CPA 同步会跳过该账号。`
+      : `确认启用账号 ${acc.email}?\n启用后该账号会重新参与自动巡检、轮转和 CPA 同步。`
+  )
+  if (!ok) return
+  actionEmail.value = acc.email
+  actionType.value = disabling ? 'disable' : 'enable'
+  try {
+    const result = disabling
+      ? await api.disableAccount(acc.email)
+      : await api.enableAccount(acc.email)
+    toast.success(disabling ? '账号已禁用' : '账号已启用', result.message || acc.email)
+    emit('refresh')
+  } catch (e) {
+    toast.error(disabling ? '禁用失败' : '启用失败', e.message)
+  } finally {
+    actionEmail.value = ''; actionType.value = ''
   }
 }
 
 async function removeAccount(email) {
   if (actionDisabled.value) return
-
-  const ok = window.confirm(`确认删除账号 ${email}？\n这会同时清理本地记录、CPA、Team/Invite 和 CloudMail。`)
+  // 二次确认已在 AtButton(confirm) 内做了第一次,这里再用 native confirm 提示破坏性操作细节
+  const ok = window.confirm(`确认删除账号 ${email}?\n这会清理本地记录、CPA、Team/Invite 和 CloudMail。`)
   if (!ok) return
-
-  actionEmail.value = email
-  actionType.value = 'delete'
-  message.value = ''
+  actionEmail.value = email; actionType.value = 'delete'
   try {
     const result = await api.deleteAccount(email)
-    message.value = result.message || `已删除 ${email}`
-    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    toast.success('账号已删除', result.message || email)
     emit('refresh')
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('删除失败', e.message)
   } finally {
-    actionEmail.value = ''
-    actionType.value = ''
-    setTimeout(() => { message.value = '' }, 8000)
+    actionEmail.value = ''; actionType.value = ''
+  }
+}
+
+async function bulkDisableSelected() {
+  if (actionDisabled.value || bulkToggling.value) return
+  const emails = selectedDisableEmails.value
+  if (!emails.length) return
+  const preview = emails.slice(0, 8).join('\n')
+  const more = emails.length > 8 ? `\n…还有 ${emails.length - 8} 个` : ''
+  const ok = window.confirm(
+    `确认批量禁用以下 ${emails.length} 个账号?\n禁用后会保留本地记录,但自动巡检、轮转和 CPA 同步会跳过它们。\n\n${preview}${more}`
+  )
+  if (!ok) return
+  bulkToggling.value = true
+  try {
+    const result = await api.bulkDisableAccounts(emails)
+    toast.success('批量禁用完成', result.message || `已禁用 ${emails.length} 个账号`)
+    clearSelection()
+    emit('refresh')
+  } catch (e) {
+    toast.error('批量禁用失败', e.message)
+  } finally {
+    bulkToggling.value = false
+  }
+}
+
+async function bulkEnableSelected() {
+  if (actionDisabled.value || bulkToggling.value) return
+  const emails = selectedEnableEmails.value
+  if (!emails.length) return
+  const preview = emails.slice(0, 8).join('\n')
+  const more = emails.length > 8 ? `\n…还有 ${emails.length - 8} 个` : ''
+  const ok = window.confirm(
+    `确认批量启用以下 ${emails.length} 个账号?\n启用后它们会重新参与自动巡检、轮转和 CPA 同步。\n\n${preview}${more}`
+  )
+  if (!ok) return
+  bulkToggling.value = true
+  try {
+    const result = await api.bulkEnableAccounts(emails)
+    toast.success('批量启用完成', result.message || `已启用 ${emails.length} 个账号`)
+    clearSelection()
+    emit('refresh')
+  } catch (e) {
+    toast.error('批量启用失败', e.message)
+  } finally {
+    bulkToggling.value = false
   }
 }
 
@@ -578,38 +735,39 @@ async function batchDelete() {
   if (actionDisabled.value || batchDeleting.value) return
   const emails = selectedEmails.value
   if (!emails.length) return
-
   const preview = emails.slice(0, 8).join('\n')
-  const more = emails.length > 8 ? `\n...还有 ${emails.length - 8} 个` : ''
+  const more = emails.length > 8 ? `\n…还有 ${emails.length - 8} 个` : ''
   const ok = window.confirm(
-    `确认批量删除以下 ${emails.length} 个账号？这会清理本地记录、CPA、Team/Invite 和 CloudMail。\n\n${preview}${more}`
+    `确认批量删除以下 ${emails.length} 个账号?这会清理本地记录、CPA、Team/Invite 和 CloudMail。\n\n${preview}${more}`
   )
   if (!ok) return
-
-  batchDeleting.value = true
-  batchProgress.value = `0/${emails.length}`
-  message.value = ''
+  batchDeleting.value = true; batchProgress.value = `0/${emails.length}`
   try {
     const r = await api.deleteAccountsBatch(emails, true)
     const s = r?.summary || {}
     const failed = (r?.results || []).filter(x => !x.ok)
     if (failed.length === 0) {
-      message.value = `批量删除完成:成功 ${s.ok}/${s.total}`
-      messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+      toast.success('批量删除完成', `成功 ${s.ok}/${s.total}`)
     } else {
       const head = failed.slice(0, 3).map(x => `${x.email}: ${x.error}`).join('; ')
-      message.value = `批量删除部分失败(成功 ${s.ok}/${s.total}):${head}${failed.length > 3 ? ' …' : ''}`
-      messageClass.value = 'bg-amber-500/10 text-amber-300 border-amber-500/20'
+      toast.warn('批量删除部分失败', `成功 ${s.ok}/${s.total}; ${head}${failed.length > 3 ? ' …' : ''}`)
     }
     clearSelection()
     emit('refresh')
   } catch (e) {
-    message.value = `批量删除失败: ${e.message}`
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('批量删除失败', e.message)
   } finally {
-    batchDeleting.value = false
-    batchProgress.value = ''
-    setTimeout(() => { message.value = '' }, 12000)
+    batchDeleting.value = false; batchProgress.value = ''
+  }
+}
+
+async function onRefreshMasterHealth() {
+  masterHealthBusy.value = true
+  try {
+    emit('reload-master-health', true)
+    toast.info('已请求重测', '走 force_refresh,绕过 5min cache')
+  } finally {
+    setTimeout(() => { masterHealthBusy.value = false }, 1200)
   }
 }
 </script>

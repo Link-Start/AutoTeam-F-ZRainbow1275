@@ -1,13 +1,15 @@
 <template>
-  <div>
-    <h2 class="text-xl font-bold text-white mb-2">同步中心</h2>
-    <p class="text-sm text-gray-400 mb-6">
-      这里放对账与同步类操作：本地账号池对账、同步到 CPA，以及从 CPA 反向拉取认证文件。
-    </p>
+  <div class="space-y-5">
+    <div>
+      <div class="text-[10px] uppercase tracking-[0.3em] text-indigo-700 mb-1">Sync Center</div>
+      <h2 class="text-2xl font-extrabold text-ink-950 tracking-tight">同步中心</h2>
+      <p class="text-sm text-ink-500 mt-1">本地账号池对账、同步到 CPA、从 CPA 反向拉取认证文件。</p>
+    </div>
     <TaskPanel
       mode="sync"
       :running-task="runningTask"
       :admin-status="adminStatus"
+      :rotate-stream="rotateStream"
       @task-started="$emit('task-started')"
       @refresh="$emit('refresh')"
     />
@@ -20,6 +22,7 @@ import TaskPanel from './TaskPanel.vue'
 defineProps({
   runningTask: Object,
   adminStatus: Object,
+  rotateStream: { type: Object, default: null },
 })
 
 defineEmits(['task-started', 'refresh'])

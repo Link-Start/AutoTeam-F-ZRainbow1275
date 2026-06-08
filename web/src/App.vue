@@ -3,24 +3,27 @@
   <SetupPage v-if="needSetup" @configured="onSetupDone" />
 
   <!-- 登录页 -->
-  <div v-else-if="!authenticated" class="min-h-screen flex items-center justify-center">
-    <div class="bg-gray-900 border border-gray-800 rounded-xl p-8 w-full max-w-sm">
-      <h1 class="text-xl font-bold text-white text-center mb-2">AutoTeam</h1>
-      <p class="text-sm text-gray-400 text-center mb-6">请输入 API Key 登录</p>
-      <div v-if="authError" class="mb-4 px-4 py-3 rounded-lg text-sm bg-red-500/10 text-red-400 border border-red-500/20">
-        {{ authError }}
+  <div v-else-if="!authenticated" class="min-h-screen flex items-center justify-center px-4">
+    <div class="glass rounded-lg p-8 w-full max-w-sm">
+      <div>
+        <div class="text-[10px] uppercase tracking-[0.3em] text-ink-400 mb-1">Account Operations</div>
+        <h1 class="text-2xl font-extrabold text-ink-950 mb-1 tracking-tight">AutoTeam</h1>
+        <p class="text-sm text-ink-500 mb-6">输入管理 API Key 进入控制台</p>
+        <div v-if="authError"
+          class="mb-4 px-3 py-2.5 rounded-lg text-sm bg-rose-50 text-rose-700 border border-rose-200">
+          {{ authError }}
+        </div>
+        <input
+          v-model.trim="inputKey"
+          type="password"
+          placeholder="API Key"
+          @keyup.enter="doLogin"
+          class="w-full px-3.5 py-2.5 bg-surface border border-hairline rounded-lg text-sm text-ink-950
+                 font-mono placeholder:text-ink-400 focus-ring mb-4 transition" />
+        <AtButton variant="primary" class="w-full" :loading="authLoading" :disabled="!inputKey" @click="doLogin">
+          {{ authLoading ? '验证中…' : '进入控制台' }}
+        </AtButton>
       </div>
-      <input
-        v-model.trim="inputKey"
-        type="password"
-        placeholder="API Key"
-        @keyup.enter="doLogin"
-        class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500 mb-4"
-      />
-      <button @click="doLogin" :disabled="!inputKey || authLoading"
-        class="w-full px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition disabled:opacity-50">
-        {{ authLoading ? '验证中...' : '登录' }}
-      </button>
     </div>
   </div>
 
@@ -31,49 +34,63 @@
       @navigate="currentPage = $event" @refresh="refresh" @logout="doLogout" />
 
     <!-- 主内容区 -->
-    <div class="flex-1 p-4 md:p-6 overflow-y-auto pb-20 md:pb-6">
+    <div class="flex-1 p-4 md:p-6 overflow-y-auto pb-20 md:pb-6 max-w-screen-2xl mx-auto w-full">
       <!-- 任务执行中提示 -->
-      <div v-if="busyTask" class="flex items-center gap-2 text-sm text-yellow-400 mb-4">
-        <span class="animate-spin inline-block w-4 h-4 border-2 border-yellow-400 border-t-transparent rounded-full"></span>
-        {{ busyTask.command === 'admin-login'
-          ? '管理员登录中...'
-          : busyTask.command === 'main-codex-sync'
-            ? '主号 Codex 同步中...'
-            : `${busyTask.command} 执行中...` }}
+      <div v-if="busyTask"
+        class="flex items-center gap-2.5 text-sm text-amber-800 mb-4 px-3 py-2 rounded-lg border border-amber-200 bg-amber-50 w-fit animate-rise">
+        <span class="animate-spin inline-block w-3.5 h-3.5 border-2 border-amber-700 border-t-transparent rounded-full"></span>
+        <span class="font-medium">
+          {{ busyTask.command === 'admin-login'
+            ? '管理员登录中...'
+            : busyTask.command === 'main-codex-sync'
+              ? '主号 Codex 同步中...'
+              : `${busyTask.command} 执行中...` }}
+        </span>
       </div>
 
-      <!-- 页面内容 -->
-      <Dashboard v-if="currentPage === 'dashboard'"
-        :status="status" :loading="loading" :running-task="busyTask" :admin-status="adminStatus" @refresh="refresh" />
+      <!-- 页面内容 — round-12 F1 加 Vue Transition page 过渡 -->
+      <Transition name="page" mode="out-in">
+        <Dashboard v-if="currentPage === 'dashboard'" key="dashboard"
+          :status="status" :loading="loading" :running-task="busyTask" :admin-status="adminStatus"
+          :register-failures="registerFailures" :register-failures-loading="registerFailuresLoading"
+          :register-failures-unavailable="registerFailuresUnavailable"
+          :master-health="masterHealth" @refresh="onActionRefresh" @reload-master-health="reloadMasterHealth" />
 
-      <TeamMembers v-else-if="currentPage === 'team'" />
+        <TeamMembers v-else-if="currentPage === 'team'" key="team" />
 
-      <PoolPage v-else-if="currentPage === 'pool'"
-        :running-task="busyTask" :admin-status="adminStatus"
-        @task-started="onTaskStarted" @refresh="refresh" />
+        <PoolPage v-else-if="currentPage === 'pool'" key="pool"
+          :running-task="busyTask" :admin-status="adminStatus" :master-health="masterHealth" :status="status"
+          :rotate-stream="rotateStream"
+          @task-started="onTaskStarted" @refresh="onActionRefresh" @reload-master-health="reloadMasterHealth" />
 
-      <SyncPage v-else-if="currentPage === 'sync'"
-        :running-task="busyTask" :admin-status="adminStatus"
-        @task-started="onTaskStarted" @refresh="refresh" />
+        <SyncPage v-else-if="currentPage === 'sync'" key="sync"
+          :running-task="busyTask" :admin-status="adminStatus"
+          :rotate-stream="rotateStream"
+          @task-started="onTaskStarted" @refresh="onActionRefresh" />
 
-      <OAuthPage v-else-if="currentPage === 'oauth'"
-        :manual-account-status="manualAccountStatus" @refresh="refresh" @progress="onAdminProgress" />
+        <OAuthPage v-else-if="currentPage === 'oauth'" key="oauth"
+          :manual-account-status="manualAccountStatus" @refresh="onActionRefresh" @progress="onAdminProgress" />
 
-      <TaskHistoryPage v-else-if="currentPage === 'tasks'"
-        :tasks="tasks" />
+        <TaskHistoryPage v-else-if="currentPage === 'tasks'" key="tasks"
+          :tasks="tasks" />
 
-      <LogViewer v-else-if="currentPage === 'logs'" />
+        <LogViewer v-else-if="currentPage === 'logs'" key="logs" />
 
-      <Settings v-else-if="currentPage === 'settings'"
-        :admin-status="adminStatus" :codex-status="codexStatus"
-        @refresh="refresh" @admin-progress="onAdminProgress" />
+        <Settings v-else-if="currentPage === 'settings'" key="settings"
+          :admin-status="adminStatus" :codex-status="codexStatus"
+          :master-health="masterHealth" :status="status"
+          @refresh="onActionRefresh" @admin-progress="onAdminProgress" @reload-master-health="reloadMasterHealth" />
+      </Transition>
     </div>
+
+    <ToastHost />
   </div>
 </template>
 
 <script setup>
-import { computed, ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { api, setApiKey, clearApiKey } from './api.js'
+import { useAppState } from './composables/useAppState.js'
 import SetupPage from './components/SetupPage.vue'
 import Sidebar from './components/Sidebar.vue'
 import Dashboard from './components/Dashboard.vue'
@@ -84,6 +101,8 @@ import TaskHistoryPage from './components/TaskHistoryPage.vue'
 import LogViewer from './components/LogViewer.vue'
 import OAuthPage from './components/OAuthPage.vue'
 import Settings from './components/Settings.vue'
+import ToastHost from './components/ToastHost.vue'
+import AtButton from './components/AtButton.vue'
 
 const needSetup = ref(false)
 const authenticated = ref(false)
@@ -93,24 +112,23 @@ const authError = ref('')
 const inputKey = ref('')
 const currentPage = ref('dashboard')
 
-const status = ref(null)
-const adminStatus = ref(null)
-const codexStatus = ref(null)
-const manualAccountStatus = ref(null)
-const tasks = ref([])
-const loading = ref(false)
-const runningTask = ref(null)
-const busyTask = computed(() => {
-  if (adminStatus.value?.login_in_progress) {
-    return { command: 'admin-login' }
-  }
-  if (codexStatus.value?.in_progress) {
-    return { command: 'main-codex-sync' }
-  }
-  return runningTask.value
-})
-
-let pollTimer = null
+const appState = useAppState(authenticated)
+const {
+  status,
+  adminStatus,
+  codexStatus,
+  manualAccountStatus,
+  registerFailures,
+  registerFailuresLoading,
+  registerFailuresUnavailable,
+  tasks,
+  loading,
+  busyTask,
+  rotateStream,
+} = appState
+// Round 9 — master-health 提到 App 级,4 个页面共享同一份(避免每页各刷各的)
+const masterHealth = ref(null)
+const masterHealthLoading = ref(false)
 
 async function checkAuth() {
   try {
@@ -142,7 +160,6 @@ async function doLogin() {
     } else {
       inputKey.value = ''
       refresh()
-      startPolling(600000)
     }
   } catch (e) {
     clearApiKey()
@@ -155,61 +172,34 @@ async function doLogin() {
 function doLogout() {
   clearApiKey()
   authenticated.value = false
-  stopPolling()
 }
 
 async function refresh() {
-  loading.value = true
+  await appState.refresh()
+}
+
+async function reloadMasterHealth(forceRefresh = false) {
+  if (!adminStatus.value?.configured) return
+  masterHealthLoading.value = true
   try {
-    const [s, t, admin, codex, manualAccount] = await Promise.all([
-      api.getStatus(),
-      api.getTasks(),
-      api.getAdminStatus(),
-      api.getMainCodexStatus(),
-      api.getManualAccountStatus(),
-    ])
-    status.value = s
-    tasks.value = t
-    adminStatus.value = admin
-    codexStatus.value = codex
-    manualAccountStatus.value = manualAccount
-    runningTask.value = t.find(t => t.status === 'running' || t.status === 'pending') || null
+    masterHealth.value = await api.getMasterHealth(!!forceRefresh)
   } catch (e) {
-    if (e.status === 401) {
-      authenticated.value = false
-      return
-    }
-    console.error('刷新失败:', e)
+    masterHealth.value = null
   } finally {
-    loading.value = false
+    masterHealthLoading.value = false
   }
 }
 
 function onTaskStarted() {
-  startPolling(10000)
-  refresh()
+  appState.notifyActionStarted()
 }
 
 function onAdminProgress() {
-  startPolling(10000)
-  refresh()
+  appState.notifyActionStarted()
 }
 
-function startPolling(interval = 600000) {
-  stopPolling()
-  pollTimer = setInterval(async () => {
-    await refresh()
-    if (!busyTask.value && interval < 600000) {
-      startPolling(600000)
-    }
-  }, interval)
-}
-
-function stopPolling() {
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
+function onActionRefresh() {
+  appState.notifyActionStarted()
 }
 
 async function checkSetup() {
@@ -226,10 +216,17 @@ function onSetupDone() {
   checkAuth().then(ok => {
     if (ok) {
       refresh()
-      startPolling(600000)
     }
   })
 }
+
+// admin 配置完成后自动拉一次 master-health
+watch(
+  () => adminStatus.value?.configured,
+  (configured) => {
+    if (configured && !masterHealth.value) reloadMasterHealth(false)
+  }
+)
 
 onMounted(async () => {
   const setupOk = await checkSetup()
@@ -240,11 +237,6 @@ onMounted(async () => {
   const ok = await checkAuth()
   if (ok) {
     refresh()
-    startPolling(600000)
   }
-})
-
-onUnmounted(() => {
-  stopPolling()
 })
 </script>

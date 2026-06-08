@@ -13,6 +13,7 @@ from autoteam.accounts import (
     STATUS_STANDBY,
     add_account,
     find_account,
+    is_supported_plan,
     load_accounts,
     update_account,
 )
@@ -229,17 +230,43 @@ class ManualAccountFlow:
         if not email:
             raise RuntimeError("OAuth token 中缺少邮箱")
 
+        plan_type_raw = bundle.get("plan_type_raw") or bundle.get("plan_type") or "unknown"
+        plan_type = (bundle.get("plan_type") or "unknown").lower()
+
+        # SPEC-2 FR-A — plan_type 白名单。手动添加时若 plan 不在白名单
+        # (self_serve_business_usage_based / enterprise / unknown 等),即使 OAuth 成功
+        # 也拒绝入池,提示用户更换账号。
+        if not is_supported_plan(plan_type_raw):
+            logger.warning("[手动添加] %s plan_type=%s 不被支持,拒绝入池", email, plan_type_raw)
+            try:
+                from autoteam.register_failures import record_failure
+                record_failure(email, "plan_unsupported", stage="manual_account",
+                               detail=f"plan_type={plan_type_raw}")
+            except Exception:
+                pass
+            raise RuntimeError(f"plan_type={plan_type_raw} 不被支持,仅支持 team/free/plus/pro")
+
         auth_file = save_auth_file(bundle)
-        plan_type = bundle.get("plan_type") or "unknown"
         account_status = STATUS_ACTIVE if plan_type == "team" else STATUS_STANDBY
+        # plan_type=team → 拿到 Team bundle,同时 PATCH 成功意味着完整 ChatGPT 席位;
+        # 其它 plan_type(free/plus/unknown)按 codex 处理,下游 fill 会据此做差异化判断。
+        seat_label = "chatgpt" if plan_type == "team" else "codex"
 
         accounts = load_accounts()
         account = find_account(accounts, email)
         if not account:
-            add_account(email, "")
+            from autoteam.admin_state import get_chatgpt_account_id
+
+            add_account(
+                email,
+                "",
+                seat_type=seat_label,
+                workspace_account_id=get_chatgpt_account_id() or None,
+            )
 
         update_fields = {
             "status": account_status,
+            "seat_type": seat_label,
             "auth_file": auth_file,
             "quota_exhausted_at": None,
             "quota_resets_at": None,

@@ -23,13 +23,19 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
-from autoteam.account_ops import delete_managed_account, fetch_team_state
+from playwright.sync_api import sync_playwright
+
+from autoteam.account_ops import delete_managed_account, delete_team_invite, fetch_team_state, team_invite_email
 from autoteam.accounts import (
     STATUS_ACTIVE,
+    STATUS_AUTH_INVALID,
+    STATUS_AUTH_PENDING,
     STATUS_EXHAUSTED,
+    STATUS_ORPHAN,
     STATUS_PENDING,
     STATUS_PERSONAL,
     STATUS_STANDBY,
@@ -37,6 +43,8 @@ from autoteam.accounts import (
     delete_account,
     find_account,
     get_standby_accounts,
+    is_account_disabled,
+    is_supported_plan,
     load_accounts,
     save_accounts,
     update_account,
@@ -51,6 +59,7 @@ from autoteam.codex_auth import (
     check_codex_quota,
     get_quota_exhausted_info,
     get_saved_main_auth_file,
+    is_token_pair_invalidated,
     login_codex_via_browser,
     quota_result_quota_info,
     quota_result_resets_at,
@@ -58,19 +67,138 @@ from autoteam.codex_auth import (
     refresh_main_auth_file,
     save_auth_file,
 )
-from autoteam.config import get_playwright_launch_options
-from autoteam.cpa_sync import sync_from_cpa, sync_main_codex_to_cpa, sync_to_cpa
-from autoteam.identity import random_age, random_birthday, random_full_name, random_password
-from autoteam.register_failures import record_failure
-from autoteam.textio import read_text, write_text
+from autoteam.config import get_playwright_context_options, get_playwright_launch_options
+from autoteam.cpa_sync import sync_from_cpa
+from autoteam.identity import random_birthday, random_password
+from autoteam.invite import RegisterBlocked  # SPEC-2 shared/add-phone-detection §5 — 5 处 OAuth 调用方 catch
+from autoteam.playwright_lifecycle import close_playwright_objects
+from autoteam.register_failures import MASTER_SUBSCRIPTION_DEGRADED, record_failure
+from autoteam.signup_profile import SignupProfile, generate_signup_profile
+from autoteam.sync_targets import (
+    sync_account_to_configured_targets,
+)
+from autoteam.sync_targets import (
+    sync_main_codex_to_configured_targets as sync_main_codex_to_cpa,
+)
+from autoteam.sync_targets import (
+    sync_to_configured_targets as sync_to_cpa,
+)
+from autoteam.textio import parse_env_value, read_text, write_text
 
 logger = logging.getLogger(__name__)
 
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
+TEAM_SEATS_MIN = 2
+TEAM_SEATS_MAX = 3
+ROTATE_NEW_ACCOUNT_MODE_DEFAULT = "domain_auto_join_first"
+ROTATE_NEW_ACCOUNT_MODES = {"domain_auto_join_first", "invite_first", "direct_first"}
+
+# Round 11 二轮收尾 — OAuth 子进程默认超时(秒)。任何 subprocess 包裹 login_codex_via_browser
+# (probe 脚本 / 异步 worker / CLI 工具) 必须用此常量,不再硬编码 60s。
+# 实测 P95 < 180s(参考 P1 报告 fd3b5ccae1 实测 71.3s headless OAuth 完成),
+# 200s 为 safety margin。生产路径(_run_post_register_oauth)在主线程内同步执行,
+# 由 _pw_executor.run 默认 300s 包裹,不走本常量。
+OAUTH_SUBPROCESS_TIMEOUT_S = int(os.environ.get("OAUTH_SUBPROCESS_TIMEOUT_S", "200"))
+
+
+# Round 7 P2.5 — 把 wham/usage 原始 rate_limit 子树序列化为字符串,
+# 供 record_failure(no_quota_assigned, raw_rate_limit=...) 落 register_failures.json,
+# 便于事后排查 OpenAI 协议变化。截断 2000 字符防止 register_failures.json 膨胀(NFR-6)。
+_RAW_RATE_LIMIT_MAX_CHARS = 2000
+
+
+def _extract_raw_rate_limit_str(quota_info) -> str:
+    """从 check_codex_quota 返回的 quota_info / exhausted_info 中提取原始 rate_limit 子树并 JSON 序列化。
+
+    输入既可能是 ok 形态的 quota_info(顶层 raw_rate_limit / primary_window),
+    也可能是 exhausted/no_quota 形态的 exhausted_info(raw_rate_limit 顶层 + 子层 quota_info)。
+    序列化失败时返回空串,不阻塞 record_failure 主流程(R5 缓解)。
+    """
+    if not isinstance(quota_info, dict):
+        return ""
+    raw = (
+        quota_info.get("raw_rate_limit")
+        or (quota_info.get("quota_info") or {}).get("raw_rate_limit")
+        or quota_info.get("primary_window")
+        or (quota_info.get("quota_info") or {}).get("primary_window")
+    )
+    if not raw:
+        return ""
+    try:
+        return json.dumps(raw, ensure_ascii=False)[:_RAW_RATE_LIMIT_MAX_CHARS]
+    except Exception:
+        return ""
 
 
 def _normalized_email(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+def _normalized_domain(value: str | None) -> str:
+    return str(value or "").strip().lower().lstrip("@").rstrip(".")
+
+
+def _runtime_env_value(name: str, default: str = "") -> str:
+    return str(parse_env_value(os.environ.get(name, default)) or "").strip()
+
+
+def _runtime_bool_env(name: str, default: bool) -> bool:
+    raw = _runtime_env_value(name, "")
+    if not raw:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on", "enabled", "y", "t"}
+
+
+def _runtime_new_account_mode() -> str:
+    mode = _runtime_env_value("ROTATE_NEW_ACCOUNT_MODE", ROTATE_NEW_ACCOUNT_MODE_DEFAULT).lower()
+    if mode in ROTATE_NEW_ACCOUNT_MODES:
+        return mode
+    logger.warning(
+        "[创建] ROTATE_NEW_ACCOUNT_MODE=%s 无效，回退到 %s",
+        mode or "<empty>",
+        ROTATE_NEW_ACCOUNT_MODE_DEFAULT,
+    )
+    return ROTATE_NEW_ACCOUNT_MODE_DEFAULT
+
+
+def _domain_auto_join_fallback_invite_enabled() -> bool:
+    return _runtime_bool_env("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", True)
+
+
+def _configured_mail_domains(mail_client=None) -> set[str]:
+    domains: set[str] = set()
+    for value in (
+        get_mail_domain(),
+        os.environ.get("CLOUDMAIL_DOMAIN", ""),
+        os.environ.get("MAILLAB_DOMAIN", ""),
+        os.environ.get("CF_TEMP_EMAIL_DOMAIN", ""),
+        os.environ.get("ADDY_IO_DOMAIN", ""),
+        getattr(mail_client, "domain", ""),
+        getattr(mail_client, "default_domain", ""),
+    ):
+        domain = _normalized_domain(value)
+        if domain:
+            domains.add(domain)
+    return domains
+
+
+def _auto_join_domain_allowlist(mail_client=None) -> tuple[set[str], bool]:
+    raw = _runtime_env_value("AUTOTEAM_AUTO_JOIN_DOMAINS", "auto")
+    if not raw or raw.lower() == "auto":
+        return _configured_mail_domains(mail_client), False
+    values = {_normalized_domain(item) for item in raw.split(",")}
+    values.discard("")
+    if "*" in values:
+        return set(), True
+    return values, False
+
+
+def _mail_domain_auto_join_allowed(mail_client=None) -> bool:
+    allowlist, wildcard = _auto_join_domain_allowlist(mail_client)
+    if wildcard:
+        return True
+    configured = _configured_mail_domains(mail_client)
+    return bool(configured and allowlist and configured.intersection(allowlist))
 
 
 def _is_main_account_email(email: str | None) -> bool:
@@ -78,6 +206,15 @@ def _is_main_account_email(email: str | None) -> bool:
 
 
 _GOOGLE_AUTO_REUSE_DOMAINS = {"gmail.com", "googlemail.com"}
+
+
+def _clamp_team_target_seats(value, *, minimum: int = TEAM_SEATS_MIN) -> int:
+    """Clamp Team target seats to the hard 1 owner + 2 child contract."""
+    try:
+        parsed = int(value or minimum)
+    except Exception:
+        parsed = minimum
+    return max(int(minimum), min(TEAM_SEATS_MAX, parsed))
 
 
 def _get_account_login_provider(acc: dict | None) -> str:
@@ -101,40 +238,1125 @@ def _auto_reuse_skip_reason(acc: dict | None) -> str | None:
     return None
 
 
-# Team 子账号(非主号)硬上限。主号 + 4 子号 = 5 席,与 cmd_rotate / cmd_fill 默认 target=5 一致。
+# --------------------------------------------------------------------------
+# Round 12 S3 — cherry-pick from upstream `.upstream/manager.py` (3137 行)
+# 详见 `.trellis/tasks/05-11-s0-upstream-team-rotate-diff/research/upstream-diff.md`
+# --------------------------------------------------------------------------
+
+# 失败类型常量（上游 `.upstream/manager.py:96`）。Hard failure → 立即暂停 + 释放席位。
+AUTH_REPAIR_HARD_FAILURE_TYPES = frozenset({"human_verification"})
+AUTH_REPAIR_SINGLE_ATTEMPT_FAILURE_TYPES = frozenset(
+    {
+        "add_phone",
+        "human_verification",
+        "email_verification",
+        "login_state_lost",
+        "account_selection",
+        "no_valid_organizations",
+    }
+)
+AUTH_REPAIR_RELEASE_AFTER_RETRY_TYPES = frozenset({"email_verification"})
+AUTH_REPAIR_RELEASE_TEAM_BLOCKER_TYPES = frozenset(
+    {
+        "login_state_lost",
+        "account_selection",
+        "no_valid_organizations",
+        "missing_auth_file",
+        "auth_error_discard",
+    }
+)
+AUTH_REPAIR_AGGRESSIVE_RELEASE_TYPES = frozenset(
+    {
+        "add_phone",
+        "human_verification",
+        "email_verification",
+        "workspace_selection",
+        "account_selection",
+        "login_state_lost",
+        "no_valid_organizations",
+        "missing_auth_file",
+        "auth_error_discard",
+        "unsupported_region",
+        "oauth_timeout",
+        "site_unavailable",
+        "token_exchange_failed",
+        "non_team_plan",
+        "auth_code_missing",
+        "login_failed",
+        "exception",
+    }
+)
+
+
+def _chatgpt_session_ready(chatgpt_api) -> bool:
+    """判断 chatgpt_api 是否处于可用 Team API session 状态。
+
+    `CHATGPT_API_TRANSPORT=auto` 时可能只有 HTTP transport 而没有 browser，
+    因此生命周期判断必须优先使用 `is_started()`，再回退到旧的 browser 字段。
+    """
+    if not chatgpt_api:
+        return False
+
+    def _declared_attr(name: str):
+        # Avoid MagicMock/duck objects becoming "ready" via dynamic __getattr__.
+        try:
+            attrs = vars(chatgpt_api)
+        except TypeError:
+            attrs = {}
+        if name in attrs:
+            return attrs[name]
+        if hasattr(type(chatgpt_api), name):
+            return getattr(chatgpt_api, name, None)
+        return None
+
+    is_started = _declared_attr("is_started")
+    if callable(is_started):
+        try:
+            return bool(is_started())
+        except Exception:
+            pass
+
+    return bool(_declared_attr("browser") or _declared_attr("http_transport"))
+
+
+def _run_post_task_sync(stage_label: str, sync_func) -> None:
+    """Run final remote sync after the Playwright-bound task has completed."""
+    try:
+        logger.info("%s 后台远端同步开始...", stage_label)
+        result = sync_func()
+        logger.info("%s 后台远端同步完成: %s", stage_label, result)
+    except Exception as exc:
+        logger.warning("%s 后台远端同步失败，保留本地轮转结果: %s", stage_label, exc)
+
+
+def _schedule_post_task_sync(stage_label: str = "[轮转]", sync_func=None) -> threading.Thread:
+    runner = sync_func or sync_to_cpa
+    thread = threading.Thread(
+        target=_run_post_task_sync,
+        args=(stage_label, runner),
+        name="autoteam-post-task-sync",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _has_auth_file(acc: dict | None) -> bool:
+    """本地 acc 是否有可用 auth_file(上游 `.upstream/manager.py:153`)。"""
+    acc = acc or {}
+    auth_file = (acc.get("auth_file") or "").strip()
+    return bool(auth_file) and _resolve_auth_file_path(auth_file).exists()
+
+
+def get_mail_domain() -> str:
+    """Return the configured mail domain used by registration/auth repair flows."""
+    from autoteam.runtime_config import get_register_domain
+
+    return get_register_domain()
+
+
+def get_mail_provider_name() -> str:
+    """Return the configured mail provider name used by registration/auth repair flows."""
+    return (os.environ.get("MAIL_PROVIDER") or "cf_temp_email").strip().lower()
+
+
+def _mail_provider_name_for_client(mail_client) -> str:
+    provider_name = str(getattr(mail_client, "provider_name", "") or "").strip().lower()
+    if not provider_name:
+        try:
+            current = getattr(mail_client, "current_provider_name", None)
+            if callable(current):
+                provider_name = str(current() or "").strip().lower()
+        except Exception:
+            provider_name = ""
+    if provider_name in {"maillab", "addy_io", "simplelogin"}:
+        return provider_name
+    if provider_name in {"cf_temp_email", "cloudflare_temp_email", "cloudmail"}:
+        return "cf_temp_email"
+    return get_mail_provider_name()
+
+
+def _auth_search_dirs() -> tuple[Path, ...]:
+    """Candidate auth directories for host and container path compatibility."""
+    candidates: list[Path] = []
+    try:
+        from autoteam.auth_storage import AUTH_DIR
+
+        candidates.append(AUTH_DIR)
+    except Exception:
+        pass
+
+    project_root = Path(__file__).resolve().parents[2]
+    candidates.extend((project_root / "data" / "auths", project_root / "auths"))
+
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return tuple(unique)
+
+
+def _resolve_auth_file_path(value: str | None) -> Path:
+    """Resolve auth paths saved as host paths, `/app/...`, `data/auths/...`, or bare names."""
+    text = (value or "").strip()
+    if not text:
+        return Path("")
+
+    direct = Path(text)
+    if direct.exists():
+        return direct
+
+    project_root = Path(__file__).resolve().parents[2]
+    candidates: list[Path] = []
+    normalized = text.replace("\\", "/")
+    if normalized.startswith("/app/"):
+        candidates.append(project_root / normalized.removeprefix("/app/"))
+    elif normalized.startswith("data/") or normalized.startswith("auths/"):
+        candidates.append(project_root / normalized)
+
+    name = Path(normalized).name
+    if name:
+        candidates.extend(auth_dir / name for auth_dir in _auth_search_dirs())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return direct
+
+
+def _has_account_mail_binding(acc: dict | None) -> bool:
+    acc = acc or {}
+    return acc.get("mail_account_id") is not None or acc.get("cloudmail_account_id") is not None
+
+
+def _is_protected_local_credential_seat(acc: dict | None) -> bool:
+    if not acc or acc.get("disabled") is True or _is_main_account_email(acc.get("email")):
+        return False
+    has_auth = _has_auth_file(acc)
+    if acc.get("status") == STATUS_EXHAUSTED:
+        return False
+    if acc.get("protect_team_seat") is True:
+        return has_auth
+    if not has_auth:
+        return False
+    if acc.get("status") in (STATUS_STANDBY, STATUS_AUTH_INVALID):
+        return True
+    return not _has_account_mail_binding(acc)
+
+
+def _can_replace_protected_managed_auth_failure(
+    acc: dict | None,
+    *,
+    error_type: str | None = None,
+    reason: str | None = None,
+    missing_auth: bool = False,
+) -> bool:
+    """Allow AutoTeam-managed child seats to be evicted despite stale protection flags."""
+    acc = acc or {}
+    if _is_main_account_email(acc.get("email")) or not _has_account_mail_binding(acc):
+        return False
+    signals = {
+        str(value or "").strip()
+        for value in (
+            error_type,
+            reason,
+            acc.get("auth_last_error"),
+            "missing_auth_file" if missing_auth else None,
+        )
+        if str(value or "").strip()
+    }
+    if acc.get("auth_retry_paused"):
+        signals.add("auth_retry_paused")
+    if acc.get("auth_retry_after"):
+        signals.add("auth_retry_after")
+    return bool(
+        signals
+        & (
+            AUTH_REPAIR_AGGRESSIVE_RELEASE_TYPES
+            | AUTH_REPAIR_RELEASE_TEAM_BLOCKER_TYPES
+            | {
+                "auth_error",
+                "auth_retry_paused",
+                "auth_retry_after",
+                "auth_retry_after_invalid",
+            }
+        )
+    )
+
+
+def _is_auth_repair_pending_status(status: str | None) -> bool:
+    """Accept current persisted auth-invalid alias and legacy target auth_pending literal."""
+    return status in {STATUS_AUTH_PENDING, "auth_pending"}
+
+
+def _can_attempt_auth_repair(acc: dict | None, mail_domain_suffix: str = "") -> bool:
+    acc = acc or {}
+    if (
+        bool(acc.get("mail_provider"))
+        or acc.get("mail_account_id") is not None
+        or acc.get("cloudmail_account_id") is not None
+    ):
+        return True
+    email = _normalized_email(acc.get("email"))
+    return bool(mail_domain_suffix and mail_domain_suffix in email)
+
+
+def _sync_ready_credential_to_targets(email: str, auth_file: str | None, *, stage_label: str) -> dict:
+    if not auth_file:
+        logger.warning("%s 新凭证已就绪但缺少 auth_file，跳过即时同步: %s", stage_label, email)
+        return {"ok": False, "skipped": True, "reason": "missing_auth_file"}
+
+    try:
+        result = sync_account_to_configured_targets(email, str(auth_file))
+    except Exception as exc:
+        logger.warning("%s 新凭证即时同步失败，保留本地结果: %s (%s)", stage_label, email, exc)
+        return {"ok": False, "error": str(exc)}
+
+    if isinstance(result, dict) and result.get("ok") and not result.get("skipped"):
+        logger.info("%s 新凭证已即时同步: %s (%s)", stage_label, email, Path(auth_file).name)
+    elif isinstance(result, dict) and result.get("ok") and result.get("skipped"):
+        logger.info("%s 新凭证即时同步跳过: %s (%s)", stage_label, email, result.get("reason"))
+    else:
+        logger.warning("%s 新凭证即时同步未完全成功，保留本地结果: %s (%s)", stage_label, email, result)
+    return result if isinstance(result, dict) else {"ok": False, "result": result}
+
+
+def _ensure_account_ipv6_proxy(email: str | None) -> tuple[str, str]:
+    email = _normalized_email(email)
+    if not email:
+        return "", ""
+    required = False
+    try:
+        from autoteam import config as runtime_config
+        from autoteam.ipv6_pool import ipv6_pool
+
+        required = bool(getattr(runtime_config, "AUTOTEAM_IPV6_POOL_REQUIRED", False))
+        proxy_url = ipv6_pool.ensure(email) or ""
+        local_proxy_url = ipv6_pool.get_local_proxy_url(email) or proxy_url
+        if local_proxy_url:
+            logger.info("[IPv6Pool] account %s using proxy %s", email, local_proxy_url)
+            return proxy_url, local_proxy_url
+        if required:
+            raise RuntimeError("IPv6 pool is required but no account proxy was assigned")
+        return "", ""
+    except Exception as exc:
+        if required:
+            logger.error("[IPv6Pool] account proxy required for %s but unavailable: %s", email, exc)
+            raise
+        logger.warning("[IPv6Pool] account proxy unavailable for %s, falling back to direct: %s", email, exc)
+        return "", ""
+
+
+def _release_account_ipv6_proxy(email: str | None) -> None:
+    email = _normalized_email(email)
+    if not email:
+        return
+    try:
+        from autoteam.ipv6_pool import ipv6_pool
+
+        if ipv6_pool.release(email):
+            logger.info("[IPv6Pool] released account proxy: %s", email)
+    except Exception as exc:
+        logger.warning("[IPv6Pool] release failed for %s: %s", email, exc)
+
+
+def _discard_auth_repair_failed_account_record(
+    email: str,
+    reason: str,
+    *,
+    status: str = STATUS_STANDBY,
+    now: float | None = None,
+) -> None:
+    """Mark a released auth-repair failure as non-reusable while keeping local evidence."""
+    update_account(
+        email,
+        status=status,
+        disabled=True,
+        reuse_disabled=True,
+        retired_at=time.time() if now is None else now,
+        retired_reason=reason,
+    )
+    _release_account_ipv6_proxy(email)
+
+
+def _attach_account_proxy_to_bundle(email: str | None, bundle: dict | None, proxy_url: str | None = None) -> None:
+    if not isinstance(bundle, dict):
+        return
+    proxy_url = (proxy_url or "").strip()
+    if not proxy_url:
+        proxy_url, _local_proxy_url = _ensure_account_ipv6_proxy(email)
+    if proxy_url:
+        bundle["proxy_url"] = proxy_url
+
+
+def _login_codex_via_browser_with_proxy(*args, playwright_proxy_url: str | None = None, **kwargs):
+    try:
+        return login_codex_via_browser(*args, playwright_proxy_url=playwright_proxy_url, **kwargs)
+    except TypeError as exc:
+        if "playwright_proxy_url" not in str(exc):
+            raise
+        return login_codex_via_browser(*args, **kwargs)
+
+
+def _pool_active_target(team_target: int) -> int:
+    """除去主号后的"子号 active 池"目标(上游 `.upstream/manager.py:159`)。
+
+    主号占 1 席,target_seats=3 时子号 active 目标 = 2。轮转主循环终止条件用此值。
+    """
+    return max(0, int(team_target) - 1)
+
+
+def _count_pool_active_accounts(accounts: list[dict] | None = None, *, require_auth: bool = False) -> int:
+    """统计非主号 + status=ACTIVE 的账号数(上游 `.upstream/manager.py:163`)。
+
+    require_auth=True 时还要求本地有可用 auth_file,用于"双指标终止条件"
+    防止"Team 满员但本地都是 standby/auth_invalid → 实际可用 0"假满足.
+    """
+    accounts = accounts if accounts is not None else load_accounts()
+    count = 0
+    for acc in accounts:
+        if require_auth:
+            if not _is_pool_active_account_usable(acc, require_auth=True):
+                continue
+        elif _is_main_account_email(acc.get("email")) or is_account_disabled(acc) or acc.get("status") != STATUS_ACTIVE:
+            continue
+        count += 1
+    return count
+
+
+def _account_auth_state_blocks_pool_use(acc: dict | None, *, now: float | None = None) -> bool:
+    """Return True when saved Codex auth is known or likely unusable."""
+    acc = acc or {}
+    if acc.get("auth_retry_paused"):
+        return True
+    if acc.get("auth_last_error"):
+        return True
+    retry_after = acc.get("auth_retry_after")
+    if retry_after:
+        try:
+            return float(retry_after) > (time.time() if now is None else now)
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _is_pool_active_account_usable(acc: dict | None, *, require_auth: bool = True) -> bool:
+    """Check whether a child account should count as an actually usable pool seat."""
+    acc = acc or {}
+    if _is_main_account_email(acc.get("email")) or is_account_disabled(acc):
+        return False
+    if acc.get("status") != STATUS_ACTIVE:
+        return False
+    if require_auth and not _has_auth_file(acc):
+        return False
+    if require_auth and _account_auth_state_blocks_pool_use(acc):
+        return False
+    return True
+
+
+def _replaceable_pool_blocker_reason(acc: dict | None, *, missing_auth: bool = False) -> str | None:
+    """Return the concrete reason a child seat blocks the usable pool but may be replaced."""
+    acc = acc or {}
+    if _is_main_account_email(acc.get("email")) or is_account_disabled(acc):
+        return None
+    if _is_protected_local_credential_seat(acc) and not _can_replace_protected_managed_auth_failure(
+        acc,
+        missing_auth=missing_auth,
+    ):
+        return None
+    status = acc.get("status")
+    if status == STATUS_EXHAUSTED:
+        return "quota_exhausted"
+    if status == STATUS_AUTH_INVALID:
+        return "auth_invalid"
+    if status == STATUS_ORPHAN:
+        return "orphan"
+    if status != STATUS_ACTIVE:
+        return None
+    if missing_auth:
+        return "auth_error"
+    if not _has_auth_file(acc):
+        return "missing_auth"
+    if acc.get("auth_retry_paused"):
+        return "auth_retry_paused"
+    if acc.get("auth_last_error"):
+        return "auth_error"
+    retry_after = acc.get("auth_retry_after")
+    if retry_after:
+        try:
+            if float(retry_after) > time.time():
+                return "auth_retry_after"
+        except (TypeError, ValueError):
+            return "auth_retry_after_invalid"
+    return None
+
+
+def _is_replaceable_pool_blocker(acc: dict | None, *, missing_auth: bool = False) -> bool:
+    return _replaceable_pool_blocker_reason(acc, missing_auth=missing_auth) is not None
+
+
+def _count_local_team_seat_accounts(accounts: list[dict] | None = None) -> int:
+    """统计本地"占着 Team 席位"的非主号账号(上游 `.upstream/manager.py:175`).
+
+    席位状态包含 ACTIVE / EXHAUSTED / AUTH_INVALID(等价上游 STATUS_AUTH_PENDING):
+    本地 STATUS_AUTH_INVALID 与状态机 AccountState.AUTH_PENDING 同 literal "auth_invalid".
+    """
+    accounts = accounts if accounts is not None else load_accounts()
+    seat_statuses = {STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_AUTH_INVALID}
+    return sum(
+        1
+        for acc in accounts
+        if not _is_main_account_email(acc.get("email"))
+        and not is_account_disabled(acc)
+        and acc.get("status") in seat_statuses
+    )
+
+
+def _estimate_local_team_member_count(team_target: int, accounts: list[dict] | None = None) -> int:
+    """估算 Team 实际成员数(含主号)(上游 `.upstream/manager.py:183`).
+
+    用于 cmd_rotate API 拿不到 member_count 时的更精确兜底,替代旧的
+    `local_active = sum(... STATUS_ACTIVE)`(后者会漏掉 EXHAUSTED / AUTH_INVALID).
+    """
+    accounts = accounts if accounts is not None else load_accounts()
+    reserved_main = 1 if int(team_target) > 0 else 0
+    return _count_local_team_seat_accounts(accounts) + reserved_main
+
+
+def _auth_repair_reset_fields() -> dict:
+    """auth_repair 状态字段清零模板(上游 `.upstream/manager.py:197`).
+
+    一次性把所有 auth_retry_* 字段写空,适用于:
+      - 手动巡检成功后重置
+      - 注册成功后重置
+      - status 从 AUTH_INVALID/STANDBY 恢复 ACTIVE 时重置
+    """
+    return {
+        "auth_retry_count": 0,
+        "auth_last_error": None,
+        "auth_last_error_detail": None,
+        "auth_last_failed_at": None,
+        "auth_retry_after": None,
+        "auth_retry_paused": False,
+    }
+
+
+def _auth_repair_retry_delays() -> tuple[int, int, int]:
+    """衰退式 retry_after 三档延迟(上游 `.upstream/manager.py:208`).
+
+    返回 (2x, 4x, 6x) * AUTO_CHECK_INTERVAL,常用 5min 间隔时为 (10min, 20min, 30min).
+    """
+    from autoteam.config import AUTO_CHECK_INTERVAL
+
+    interval = AUTO_CHECK_INTERVAL
+    try:
+        from autoteam.api import _auto_check_config
+
+        interval = int(_auto_check_config.get("interval", interval) or interval)
+    except Exception:
+        pass
+
+    interval = max(60, int(interval))
+    return (interval * 2, interval * 4, interval * 6)
+
+
+def _auth_repair_retry_add_phone_enabled() -> bool:
+    """add_phone 软重试开关(上游 `.upstream/manager.py:223`).
+
+    True → 命中 add_phone 时按指数退避重试 N 次再放弃; False → 命中即 hard fail.
+    """
+    from autoteam.config import AUTO_CHECK_RETRY_ADD_PHONE
+
+    enabled = AUTO_CHECK_RETRY_ADD_PHONE
+    try:
+        from autoteam.api import _auto_check_config
+
+        enabled = bool(_auto_check_config.get("retry_add_phone", enabled))
+    except Exception:
+        pass
+
+    return bool(enabled)
+
+
+def _auth_repair_add_phone_max_retries() -> int:
+    """add_phone 最大重试次数(上游 `.upstream/manager.py:237`).
+
+    超过此次数(从 1 起算) → next_count > max_retries → 暂停 + 释放席位.
+    """
+    from autoteam.config import AUTO_CHECK_ADD_PHONE_MAX_RETRIES
+
+    retries = AUTO_CHECK_ADD_PHONE_MAX_RETRIES
+    try:
+        from autoteam.api import _auto_check_config
+
+        retries = int(_auto_check_config.get("add_phone_max_retries", retries) or retries)
+    except Exception:
+        pass
+
+    return max(1, int(retries))
+
+
+def _auth_repair_add_phone_retry_delays(max_retries: int | None = None) -> tuple[int, ...]:
+    """add_phone 指数退避延迟序列(上游 `.upstream/manager.py:251`).
+
+    返回 (interval*2^0, interval*2^1, ...) 长度 = max_retries.
+    """
+    from autoteam.config import AUTO_CHECK_INTERVAL
+
+    interval = AUTO_CHECK_INTERVAL
+    try:
+        from autoteam.api import _auto_check_config
+
+        interval = int(_auto_check_config.get("interval", interval) or interval)
+    except Exception:
+        pass
+
+    retries = _auth_repair_add_phone_max_retries() if max_retries is None else max_retries
+    interval = max(60, int(interval))
+    retries = max(1, int(retries))
+    return tuple(interval * (2**idx) for idx in range(retries))
+
+
+def _auth_repair_error_label(error_type: str | None) -> str:
+    """error_type → 中文用户可读标签(上游 `.upstream/manager.py:268`).
+
+    UI / 日志用,未识别的 error_type 原样返回.
+    """
+    mapping = {
+        "add_phone": "手机号验证",
+        "human_verification": "人机验证",
+        "email_verification": "邮箱验证码页卡住",
+        "workspace_selection": "workspace 选择未完成",
+        "account_selection": "账号选择页未完成",
+        "login_state_lost": "登录态丢失",
+        "missing_auth_file": "缺少本地 Codex 凭证",
+        "auth_error_discard": "认证失效后一次性丢弃",
+        "unsupported_region": "出口地区不被 OAuth 接受",
+        "oauth_timeout": "OAuth 授权页超时",
+        "site_unavailable": "站点不可用/代理异常",
+        "token_exchange_failed": "token 交换失败",
+        "non_team_plan": "未进入 Team workspace",
+        "auth_code_missing": "未获取到 auth code",
+        "login_failed": "登录失败",
+        "exception": "登录异常",
+    }
+    return mapping.get(error_type or "", error_type or "未知错误")
+
+
+def _oauth_retry_delay_seconds(error_type: str | None) -> int:
+    """Short same-round retry delays for transient OAuth organization/region pages."""
+    mapping = {
+        "unsupported_region": 20,
+        "account_selection": 6,
+        "no_valid_organizations": 10,
+        "oauth_timeout": 8,
+    }
+    return mapping.get(str(error_type or "").strip(), 0)
+
+
+def _auth_repair_state_suffix(state: dict | None) -> str:
+    """根据 auth_retry_after / auth_retry_paused 字段拼后缀(上游 `.upstream/manager.py:285`)."""
+    state = state or {}
+    if state.get("auth_retry_paused"):
+        return "，已暂停自动修复"
+    retry_after = state.get("auth_retry_after")
+    if retry_after:
+        mins = max(1, int((retry_after - time.time() + 59) // 60))
+        return f"，约 {mins} 分钟后重试"
+    return ""
+
+
+def _auth_repair_reset(email: str) -> None:
+    """注册/复用成功后清空 auth_repair 状态字段(上游 `.upstream/manager.py:296`).
+
+    不修改 status — 调用方在调用本 helper 前已经把 status 写为 ACTIVE.
+    """
+    update_account(email, **_auth_repair_reset_fields())
+
+
+def _release_auth_repair_team_seat(email: str, *, chatgpt_api=None) -> str:
+    """复用或新建 ChatGPTTeamAPI 移除受损账号的 Team 席位(上游 `.upstream/manager.py:300`).
+
+    返回 "removed" / "already_absent" / "failed".
+    给 _record_auth_repair_failure 在 hard failure / add_phone 超限时用.
+    """
+    managed_chatgpt = chatgpt_api
+    started_here = False
+
+    try:
+        if managed_chatgpt is None:
+            managed_chatgpt = ChatGPTTeamAPI()
+
+        if not _chatgpt_session_ready(managed_chatgpt):
+            managed_chatgpt.start()
+            started_here = True
+
+        return str(remove_from_team(managed_chatgpt, email, return_status=True))
+    except Exception as exc:
+        logger.warning("[认证修复] 释放 %s 的 Team 席位失败: %s", email, exc)
+        return "failed"
+    finally:
+        if started_here and _chatgpt_session_ready(managed_chatgpt):
+            managed_chatgpt.stop()
+
+
+def _auth_repair_result_suffix(result: dict | None) -> str:
+    """补充"已释放 Team 席位"语义到日志后缀(上游 `.upstream/manager.py:321`)."""
+    result = result or {}
+    suffix = _auth_repair_state_suffix(result)
+    if result.get("seat_released"):
+        return f"{suffix}，已释放 Team 席位"
+    if result.get("release_attempted") and result.get("remove_status") == "failed":
+        return f"{suffix}，释放 Team 席位失败"
+    return suffix
+
+
+def _auth_repair_skip_reason(acc: dict | None, *, force: bool = False, now: float | None = None) -> str | None:
+    """判断是否应跳过自动修复(上游 `.upstream/manager.py:331`).
+
+    返回 None  → 可走修复; 非 None → 中文跳过原因(冷却中 / 已暂停).
+    force=True 永远不跳过(给 cmd_check force_auth_repair=True 用).
+    """
+    if force or not acc:
+        return None
+
+    if acc.get("auth_retry_paused"):
+        label = _auth_repair_error_label(acc.get("auth_last_error"))
+        return f"已暂停自动修复（{label}）"
+
+    retry_after = acc.get("auth_retry_after")
+    now = time.time() if now is None else now
+    if retry_after and retry_after > now:
+        remain_secs = max(0, int(retry_after - now))
+        remain_mins = max(1, (remain_secs + 59) // 60)
+        label = _auth_repair_error_label(acc.get("auth_last_error"))
+        return f"自动修复冷却中（{label}，约 {remain_mins} 分钟后重试）"
+    return None
+
+
+def _should_aggressively_release_auth_failure(error_type: str | None, *, discard_failed_repair: bool) -> bool:
+    """Return whether one-shot rotation should release a child seat for this login/link failure."""
+    if not discard_failed_repair:
+        return False
+    normalized = str(error_type or "").strip()
+    if not normalized:
+        normalized = "login_failed"
+    return normalized in AUTH_REPAIR_AGGRESSIVE_RELEASE_TYPES
+
+
+def _record_auth_repair_failure(
+    email: str,
+    error_type: str | None = None,
+    error_detail: str | None = None,
+    *,
+    chatgpt_api=None,
+) -> dict:
+    """OAuth 修复失败 → 写衰退式 retry_after 状态 + 决定是否释放 Team 席位.
+
+    上游 `.upstream/manager.py:349`. 三分支:
+      1. add_phone + 软重试开 + 未超限 → 指数退避 retry_after, paused=False
+      2. add_phone(超限) | hard_failure → paused=True + 释放席位
+      3. 普通错误 → 衰退式三档 retry_after, paused=False
+
+    本地适配:
+      - 上游 STATUS_AUTH_PENDING → 本地 STATUS_AUTH_INVALID
+        (literal 同为 "auth_invalid", AccountState.AUTH_PENDING 等价)
+      - 所有 status / 字段写入走 update_account → default_machine.transition
+        自动校验合法性 + 写 state_log + 发事件.
+    """
+    now = time.time()
+    acc = find_account(load_accounts(), email) or {"email": email}
+    error_type = error_type or "login_failed"
+    error_detail = error_detail or _auth_repair_error_label(error_type)
+    retry_delays = _auth_repair_retry_delays()
+    release_team_seat = False
+    missing_auth_file = not _has_auth_file(acc)
+    team_blocking_status = acc.get("status") in (STATUS_STANDBY, STATUS_AUTH_INVALID)
+    protected_local_credential = _is_protected_local_credential_seat(acc)
+    try:
+        from autoteam.config import ROTATE_SKIP_REUSE as discard_failed_repair
+    except Exception:
+        discard_failed_repair = True
+
+    if _should_aggressively_release_auth_failure(error_type, discard_failed_repair=discard_failed_repair):
+        prev_count = int(acc.get("auth_retry_count") or 0)
+        state = {
+            "auth_retry_count": prev_count + 1,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": None,
+            "auth_retry_paused": True,
+        }
+        release_team_seat = True
+    elif error_type == "add_phone" and _auth_repair_retry_add_phone_enabled():
+        prev_count = int(acc.get("auth_retry_count") or 0) if acc.get("auth_last_error") == "add_phone" else 0
+        next_count = prev_count + 1
+        max_retries = _auth_repair_add_phone_max_retries()
+        add_phone_delays = _auth_repair_add_phone_retry_delays(max_retries)
+
+        if next_count > max_retries:
+            state = {
+                "auth_retry_count": next_count,
+                "auth_last_error": error_type,
+                "auth_last_error_detail": error_detail,
+                "auth_last_failed_at": now,
+                "auth_retry_after": None,
+                "auth_retry_paused": True,
+            }
+            release_team_seat = True
+        else:
+            state = {
+                "auth_retry_count": next_count,
+                "auth_last_error": error_type,
+                "auth_last_error_detail": error_detail,
+                "auth_last_failed_at": now,
+                "auth_retry_after": now + add_phone_delays[next_count - 1],
+                "auth_retry_paused": False,
+            }
+    elif error_type in AUTH_REPAIR_HARD_FAILURE_TYPES or error_type == "add_phone":
+        retry_count = max(int(acc.get("auth_retry_count") or 0), len(retry_delays))
+        state = {
+            "auth_retry_count": retry_count,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": None,
+            "auth_retry_paused": True,
+        }
+        release_team_seat = True
+    elif error_type in AUTH_REPAIR_RELEASE_TEAM_BLOCKER_TYPES and (
+        missing_auth_file or team_blocking_status or discard_failed_repair
+    ):
+        prev_count = int(acc.get("auth_retry_count") or 0)
+        state = {
+            "auth_retry_count": prev_count + 1,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": None,
+            "auth_retry_paused": True,
+        }
+        release_team_seat = True
+    else:
+        prev_count = int(acc.get("auth_retry_count") or 0)
+        next_count = min(prev_count + 1, len(retry_delays))
+        delay = retry_delays[max(0, next_count - 1)]
+        retry_after = now + delay
+        state = {
+            "auth_retry_count": next_count,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": retry_after,
+            "auth_retry_paused": False,
+        }
+        if error_type in AUTH_REPAIR_RELEASE_AFTER_RETRY_TYPES and next_count >= len(retry_delays):
+            state["auth_retry_after"] = None
+            state["auth_retry_paused"] = True
+            release_team_seat = True
+
+    protected_replacement_override = _can_replace_protected_managed_auth_failure(acc, error_type=error_type)
+    if release_team_seat and protected_local_credential and not protected_replacement_override:
+        logger.warning("[认证修复] 保留受保护的本地凭证席位: %s", email)
+        release_team_seat = False
+
+    update_account(email, **state)
+
+    is_team_member = _is_email_in_team(email)
+    if not is_team_member and acc.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_AUTH_INVALID):
+        is_team_member = True
+
+    release_attempted = False
+    remove_status = None
+    seat_released = False
+    if release_team_seat and is_team_member:
+        release_attempted = True
+        remove_status = _release_auth_repair_team_seat(email, chatgpt_api=chatgpt_api)
+        seat_released = remove_status in ("removed", "already_absent")
+
+    # 上游用 STATUS_AUTH_PENDING; 本地 STATUS_AUTH_INVALID 同 literal "auth_invalid",
+    # 走 default_machine.transition 时映射到 AccountState.AUTH_PENDING.
+    final_status = STATUS_STANDBY if seat_released or not is_team_member else STATUS_AUTH_INVALID
+    update_account(email, status=final_status, _reason=f"auth_repair:{error_type}")
+    if discard_failed_repair and final_status == STATUS_STANDBY and (
+        not protected_local_credential or protected_replacement_override
+    ):
+        _discard_auth_repair_failed_account_record(
+            email,
+            f"auth_repair_failed:{error_type}",
+            status=STATUS_STANDBY,
+            now=now,
+        )
+
+    return {
+        **state,
+        "status": final_status,
+        "seat_released": seat_released,
+        "release_attempted": release_attempted,
+        "remove_status": remove_status,
+        "protected_local_credential": protected_local_credential,
+        "protected_replacement_override": protected_replacement_override,
+    }
+
+
+def _login_codex_with_result(
+    email: str,
+    password: str,
+    *,
+    mail_client=None,
+    max_attempts: int = 3,
+    signup_profile: SignupProfile | None = None,
+    pre_signed_in_cookies: list | None = None,
+    playwright_proxy_url: str | None = None,
+) -> dict:
+    """Run Codex OAuth with the explicit result wrapper used by auth repair.
+
+    This helper is intentionally isolated from `cmd_check` seat-release policy.
+    It normalizes old bundle/None callers, current `return_result=True` callers,
+    and rejected non-Team bundles into one retryable result shape.
+    """
+    max_attempts = max(1, int(max_attempts))
+
+    def _reject_non_team(bundle: dict | None) -> dict | None:
+        if not isinstance(bundle, dict) or not bundle:
+            return None
+        plan_type = str(bundle.get("plan_type") or "").lower()
+        if plan_type == "team":
+            return None
+        return {
+            "ok": False,
+            "bundle": None,
+            "error_type": "non_team_plan",
+            "error_detail": f"登录后 plan={plan_type or 'unknown'}，未进入 Team workspace",
+            "retryable": True,
+        }
+
+    def _result_from_legacy_bundle(bundle) -> dict:
+        non_team = _reject_non_team(bundle if isinstance(bundle, dict) else None)
+        if non_team:
+            return non_team
+        return {
+            "ok": bool(bundle),
+            "bundle": bundle if bundle else None,
+            "error_type": None if bundle else "login_failed",
+            "error_detail": None if bundle else "登录失败",
+            "retryable": False if bundle else True,
+        }
+
+    def _call_login(use_cookies: list | None) -> dict:
+        kwargs = {"mail_client": mail_client, "return_result": True}
+        if signup_profile is not None:
+            kwargs["signup_profile"] = signup_profile
+        if use_cookies is not None:
+            kwargs["pre_signed_in_cookies"] = use_cookies
+        if playwright_proxy_url is not None:
+            kwargs["playwright_proxy_url"] = playwright_proxy_url
+
+        try:
+            result = login_codex_via_browser(email, password, **kwargs)
+        except TypeError:
+            # Keep test doubles and older call signatures usable while current
+            # production code accepts the extended kwargs above.
+            result = login_codex_via_browser(
+                email,
+                password,
+                mail_client=mail_client,
+                return_result=True,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "bundle": None,
+                "error_type": "exception",
+                "error_detail": str(exc),
+                "retryable": True,
+            }
+
+        if isinstance(result, dict) and "ok" in result:
+            non_team = _reject_non_team(result.get("bundle"))
+            if result.get("ok") and non_team:
+                return non_team
+            return result
+        return _result_from_legacy_bundle(result)
+
+    last_result = None
+    for attempt in range(1, max_attempts + 1):
+        # Captured ChatGPT/Auth cookies are a first-attempt shortcut. If they
+        # fail, later attempts fall back to the full login/OAuth path.
+        use_cookies = pre_signed_in_cookies if attempt == 1 else None
+        result = _call_login(use_cookies)
+        result["attempts"] = attempt
+        if result.get("ok"):
+            return result
+
+        last_result = result
+        error_type = result.get("error_type")
+        retryable = bool(result.get("retryable"))
+        if attempt >= max_attempts or not retryable or error_type in AUTH_REPAIR_SINGLE_ATTEMPT_FAILURE_TYPES:
+            return result
+
+        logger.warning(
+            "[Codex] %s 登录未完成（%s），准备在本轮重试第 %d/%d 次",
+            email,
+            _auth_repair_error_label(error_type),
+            attempt + 1,
+            max_attempts,
+        )
+        retry_delay = _oauth_retry_delay_seconds(error_type)
+        if retry_delay > 0:
+            logger.info(
+                "[Codex] %s 命中 %s，等待 %d 秒后重试以规避瞬时组织/出口抖动",
+                email,
+                _auth_repair_error_label(error_type),
+                retry_delay,
+            )
+            time.sleep(retry_delay)
+
+    return last_result or {
+        "ok": False,
+        "bundle": None,
+        "error_type": "login_failed",
+        "error_detail": "登录失败",
+        "retryable": True,
+        "attempts": max_attempts,
+    }
+
+
+def invite_to_team(chatgpt_api, email, seat_type="default"):
+    """邀请账号加入 Team(上游 `.upstream/manager.py:1209`,直接回贴).
+
+    旧账号默认走 default(ChatGPT+Codex 双席); 失败自动 fallback usage_based(仅 Codex).
+
+    返回 bool。本地 chatgpt_api.invite_member 内部已自带 default→usage_based fallback
+    + errored_emails 处理 + 重试退避,但本 helper 仍提供:
+      - 模块级 helper(可被 reinvite_account 直接调用,不必走完整 OAuth 链路重邀);
+      - 简化的 bool 返回(调用方不关心 errored_emails 细节时).
+    """
+    status, data = chatgpt_api.invite_member(email, seat_type=seat_type)
+    if status == 200 and isinstance(data, dict):
+        errored = data.get("errored_emails", [])
+        if errored:
+            err_msg = errored[0].get("error", "unknown") if isinstance(errored[0], dict) else "unknown"
+            logger.warning("[Team] 邀请 %s 被拒绝: %s", email, err_msg)
+            # default 失败则尝试 usage_based(本地 invite_member 已自带,但保持上游兜底语义)
+            if seat_type == "default":
+                logger.info("[Team] 尝试 usage_based 方式...")
+                return invite_to_team(chatgpt_api, email, seat_type="usage_based")
+            return False
+    return status == 200
+
+
+# --------------------------------------------------------------------------
+# end Round 12 S3 cherry-pick block
+# --------------------------------------------------------------------------
+
+
+# Team 子账号(非主号)硬上限。主号 + 2 子号 = 3 席,与 cmd_rotate / cmd_fill 默认 target=3 一致。
 # 超过这个数说明有"假 standby / 假 personal"在 Team 里占席位(同步延迟或历史 bug 遗留),
-# _reconcile_team_members 会按优先级 kick 多余者,永不让 Team 超出 4 子号。
-TEAM_SUB_ACCOUNT_HARD_CAP = 4
+# _reconcile_team_members 会按优先级 kick 多余者,永不让 Team 超出 2 子号。
+TEAM_SUB_ACCOUNT_HARD_CAP = 2
 
 
-def _reconcile_team_members(chatgpt_api=None):
+def _find_team_auth_file(email):
+    """在 auths 目录里找 codex-{email}-team-*.json。找到返回字符串路径,否则 None。
+
+    严格只接 -team-*.json:personal/plus/free 席位 auth 不能用于 Team 子号,
+    用错 plan 的 bundle 会被 OAuth 拒收(参考 codex-oauth personal 模式回退)。
+    """
+    candidates: list[Path] = []
+    for auth_dir in _auth_search_dirs():
+        if auth_dir.exists():
+            candidates.extend(sorted(auth_dir.glob(f"codex-{email}-team-*.json")))
+    return str(candidates[0]) if candidates else None
+
+
+def _is_quota_exhausted_snapshot(acc):
+    """本地 last_quota 表明 5h 和周额度均满(pct=100)→ 耗尽未抛弃。"""
+    lq = acc.get("last_quota") or {}
+    if not lq:
+        return False
+    try:
+        return int(lq.get("primary_pct", 0)) >= 100 and int(lq.get("weekly_pct", 0)) >= 100
+    except (TypeError, ValueError):
+        return False
+
+
+def _check_and_mark_exhausted(acc, email, _safe_update, result):
+    """若本地 last_quota 显示耗尽,则标 EXHAUSTED + quota_exhausted_at,返回 True。
+
+    抽出来给两条 auth 补齐路径(STANDBY 错位 / ACTIVE 缺 auth)在补 auth 后调用,
+    防止 quota 已满的成员补完 auth 又被当成正常 active 留下,等到下一轮 cmd_check
+    才发现耗尽。
+    """
+    if not _is_quota_exhausted_snapshot(acc):
+        return False
+    logger.warning(
+        "[对账] %s 补齐 auth 后 last_quota 显示耗尽,改标 EXHAUSTED(不立即 kick)",
+        email,
+    )
+    _safe_update(
+        acc.get("email"),
+        status=STATUS_EXHAUSTED,
+        quota_exhausted_at=time.time(),
+    )
+    result["exhausted_marked"].append(email)
+    return True
+
+
+def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
     """对账:Team 实际成员 vs 本地 accounts.json,修复一切不一致。
 
     触发原因:历史 bug(OpenAI /users 同步延迟 → remove_from_team already_absent 误判 →
-    DELETE 被跳过)在 Team 里留下"假 standby""假 personal"遗留成员,占 4 子号的席位。
-    新版 remove_from_team 已带 retry 修复源头,但对账层仍需兜底:
+    DELETE 被跳过)在 Team 里留下"假 standby""假 personal"遗留成员，占子号席位。
 
-    处理矩阵:
-        Team里 + 本地 active    → 正常,不动
-        Team里 + 本地 pending   → 注册完成,升 active
-        Team里 + 本地 standby   → 假 standby(应被踢但未踢),KICK
-        Team里 + 本地 exhausted → 应被踢但未踢,KICK
-        Team里 + 本地 personal  → fill-personal 本应踢出,KICK
-        Team里 + 本地无记录     → 手动邀请/其他来源,sync_account_states 会补录
+    处理矩阵(第一轮):
+        Team里 + 本地 active + auth_file 存在           → 正常
+        Team里 + 本地 active + auth_file 缺失           → **残废**
+            RECONCILE_KICK_ORPHAN=true(默认): KICK
+            RECONCILE_KICK_ORPHAN=false: 标 STATUS_ORPHAN 等人工
+        Team里 + 本地 active + last_quota 5h/周 均满    → **耗尽未抛弃**
+            标 STATUS_EXHAUSTED + quota_exhausted_at=now,**不立即 kick**
+            (避免 token_revoked 风控,让 cmd_replace 走正常流程)
+        Team里 + 本地 pending                            → 升 active
+        Team里 + 本地 standby                            → **错位**。修正本地 active,
+            校验 / 补齐 auth_file 指向 auths/codex-{email}-team-*.json
+        Team里 + 本地 exhausted                          → 假 exhausted,KICK
+        Team里 + 本地 personal                           → fill-personal 本应踢,KICK
+        Team里 + 本地 auth_invalid                       → token 失效,KICK
+        Team里 + 本地 orphan                             → 已标记,保留原状
+        Team里 + 本地无记录                              → **ghost**
+            RECONCILE_KICK_GHOST=true(默认): KICK;否则留给 sync_account_states
 
-    之后若 Team 非主号子账号仍 > TEAM_SUB_ACCOUNT_HARD_CAP,按 exhausted → personal →
-    standby → 额度最低的 active 顺序 kick 到刚好 4 为止。
+    之后若 Team 非主号子账号仍 > TEAM_SUB_ACCOUNT_HARD_CAP,按 orphan → auth_invalid →
+    exhausted → personal → standby → 额度最低 active 顺序 kick 到 TEAM_SUB_ACCOUNT_HARD_CAP 为止。
 
-    返回 dict: {kicked: [email...], flipped_to_active: [email...], over_cap_kicked: [email...]}
+    dry_run=True 只诊断不动账户,用于 cmd_reconcile_dry_run。
     """
-    result = {"kicked": [], "flipped_to_active": [], "over_cap_kicked": []}
+    from autoteam.config import RECONCILE_KICK_GHOST, RECONCILE_KICK_ORPHAN
+
+    result = {
+        "kicked": [],
+        "flipped_to_active": [],
+        "orphan_kicked": [],
+        "orphan_marked": [],
+        "misaligned_fixed": [],
+        "exhausted_marked": [],
+        "ghost_kicked": [],
+        "ghost_seen": [],
+        "over_cap_kicked": [],
+        "dry_run": bool(dry_run),
+    }
     account_id = get_chatgpt_account_id()
     if not account_id:
         logger.warning("[对账] account_id 为空,跳过对账")
         return result
 
     need_stop = False
-    if not chatgpt_api or not getattr(chatgpt_api, "browser", None):
+    if not chatgpt_api or not _chatgpt_session_ready(chatgpt_api):
         try:
             chatgpt_api = ChatGPTTeamAPI()
             chatgpt_api.start()
@@ -142,6 +1364,22 @@ def _reconcile_team_members(chatgpt_api=None):
         except Exception as exc:
             logger.warning("[对账] 无法启动 ChatGPTTeamAPI,跳过对账: %s", exc)
             return result
+
+    def _safe_kick(email_to_kick):
+        if dry_run:
+            logger.info("[对账/dry-run] 将会 KICK %s(未执行)", email_to_kick)
+            return "dry_run"
+        try:
+            return remove_from_team(chatgpt_api, email_to_kick, return_status=True)
+        except Exception as exc:
+            logger.error("[对账] KICK %s 抛异常: %s", email_to_kick, exc)
+            return "error"
+
+    def _safe_update(email_to_update, **fields):
+        if dry_run:
+            logger.info("[对账/dry-run] update_account(%s, %s)(未执行)", email_to_update, fields)
+            return
+        update_account(email_to_update, **fields)
 
     try:
         path = f"/backend-api/accounts/{account_id}/users"
@@ -171,87 +1409,220 @@ def _reconcile_team_members(chatgpt_api=None):
         for email, _m in team_subs:
             acc = by_email.get(email)
             if not acc:
+                # ghost: workspace 有 + 本地完全无记录
+                result["ghost_seen"].append(email)
+                if RECONCILE_KICK_GHOST:
+                    logger.warning("[对账] ghost 成员 %s(本地无记录),KICK", email)
+                    rs = _safe_kick(email)
+                    if rs in ("removed", "already_absent", "dry_run"):
+                        result["ghost_kicked"].append(email)
+                else:
+                    logger.info(
+                        "[对账] ghost 成员 %s,RECONCILE_KICK_GHOST=false,留给 sync 补录",
+                        email,
+                    )
                 continue
+
             status = acc.get("status")
-            if status == STATUS_ACTIVE:
-                continue
+
             if status == STATUS_PENDING:
                 logger.info("[对账] %s pending → active(Team 里已存在)", email)
-                update_account(acc.get("email"), status=STATUS_ACTIVE)
+                # 同步当前 workspace 指纹,防止下轮 sync_account_states 把它误打 standby
+                _safe_update(acc.get("email"), status=STATUS_ACTIVE, workspace_account_id=account_id)
                 result["flipped_to_active"].append(email)
                 continue
-            if status in (STATUS_STANDBY, STATUS_EXHAUSTED, STATUS_PERSONAL):
-                logger.warning("[对账] %s 本地=%s 但 Team 里仍挂着,KICK", email, status)
-                try:
-                    remove_status = remove_from_team(chatgpt_api, acc.get("email"), return_status=True)
-                    if remove_status in ("removed", "already_absent"):
-                        # standby/exhausted 保留原状态,personal 也保留(下次 fill-personal 才会真处理)
-                        result["kicked"].append(email)
+
+            if status == STATUS_STANDBY:
+                # 错位:workspace 是事实来源,本地 standby 是陈旧状态
+                logger.warning("[对账] %s 错位(workspace=active 本地=standby),修正 active", email)
+                auth_path = acc.get("auth_file")
+                if not auth_path or not Path(auth_path).exists():
+                    found = _find_team_auth_file(email)
+                    if found:
+                        logger.info("[对账] %s 补齐 auth_file=%s", email, found)
+                        _safe_update(
+                            acc.get("email"),
+                            status=STATUS_ACTIVE,
+                            auth_file=found,
+                            workspace_account_id=account_id,
+                        )
+                        result["misaligned_fixed"].append(email)
+                        # fallthrough:补齐 auth 后仍要做 quota 耗尽检查,
+                        # 否则刚补完的 active 成员若 last_quota=0/0 会被漏标 EXHAUSTED
+                        _check_and_mark_exhausted(acc, email, _safe_update, result)
                     else:
-                        logger.error("[对账] KICK %s 失败: status=%s", email, remove_status)
-                except Exception as exc:
-                    logger.error("[对账] KICK %s 抛异常: %s", email, exc)
+                        # 错位且找不到 auth → 实为残废,降级
+                        logger.warning("[对账] %s 错位但无 auth 文件,降级为残废分支", email)
+                        if RECONCILE_KICK_ORPHAN:
+                            rs = _safe_kick(email)
+                            if rs in ("removed", "already_absent", "dry_run"):
+                                result["orphan_kicked"].append(email)
+                                # KICK 成功后必须同步本地状态,否则下次 fill 仍按 active 计数(回归 bug)
+                                _safe_update(acc.get("email"), status=STATUS_AUTH_INVALID)
+                        else:
+                            _safe_update(acc.get("email"), status=STATUS_ORPHAN)
+                            result["orphan_marked"].append(email)
+                else:
+                    _safe_update(acc.get("email"), status=STATUS_ACTIVE, workspace_account_id=account_id)
+                    result["misaligned_fixed"].append(email)
+                    _check_and_mark_exhausted(acc, email, _safe_update, result)
+                continue
 
-        # 第二轮:硬上限 4 子号。kick 完上面的,再拉一次 /users 得到最新数
-        resp2 = chatgpt_api._api_fetch("GET", path)
-        if resp2.get("status") == 200:
-            try:
-                data2 = json.loads(resp2.get("body") or "{}")
-                members2 = data2.get("items", data2.get("users", data2.get("members", [])))
-            except Exception:
-                members2 = members
+            if status == STATUS_ACTIVE:
+                # 残废检查:workspace + 本地 active 但 auth_file 缺失
+                auth_path = acc.get("auth_file")
+                if not auth_path or not Path(auth_path).exists():
+                    found = _find_team_auth_file(email)
+                    if found:
+                        logger.info("[对账] %s active + auth_file=null,发现 %s,补上", email, found)
+                        _safe_update(acc.get("email"), auth_file=found)
+                        # fallthrough:补 auth 后仍要 quota 耗尽检查,避免漏标 EXHAUSTED
+                        _check_and_mark_exhausted(acc, email, _safe_update, result)
+                        continue
+                    if RECONCILE_KICK_ORPHAN:
+                        logger.warning("[对账] 残废 %s(workspace 有 + 本地 auth 缺失),KICK", email)
+                        rs = _safe_kick(email)
+                        if rs in ("removed", "already_absent", "dry_run"):
+                            result["orphan_kicked"].append(email)
+                            # KICK 成功后必须同步本地状态,否则下次 fill 仍按 active 计数(回归 bug)
+                            _safe_update(acc.get("email"), status=STATUS_AUTH_INVALID)
+                    else:
+                        logger.warning("[对账] 残废 %s,RECONCILE_KICK_ORPHAN=false,标 STATUS_ORPHAN", email)
+                        _safe_update(acc.get("email"), status=STATUS_ORPHAN)
+                        result["orphan_marked"].append(email)
+                    continue
+
+                # 耗尽未抛弃: last_quota 5h/周 均 100% → 标 EXHAUSTED,**不**立即 kick
+                if _is_quota_exhausted_snapshot(acc):
+                    logger.warning(
+                        "[对账] %s active + last_quota 0/0(耗尽未抛弃),标 EXHAUSTED(不立即 kick)",
+                        email,
+                    )
+                    _safe_update(
+                        acc.get("email"),
+                        status=STATUS_EXHAUSTED,
+                        quota_exhausted_at=time.time(),
+                    )
+                    result["exhausted_marked"].append(email)
+                    continue
+
+                # 正常 active
+                continue
+
+            if status == STATUS_ORPHAN:
+                # 上一轮已经标 orphan,等人工补 auth,不反复 kick
+                logger.debug("[对账] %s 已标 STATUS_ORPHAN,跳过", email)
+                continue
+
+            if status in (STATUS_EXHAUSTED, STATUS_PERSONAL, STATUS_AUTH_INVALID):
+                logger.warning("[对账] %s 本地=%s 但 Team 里仍挂着,KICK", email, status)
+                rs = _safe_kick(acc.get("email"))
+                if rs in ("removed", "already_absent", "dry_run"):
+                    # standby/exhausted 保留原状态,personal 也保留(下次 fill-personal 才真处理)
+                    result["kicked"].append(email)
+                elif rs != "error":
+                    logger.error("[对账] KICK %s 失败: status=%s", email, rs)
+                continue
+
+        # 第二轮:硬上限 TEAM_SUB_ACCOUNT_HARD_CAP 子号。
+        # 非 dry_run:kick 完第一轮再 GET /users 拿最新数;
+        # dry_run:**不**重新 GET /users —— 否则刚"假装 KICK"的 ghost 仍在 workspace 真实
+        # 成员里,会被算进 remaining_subs,over_cap 数量被高估。改用第一轮 team_subs
+        # 减去本轮已被标 KICK 的 email,模拟 dry_run 后的 remaining。
+        if dry_run:
+            kicked_in_round_one = set(result["kicked"] + result["orphan_kicked"] + result["ghost_kicked"])
+            remaining_subs = [email for email, _m in team_subs if email not in kicked_in_round_one]
         else:
-            members2 = members
-
-        remaining_subs = [
-            (m.get("email") or "").lower()
-            for m in members2
-            if (m.get("email") or "") and not _is_main_account_email(m.get("email"))
-        ]
+            resp2 = chatgpt_api._api_fetch("GET", path)
+            if resp2.get("status") == 200:
+                try:
+                    data2 = json.loads(resp2.get("body") or "{}")
+                    members2 = data2.get("items", data2.get("users", data2.get("members", [])))
+                except Exception:
+                    members2 = members
+            else:
+                members2 = members
+            remaining_subs = [
+                (m.get("email") or "").lower()
+                for m in members2
+                if (m.get("email") or "") and not _is_main_account_email(m.get("email"))
+            ]
         excess = len(remaining_subs) - TEAM_SUB_ACCOUNT_HARD_CAP
         if excess > 0:
             logger.warning(
-                "[对账] Team 子号 %d > 硬上限 %d,按优先级 kick %d 个",
+                "[对账%s] Team 子号 %d > 硬上限 %d,按优先级 kick %d 个",
+                "/dry-run" if dry_run else "",
                 len(remaining_subs),
                 TEAM_SUB_ACCOUNT_HARD_CAP,
                 excess,
             )
-            accounts_now = load_accounts()
-            acc_map = {(a.get("email") or "").lower(): a for a in accounts_now}
+            # dry_run 下复用第一轮 by_email,不再读 accounts.json,保持只读纯净
+            if dry_run:
+                acc_map = by_email
+            else:
+                accounts_now = load_accounts()
+                acc_map = {(a.get("email") or "").lower(): a for a in accounts_now}
 
             def _priority(email):
                 # 优先级越小越先 kick
                 a = acc_map.get(email)
                 if not a:
-                    return (0, 0)  # 不在本地的未知账号最先 kick
+                    # ghost(本地无记录):仅当 KICK_GHOST=True 才优先 kick;
+                    # 关闭时排到最后,避免绕过 RECONCILE_KICK_GHOST 开关
+                    return (0, 0) if RECONCILE_KICK_GHOST else (99, 0)
                 st = a.get("status")
-                if st == STATUS_EXHAUSTED:
+                if st == STATUS_ORPHAN:
                     return (1, 0)
-                if st == STATUS_PERSONAL:
+                if st == STATUS_AUTH_INVALID:
+                    return (1, 1)
+                if st == STATUS_EXHAUSTED:
                     return (2, 0)
-                if st == STATUS_STANDBY:
+                if st == STATUS_PERSONAL:
                     return (3, 0)
+                if st == STATUS_STANDBY:
+                    return (4, 0)
                 if st == STATUS_ACTIVE:
                     # active 按额度剩余从低到高 kick
                     lq = a.get("last_quota") or {}
                     p_remain = 100 - lq.get("primary_pct", 0)
-                    return (4, p_remain)
-                return (5, 0)
+                    return (5, p_remain)
+                return (6, 0)
 
             victims = sorted(remaining_subs, key=_priority)[:excess]
-            for email in victims:
-                try:
-                    remove_status = remove_from_team(chatgpt_api, email, return_status=True)
-                    if remove_status in ("removed", "already_absent"):
-                        acc = acc_map.get(email)
-                        if acc and acc.get("status") == STATUS_ACTIVE:
-                            update_account(acc.get("email"), status=STATUS_STANDBY)
-                        result["over_cap_kicked"].append(email)
-                        logger.info("[对账] 超员 kick %s (priority=%s)", email, _priority(email))
-                    else:
-                        logger.error("[对账] 超员 kick %s 失败: status=%s", email, remove_status)
-                except Exception as exc:
-                    logger.error("[对账] 超员 kick %s 抛异常: %s", email, exc)
+            if dry_run:
+                # 只预测,不调 _safe_kick(它内部 dry_run 也只是 log),不写 acc 状态
+                for email in victims:
+                    logger.info(
+                        "[对账/dry-run] 超员预测 kick %s (priority=%s)",
+                        email,
+                        _priority(email),
+                    )
+                    result["over_cap_kicked"].append(email)
+            else:
+                for email in victims:
+                    try:
+                        remove_status = remove_from_team(chatgpt_api, email, return_status=True)
+                        if remove_status in ("removed", "already_absent"):
+                            acc = acc_map.get(email)
+                            if acc and acc.get("status") == STATUS_ACTIVE:
+                                update_account(acc.get("email"), status=STATUS_STANDBY)
+                            result["over_cap_kicked"].append(email)
+                            logger.info("[对账] 超员 kick %s (priority=%s)", email, _priority(email))
+                        else:
+                            logger.error("[对账] 超员 kick %s 失败: status=%s", email, remove_status)
+                    except Exception as exc:
+                        logger.error("[对账] 超员 kick %s 抛异常: %s", email, exc)
+        # Round 9 RT-3 — 复用 chatgpt_api 调 retroactive helper(走 5min cache,失败仅 warning)。
+        # spec/shared/master-subscription-health.md v1.1 §11.3。
+        try:
+            from autoteam.master_health import _apply_master_degraded_classification
+
+            retro = _apply_master_degraded_classification(chatgpt_api=chatgpt_api, dry_run=dry_run)
+            result["master_degraded_retroactive"] = retro
+        except Exception as exc:
+            logger.warning("[对账] retroactive helper 异常: %s", exc)
+            result["master_degraded_retroactive"] = {"errors": [{"stage": "rt3", "error": str(exc)}]}
+
     finally:
         if need_stop:
             try:
@@ -260,6 +1631,33 @@ def _reconcile_team_members(chatgpt_api=None):
                 pass
 
     return result
+
+
+def _probe_kicked_account(acc):
+    """SPEC-2 FR-E1 — 单账号探测:wham/usage 401/403 → 被踢;ok / 其他 → 自然待机/未确认.
+
+    返回 status_str(check_codex_quota 5 分类之一)或 None(无法探测)。
+    任何异常吞掉返回 None,让上游降级 STANDBY 旧行为。
+
+    NB: 该函数会从 auth_file 读 access_token,探测时间长(网络往返 + 5s 超时),
+    上游必须用 ThreadPoolExecutor 并发调用,否则 N 个账号串行会让 sync 超 30s。
+    """
+    auth_file = acc.get("auth_file")
+    if not auth_file:
+        return None
+    try:
+        path_obj = Path(auth_file)
+        if not path_obj.exists():
+            return None
+        data = json.loads(path_obj.read_text(encoding="utf-8"))
+        access_token = data.get("access_token") or (data.get("tokens") or {}).get("access_token")
+        if not access_token:
+            return None
+        status, _ = check_codex_quota(access_token)
+        return status
+    except Exception as exc:
+        logger.debug("[同步] _probe_kicked_account(%s) 异常: %s", acc.get("email"), exc)
+        return None
 
 
 def sync_account_states(chatgpt_api=None):
@@ -272,7 +1670,7 @@ def sync_account_states(chatgpt_api=None):
 
     # 获取 Team 实际成员
     need_stop = False
-    if not chatgpt_api or not chatgpt_api.browser:
+    if not chatgpt_api or not _chatgpt_session_ready(chatgpt_api):
         try:
             chatgpt_api = ChatGPTTeamAPI()
             chatgpt_api.start()
@@ -302,16 +1700,158 @@ def sync_account_states(chatgpt_api=None):
     changed = False
     local_email_set = {a["email"].lower() for a in accounts}
 
+    # Round 12 wire-up (M1) — 把"直写 acc['status']=X 之后批量 save_accounts"改成
+    # 实时 update_account → default_machine.transition. 收益:
+    #   * state_log.jsonl 落每条变更
+    #   * 事件总线广播 → F2 SSE 推送 sync 引起的 transition
+    #   * IllegalTransition 合法性兜底
+    # 注: update_account 是 RMW + 锁内 save,O(N) 次 IO,但 sync 不在 hot path
+    # 而是 cmd_rotate 的 1/5 阶段,延迟开销可接受.
+
+    def _transition_status(email: str, new_status: str, **extra) -> None:
+        """走状态机的 update_account 包装. 出错降级 warning,不打断 sync."""
+        try:
+            update_account(email, status=new_status, **extra)
+        except Exception as exc:
+            logger.warning(
+                "[同步] update_account(%s -> %s) 抛异常(忽略): %s",
+                email, new_status, exc,
+            )
+
+    # SPEC-2 FR-E1~E4 — 区分人工踢出 vs 自然待机:
+    # 不在 Team 的 active 号 → wham/usage 401/403 → AUTH_INVALID(被踢);ok / network → STANDBY(自然)。
+    # 探测有并发上限 5 + 单调用 5s + 整体 30s + 30 分钟 last_quota_check_at 去重。
+    from autoteam.runtime_config import get_sync_probe_concurrency, get_sync_probe_cooldown_minutes
+
+    cooldown_secs = max(60, int(get_sync_probe_cooldown_minutes()) * 60)
+    concurrency = max(1, int(get_sync_probe_concurrency()))
+    need_probe = []
+    now_ts = time.time()
+
     for acc in accounts:
         email = acc["email"].lower()
         in_team = email in team_emails
 
-        if in_team and acc["status"] in (STATUS_STANDBY, STATUS_PENDING):
+        if in_team and acc["status"] in (STATUS_STANDBY, STATUS_PENDING, "auth_pending"):
+            # Round 12 wire-up M1 — go through state machine (default_machine.transition).
+            ws_id = account_id or None
+            protect_team_seat = _has_auth_file(acc)
+            _transition_status(
+                acc["email"], STATUS_ACTIVE,
+                workspace_account_id=ws_id,
+                protect_team_seat=protect_team_seat,
+                remote_seen_at=now_ts,
+                _reason="sync_account_states:in_team",
+            )
+            # 内存里也同步,后续 need_probe / domain_suffix 分支基于刷新后的状态判断
             acc["status"] = STATUS_ACTIVE
+            acc["remote_seen_at"] = now_ts
+            if protect_team_seat:
+                acc["protect_team_seat"] = True
+            if account_id:
+                acc["workspace_account_id"] = account_id
             changed = True
         elif not in_team and acc["status"] == STATUS_ACTIVE:
-            acc["status"] = STATUS_STANDBY
-            changed = True
+            # 守卫(Bug 4A):账号记录的 workspace_account_id 与当前 workspace 不一致 →
+            # 这是母号切换造成的"前母号留下号",不是真的被踢出。保留原 active,
+            # 不要无脑刷成 standby(否则 sync_to_cpa 会把还可用的 token 文件抹掉)。
+            # 仅在两个 ID 都存在且不同时跳过 flip;字段缺失/legacy 记录走原行为。
+            acc_ws = acc.get("workspace_account_id")
+            if acc_ws and account_id and acc_ws != account_id:
+                logger.warning(
+                    "[同步] %s 在当前 workspace 不可见,但其 workspace_account_id=%s ≠ 当前 %s(母号切换遗留),保留 active 不 flip",
+                    acc["email"],
+                    acc_ws,
+                    account_id,
+                )
+                continue
+            # FR-E3 探测去重:30 分钟内不重复探测,直接降级 STANDBY 走旧行为
+            last_check = float(acc.get("last_quota_check_at") or 0)
+            if (now_ts - last_check) < cooldown_secs:
+                _transition_status(
+                    acc["email"], STATUS_STANDBY,
+                    _reason="sync_account_states:probe_cooldown",
+                )
+                acc["status"] = STATUS_STANDBY
+                changed = True
+                continue
+            # 收集到批量待探测列表,后面用 ThreadPoolExecutor 并发跑
+            if acc.get("auth_file"):
+                need_probe.append(acc)
+            else:
+                # 没 auth_file 无法探测 → 直接降级 STANDBY(等用户重 OAuth)
+                _transition_status(
+                    acc["email"], STATUS_STANDBY,
+                    _reason="sync_account_states:no_auth_file",
+                )
+                acc["status"] = STATUS_STANDBY
+                changed = True
+
+    # FR-E2 并发探测被踢识别(只对 need_probe 中的账号)
+    if need_probe:
+        import concurrent.futures
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+                future_map = {ex.submit(_probe_kicked_account, acc): acc for acc in need_probe}
+                done, not_done = concurrent.futures.wait(
+                    future_map.keys(), timeout=30.0,
+                    return_when=concurrent.futures.ALL_COMPLETED,
+                )
+                for fut in done:
+                    acc = future_map[fut]
+                    try:
+                        status_str = fut.result(timeout=0.1)
+                    except Exception:
+                        status_str = None
+                    finalize_ts = time.time()
+                    acc["last_quota_check_at"] = finalize_ts
+
+                    if status_str == "auth_error":
+                        _transition_status(
+                            acc["email"], STATUS_AUTH_INVALID,
+                            last_kicked_at=finalize_ts,
+                            last_quota_check_at=finalize_ts,
+                            _reason="sync_account_states:probe_auth_error",
+                        )
+                        acc["status"] = STATUS_AUTH_INVALID
+                        acc["last_kicked_at"] = finalize_ts
+                        logger.warning(
+                            "[同步] %s wham 401/403 → AUTH_INVALID(判定人工踢出)",
+                            acc["email"],
+                        )
+                    elif status_str == "no_quota":
+                        # 不会自然恢复
+                        _transition_status(
+                            acc["email"], STATUS_AUTH_INVALID,
+                            last_quota_check_at=finalize_ts,
+                            _reason="sync_account_states:probe_no_quota",
+                        )
+                        acc["status"] = STATUS_AUTH_INVALID
+                        logger.warning("[同步] %s wham no_quota → AUTH_INVALID", acc["email"])
+                    else:
+                        # ok / exhausted / network_error / None → 自然待机
+                        _transition_status(
+                            acc["email"], STATUS_STANDBY,
+                            last_quota_check_at=finalize_ts,
+                            _reason="sync_account_states:probe_natural_standby",
+                        )
+                        acc["status"] = STATUS_STANDBY
+                    changed = True
+
+                # 超时未完成的:保持原 ACTIVE,等下轮(避免误标)
+                for fut in not_done:
+                    acc = future_map[fut]
+                    logger.warning("[同步] %s 探测超时,保留 ACTIVE 等下轮", acc["email"])
+                    fut.cancel()
+        except Exception as exc:
+            logger.warning("[同步] 探测段抛异常,降级所有 need_probe 为 STANDBY: %s", exc)
+            for acc in need_probe:
+                _transition_status(
+                    acc["email"], STATUS_STANDBY,
+                    _reason="sync_account_states:probe_exception",
+                )
+                acc["status"] = STATUS_STANDBY
+                changed = True
 
     # Team 中有我们域名但本地无记录的成员 → 自动添加
     if domain_suffix:
@@ -325,6 +1865,7 @@ def sync_account_states(chatgpt_api=None):
                         "password": "",
                         "cloudmail_account_id": None,
                         "status": STATUS_ACTIVE,
+                        "workspace_account_id": account_id or None,
                         "auth_file": None,
                         "quota_exhausted_at": None,
                         "quota_resets_at": None,
@@ -349,19 +1890,22 @@ def sync_account_states(chatgpt_api=None):
                 # 判断是否在 Team 中
                 in_team = email in team_emails
                 status = STATUS_ACTIVE if in_team else STATUS_STANDBY
-                accounts.append(
-                    {
-                        "email": email,
-                        "password": "",
-                        "cloudmail_account_id": None,
-                        "status": status,
-                        "auth_file": str(auth_file),
-                        "quota_exhausted_at": None,
-                        "quota_resets_at": None,
-                        "created_at": time.time(),
-                        "last_active_at": None,
-                    }
-                )
+                recovered = {
+                    "email": email,
+                    "password": "",
+                    "cloudmail_account_id": None,
+                    "status": status,
+                    "auth_file": str(auth_file),
+                    "quota_exhausted_at": None,
+                    "quota_resets_at": None,
+                    "created_at": time.time(),
+                    "last_active_at": None,
+                }
+                if in_team:
+                    recovered["protect_team_seat"] = True
+                    if account_id:
+                        recovered["workspace_account_id"] = account_id
+                accounts.append(recovered)
                 local_email_set.add(email)
                 changed = True
                 logger.info("[同步] 从 auths 目录恢复账号: %s（%s）", email, status)
@@ -370,6 +1914,22 @@ def sync_account_states(chatgpt_api=None):
 
     if changed:
         save_accounts(accounts)
+
+    # Round 9 RT-4 — sync 收尾跑一次 retroactive helper(走 5min cache,不发 HTTP)。
+    # spec/shared/master-subscription-health.md v1.1 §11.3。失败仅 warning 不影响 sync。
+    try:
+        from autoteam.master_health import _apply_master_degraded_classification
+
+        retro = _apply_master_degraded_classification()
+        if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+            logger.info(
+                "[同步] retroactive: GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                len(retro.get("marked_grace") or []),
+                len(retro.get("marked_standby") or []),
+                len(retro.get("reverted_active") or []),
+            )
+    except Exception as exc:
+        logger.warning("[同步] retroactive helper 异常(不影响 sync 主流程): %s", exc)
 
 
 def _print_status_table(accounts, quota_cache=None):
@@ -536,9 +2096,24 @@ def _check_and_refresh(acc):
     return status, info
 
 
-def cmd_check():
-    """只检查 active 账号的额度，无认证文件或 auth_error 的自动重新登录 Codex"""
-    from autoteam.config import AUTO_CHECK_THRESHOLD, CLOUDMAIL_DOMAIN
+STANDBY_PROBE_INTERVAL_SEC = 1.5  # 每个 standby 账号探测间隔,限速避免群访 OpenAI 触发风控
+STANDBY_PROBE_DEDUP_SEC = 24 * 3600  # 24h 内已探测过的 standby 跳过
+
+
+def cmd_check(
+    include_standby: bool = False,
+    *,
+    force_auth_repair: bool = False,
+    preserve_low_active: bool = False,
+    preserved_low_accounts=None,
+):
+    """检查 active 账号的额度,无认证文件或 auth_error 的自动重新登录 Codex。
+
+    参数:
+        include_standby: True 时额外探测 standby 池每个账号的 quota(限速 + 24h 去重),
+                         401/403 的标记为 STATUS_AUTH_INVALID。默认 False 保持向后兼容。
+    """
+    from autoteam.config import AUTO_CHECK_THRESHOLD
 
     # API 运行时配置优先（前端可修改）
     try:
@@ -600,10 +2175,12 @@ def cmd_check():
                     "[%s] (personal) token 失效或账号无权访问 wham/usage(伪 personal 号被踢出 Team 后常见),保留旧快照",
                     email,
                 )
+            elif status_str == "network_error":
+                logger.warning("[%s] (personal) 额度查询遇到临时网络错误,保留旧快照,等下一轮", email)
             # status_str == "no_auth" 已在 _check_and_refresh 里被 auth_file 判空挡掉
 
     # 入口先跑一次对账:凡是"Team 里挂着但本地 standby/exhausted/personal"的遗留成员,
-    # 统一 kick。顺便把 Team 子号硬压到 TEAM_SUB_ACCOUNT_HARD_CAP(4)以内。
+    # 统一 kick。顺便把 Team 子号硬压到 TEAM_SUB_ACCOUNT_HARD_CAP 以内。
     # 这里失败不影响后续额度检查(已有 try/except 包裹),避免对账异常把整个 check 打挂。
     try:
         recon = _reconcile_team_members()
@@ -638,7 +2215,7 @@ def cmd_check():
 
                 if email_l in team_emails:
                     logger.info("[检查] pending 账号已在 Team 中，转为 active: %s", email)
-                    update_account(email, status=STATUS_ACTIVE)
+                    update_account(email, status=STATUS_ACTIVE, workspace_account_id=get_chatgpt_account_id() or None)
                     continue
 
                 if email_l in invite_emails:
@@ -662,7 +2239,7 @@ def cmd_check():
         except Exception as exc:
             logger.warning("[检查] pending 对账失败，跳过本轮清理: %s", exc)
         finally:
-            if chatgpt and chatgpt.browser:
+            if chatgpt:
                 chatgpt.stop()
 
         if deleted_pending:
@@ -671,21 +2248,52 @@ def cmd_check():
 
         accounts = load_accounts()
 
-    all_active = [a for a in accounts if a["status"] == STATUS_ACTIVE and not _is_main_account_email(a.get("email"))]
+    all_active = [
+        a
+        for a in accounts
+        if a["status"] == STATUS_ACTIVE and not _is_main_account_email(a.get("email")) and not is_account_disabled(a)
+    ]
+    auth_pending_accounts = [
+        a
+        for a in accounts
+        if _is_auth_repair_pending_status(a.get("status"))
+        and not _is_main_account_email(a.get("email"))
+        and not is_account_disabled(a)
+    ]
 
     # 区分：有认证文件的 vs 无认证文件的
     active_with_auth = []
     no_auth_list = []
+    skipped_repairs = []
+    mail_domain = get_mail_domain()
+    mail_domain_suffix = mail_domain.lstrip("@") if mail_domain else ""
     for a in all_active:
-        if a.get("auth_file") and Path(a["auth_file"]).exists():
+        if _has_auth_file(a):
             active_with_auth.append(a)
         else:
-            # 只管我们域名的账号
-            if CLOUDMAIL_DOMAIN and CLOUDMAIL_DOMAIN.lstrip("@") in a["email"]:
+            if _can_attempt_auth_repair(a, mail_domain_suffix):
+                skip_reason = _auth_repair_skip_reason(a, force=force_auth_repair)
+                if skip_reason:
+                    skipped_repairs.append((a["email"], skip_reason))
+                    continue
                 no_auth_list.append(a)
+    for a in auth_pending_accounts:
+        if _has_auth_file(a):
+            active_with_auth.append(a)
+        elif _can_attempt_auth_repair(a, mail_domain_suffix):
+            skip_reason = _auth_repair_skip_reason(a, force=force_auth_repair)
+            if skip_reason:
+                skipped_repairs.append((a["email"], skip_reason))
+                continue
+            no_auth_list.append(a)
+
+    if skipped_repairs:
+        logger.info("[检查] 跳过 %d 个处于冷却/暂停中的认证修复账号:", len(skipped_repairs))
+        for email, reason in skipped_repairs:
+            logger.info("[检查]   %s（%s）", email, reason)
 
     if not active_with_auth and not no_auth_list:
-        logger.info("[检查] 没有可检查的 active 账号")
+        logger.info("[检查] 没有可检查或可修复的账号")
         return []
 
     # 检查有认证文件的账号额度
@@ -696,6 +2304,7 @@ def cmd_check():
         logger.info("[检查] 检查 %d 个 active 账号的额度...", len(active_with_auth))
         for acc in active_with_auth:
             email = acc["email"]
+            was_auth_pending = _is_auth_repair_pending_status(acc.get("status"))
             status_str, info = _check_and_refresh(acc)
 
             if status_str == "ok":
@@ -710,6 +2319,23 @@ def cmd_check():
                     update_account(email, last_quota=info)
                     # 低于阈值视为用完
                     if p_remain < threshold:
+                        if preserve_low_active and not was_auth_pending:
+                            if preserved_low_accounts is not None:
+                                preserved_low_accounts.append(
+                                    {
+                                        "email": email,
+                                        "remaining": p_remain,
+                                        "quota": info,
+                                    }
+                                )
+                            logger.warning(
+                                "[%s] 5h剩余 %d%% < %d%%，先移后补模式暂不标记 exhausted (重置 %s)",
+                                email,
+                                p_remain,
+                                threshold,
+                                p_time,
+                            )
+                            continue
                         resets_at = p_reset or (time.time() + 18000)
                         logger.warning(
                             "[%s] 5h剩余 %d%% < %d%%，标记为 exhausted (重置 %s)", email, p_remain, threshold, p_time
@@ -722,6 +2348,18 @@ def cmd_check():
                         )
                         exhausted_list.append(acc)
                     else:
+                        _auth_repair_reset(email)
+                        if was_auth_pending:
+                            update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
+                            logger.info(
+                                "[%s] 认证已恢复 - 5h剩余: %d%% (重置 %s) | 周剩余: %d%% (重置 %s)",
+                                email,
+                                p_remain,
+                                p_time,
+                                w_remain,
+                                w_time,
+                            )
+                            continue
                         logger.info(
                             "[%s] 额度可用 - 5h剩余: %d%% (重置 %s) | 周剩余: %d%% (重置 %s)",
                             email,
@@ -731,6 +2369,7 @@ def cmd_check():
                             w_time,
                         )
                 else:
+                    _auth_repair_reset(email)
                     logger.info("[%s] 额度可用", email)
             elif status_str == "exhausted":
                 quota_info = quota_result_quota_info(info) or {}
@@ -793,28 +2432,117 @@ def cmd_check():
                     else:
                         logger.info("[%s] token 失效但 5h 重置时间已过，需重新登录验证", email)
                 logger.warning("[%s] 认证失败，需要重新登录 Codex", email)
-                auth_error_list.append(acc)
+                skip_reason = _auth_repair_skip_reason(acc, force=force_auth_repair)
+                if skip_reason:
+                    skipped_repairs.append((email, skip_reason))
+                else:
+                    auth_error_list.append(acc)
+            elif status_str == "no_auth":
+                skip_reason = _auth_repair_skip_reason(acc, force=force_auth_repair)
+                if skip_reason:
+                    skipped_repairs.append((email, skip_reason))
+                else:
+                    auth_error_list.append(acc)
+            elif status_str == "network_error":
+                historical_low = _historical_low_quota_info(acc, threshold)
+                if historical_low:
+                    quota_info = quota_result_quota_info(historical_low) or acc.get("last_quota")
+                    remaining = int(historical_low.get("remaining", 0) or 0)
+                    resets_at = quota_result_resets_at(historical_low) or int(time.time() + 18000)
+                    reset_time = time.strftime("%m-%d %H:%M", time.localtime(resets_at)) if resets_at else "?"
+                    if preserve_low_active and not was_auth_pending:
+                        if preserved_low_accounts is not None:
+                            preserved_low_accounts.append(
+                                {
+                                    "email": email,
+                                    "remaining": remaining,
+                                    "quota": quota_info,
+                                }
+                            )
+                        logger.warning(
+                            "[%s] 额度接口暂时不可达，但历史 5h 剩余 %d%% < %d%%，先移后补模式纳入轮换候选 (重置 %s)",
+                            email,
+                            remaining,
+                            threshold,
+                            reset_time,
+                        )
+                        continue
+                    logger.warning(
+                        "[%s] 额度接口暂时不可达，但历史 5h 剩余 %d%% < %d%%，标记为 exhausted (重置 %s)",
+                        email,
+                        remaining,
+                        threshold,
+                        reset_time,
+                    )
+                    update_account(
+                        email,
+                        status=STATUS_EXHAUSTED,
+                        last_quota=quota_info,
+                        quota_exhausted_at=time.time(),
+                        quota_resets_at=resets_at,
+                    )
+                    exhausted_list.append(acc)
+                    continue
+                logger.warning("[%s] 额度接口暂时不可达，保留当前凭证和席位状态，等待下一轮复查", email)
 
-    # 无认证文件的 active 账号也需要重新登录
+    # 无认证文件的 Team 内账号也需要重新登录
     if no_auth_list:
-        logger.info("[检查] 发现 %d 个 active 账号无认证文件，需要登录 Codex:", len(no_auth_list))
+        logger.info("[检查] 发现 %d 个 Team 内账号无认证文件，需要登录 Codex:", len(no_auth_list))
         for a in no_auth_list:
             logger.info("[检查]   %s", a["email"])
         auth_error_list.extend(no_auth_list)
 
     # auth_error + 无认证文件的统一重新登录 Codex
     if auth_error_list:
-        logger.info("[检查] 重新登录 %d 个 token 失效的账号...", len(auth_error_list))
-        mail_client = CloudMailClient()
-        mail_client.login()
+        # Round 11 V7 — 双失效预筛:access_token + refresh_token 同时被 server-side invalidate
+        # 的号无法靠重登 / refresh 救活(必须 fresh password login,且子号还在 Team 内时
+        # 注册都救不回来),直接标 STATUS_AUTH_INVALID + stamp 时间戳,跳过昂贵的 Playwright OAuth。
+        survivable_auth_errors = []
+        for acc in auth_error_list:
+            email = acc["email"]
+            auth_file = acc.get("auth_file")
+            try:
+                token_pair_dead = is_token_pair_invalidated(auth_file)
+            except Exception as exc:  # noqa: BLE001 — 探活函数本身吞,这层兜底防御
+                logger.warning("[%s] 双失效探活异常,按可救处理: %s", email, exc)
+                token_pair_dead = False
+            if token_pair_dead:
+                logger.error(
+                    "[%s] access_token + refresh_token 同时被 server-side invalidate,标 AUTH_INVALID 跳过重登",
+                    email,
+                )
+                update_account(
+                    email,
+                    status=STATUS_AUTH_INVALID,
+                    last_token_pair_invalidated_at=time.time(),
+                )
+            else:
+                survivable_auth_errors.append(acc)
+        auth_error_list = survivable_auth_errors
+
+    if auth_error_list:
+        logger.info("[检查] 重新登录 %d 个认证失效/待修复的账号...", len(auth_error_list))
+        mail_clients = {}
         for acc in auth_error_list:
             email = acc["email"]
             password = acc.get("password", "")
             logger.info("[%s] 重新 Codex 登录...", email)
-            bundle = login_codex_via_browser(email, password, mail_client=mail_client)
-            if bundle:
+            provider = (acc.get("mail_provider") or get_mail_provider_name()).strip().lower()
+            mail_client = mail_clients.get(provider)
+            if mail_client is None:
+                mail_client = _get_account_mail_client(acc)
+                mail_clients[provider] = mail_client
+            auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+            login_kwargs = {"mail_client": mail_client}
+            if playwright_proxy_url:
+                login_kwargs["playwright_proxy_url"] = playwright_proxy_url
+            login_result = _login_codex_with_result(email, password, **login_kwargs)
+            bundle = login_result.get("bundle")
+            if login_result.get("ok") and bundle:
+                _attach_account_proxy_to_bundle(email, bundle, auth_proxy_url)
                 auth_file = save_auth_file(bundle)
                 update_account(email, auth_file=auth_file)
+                _auth_repair_reset(email)
                 logger.info("[%s] token 已更新", email)
                 # 重新检查额度
                 status_str, info = _check_and_refresh(find_account(load_accounts(), email))
@@ -844,15 +2572,103 @@ def cmd_check():
                         )
                         exhausted_list.append(acc)
                     else:
+                        _auth_repair_reset(email)
+                        update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
                         logger.info("[%s] 额度可用 (%d%%)", email, p_remain)
                 elif status_str == "ok":
+                    _auth_repair_reset(email)
+                    update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
                     logger.info("[%s] 额度可用", email)
                 elif status_str == "auth_error":
-                    logger.warning("[%s] 重新登录后仍无法查询额度（可能未选中 Team workspace），标记为 standby", email)
-                    update_account(email, status=STATUS_STANDBY)
+                    result = _record_auth_repair_failure(
+                        email,
+                        login_result.get("error_type") or "non_team_plan",
+                        login_result.get("error_detail") or "重新登录后仍无法查询额度",
+                    )
+                    extra = _auth_repair_result_suffix(result)
+                    logger.warning(
+                        "[%s] 重新登录后仍无法查询额度（可能未选中 Team workspace），标记为 %s%s",
+                        email,
+                        result.get("status"),
+                        extra,
+                    )
+                elif status_str == "network_error":
+                    _auth_repair_reset(email)
+                    update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
+                    logger.warning("[%s] 重新登录成功，但额度接口暂时不可达；保留 active 并等待下一轮复查", email)
             else:
-                logger.error("[%s] Codex 登录失败，标记为 standby", email)
-                update_account(email, status=STATUS_STANDBY)
+                result = _record_auth_repair_failure(
+                    email,
+                    login_result.get("error_type"),
+                    login_result.get("error_detail"),
+                )
+                extra = _auth_repair_result_suffix(result)
+                logger.error(
+                    "[%s] Codex 登录失败，标记为 %s（%s%s）",
+                    email,
+                    result.get("status"),
+                    _auth_repair_error_label(result.get("auth_last_error")),
+                    extra,
+                )
+
+    # 已 exhausted 但 5h 重置时间已过 → 复测,真的回血则 promote 回 active,避免轮转
+    # 多走一遍"kick → standby → re-invite"。token 仍在 Team 里时这个直接 promote 路径
+    # 节省一次 Playwright + remove_from_team + invite + OAuth 的开销。
+    accounts_now = load_accounts()
+    exhausted_to_probe = [
+        a
+        for a in accounts_now
+        if a.get("status") == STATUS_EXHAUSTED
+        and not _is_main_account_email(a.get("email"))
+        and a.get("auth_file")
+        and Path(a["auth_file"]).exists()
+        and a.get("quota_resets_at")
+        and time.time() >= a["quota_resets_at"]
+    ]
+    if exhausted_to_probe:
+        logger.info("[检查] 复测 %d 个重置时间已过的 exhausted 账号...", len(exhausted_to_probe))
+        for acc in exhausted_to_probe:
+            email = acc["email"]
+            try:
+                status_str, info = _check_and_refresh(acc)
+            except Exception as exc:
+                logger.warning("[%s] exhausted 复测异常,跳过: %s", email, exc)
+                continue
+            if status_str == "ok" and isinstance(info, dict):
+                p_remain = 100 - info.get("primary_pct", 0)
+                if p_remain >= threshold:
+                    update_account(
+                        email,
+                        status=STATUS_ACTIVE,
+                        last_quota=info,
+                        quota_exhausted_at=None,
+                        quota_resets_at=None,
+                        workspace_account_id=get_chatgpt_account_id() or None,
+                    )
+                    logger.info(
+                        "[%s] 5h 已重置(剩余 %d%%),从 exhausted 回血到 active",
+                        email,
+                        p_remain,
+                    )
+                else:
+                    update_account(email, last_quota=info)
+                    logger.info(
+                        "[%s] 复测后剩余 %d%% < %d%%,保留 exhausted",
+                        email,
+                        p_remain,
+                        threshold,
+                    )
+            elif status_str == "exhausted":
+                quota_info = quota_result_quota_info(info) or {}
+                new_resets = quota_result_resets_at(info) or acc.get("quota_resets_at")
+                if quota_info:
+                    update_account(email, last_quota=quota_info, quota_resets_at=new_resets)
+                logger.info("[%s] 复测后仍 exhausted,resets_at 已刷新", email)
+            elif status_str == "auth_error":
+                logger.warning("[%s] 复测时 token 失效,改标 AUTH_INVALID 等 reconcile 处理", email)
+                update_account(email, status=STATUS_AUTH_INVALID)
+            elif status_str == "network_error":
+                logger.info("[%s] 复测遇到临时网络错误,保留 exhausted,下一轮再试", email)
 
     # Personal 号独立扫描(不参与轮转,但用户需要看到额度)
     try:
@@ -860,7 +2676,134 @@ def cmd_check():
     except Exception as exc:
         logger.warning("[检查] personal 分支异常(不影响 active 结果): %s", exc)
 
+    # Standby 池额度探测(可选):修复"standby 永远无 quota 数据 → _quota_recovered 失真
+    # → fill 时盲选踩雷"的问题。限速 + 24h 去重,探到 401/403 标 STATUS_AUTH_INVALID。
+    if include_standby:
+        try:
+            _probe_standby_quota()
+        except Exception as exc:
+            logger.warning("[检查] standby 探测分支异常(不影响 active/personal 结果): %s", exc)
+
+    # Round 9 RT-3 兜底 — 即便 _reconcile_team_members 因 chatgpt_api 启动失败提前 return,
+    # 这里仍能跑一次 retroactive(走 5min cache,自起 chatgpt_api)。
+    try:
+        from autoteam.master_health import _apply_master_degraded_classification
+
+        retro = _apply_master_degraded_classification()
+        if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+            logger.info(
+                "[检查] retroactive: GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                len(retro.get("marked_grace") or []),
+                len(retro.get("marked_standby") or []),
+                len(retro.get("reverted_active") or []),
+            )
+    except Exception as exc:
+        logger.warning("[检查] retroactive helper 异常(不影响 cmd_check): %s", exc)
+
     return exhausted_list
+
+
+def _probe_standby_quota():
+    """遍历 standby 池,探测每个账号的 quota。
+
+    - 限速:每账号之间 sleep STANDBY_PROBE_INTERVAL_SEC,避免群访 OpenAI wham/usage 触发风控
+    - 去重:last_quota_check_at 在 STANDBY_PROBE_DEDUP_SEC 秒内的跳过
+    - auth_error(**仅** 401/403):标 STATUS_AUTH_INVALID,等 reconcile 处置
+    - network_error(DNS/timeout/SSL/5xx/429/JSON 解析失败/其他临时错误):
+      **不写 last_quota_check_at**(允许下一轮立刻重试),**不改 status**,只 log warning。
+      这条修复的就是"网络抖动一次,18 个号一起被误标 AUTH_INVALID 然后被 reconcile 全删"事故。
+    - exhausted:刷新 quota_exhausted_at / quota_resets_at(修正过期快照),维持 standby
+    - ok:仅写回 last_quota + last_quota_check_at,不改 status(standby 的 status 由 fill/rotate 决定)
+    - 未知 status:防御分支只 log,不写时间戳,避免去重逻辑卡住未来真正的探测
+    """
+    standby = get_standby_accounts()
+    if not standby:
+        logger.info("[检查] standby 池为空,跳过探测")
+        return
+
+    now = time.time()
+    to_probe = []
+    skipped = 0
+    no_auth = 0
+    for acc in standby:
+        auth_file = acc.get("auth_file")
+        if not auth_file or not Path(auth_file).exists():
+            no_auth += 1
+            continue
+        last_check = acc.get("last_quota_check_at") or 0
+        if last_check and (now - last_check) < STANDBY_PROBE_DEDUP_SEC:
+            skipped += 1
+            continue
+        to_probe.append(acc)
+
+    if not to_probe:
+        logger.info(
+            "[检查] standby 池共 %d 个,全部在 24h 内已探测或无 auth_file(skipped=%d,no_auth=%d),跳过",
+            len(standby),
+            skipped,
+            no_auth,
+        )
+        return
+
+    logger.info(
+        "[检查] 探测 %d 个 standby 账号的额度(总 %d,跳过 %d 近期已探测,%d 无 auth_file,间隔 %.1fs)...",
+        len(to_probe),
+        len(standby),
+        skipped,
+        no_auth,
+        STANDBY_PROBE_INTERVAL_SEC,
+    )
+
+    for idx, acc in enumerate(to_probe):
+        email = acc["email"]
+        if idx > 0:
+            time.sleep(STANDBY_PROBE_INTERVAL_SEC)
+        try:
+            status_str, info = _check_and_refresh(acc)
+        except Exception as exc:
+            logger.warning("[%s] (standby) 探测异常,跳过: %s", email, exc)
+            continue
+
+        probe_ts = time.time()
+        if status_str == "ok" and isinstance(info, dict):
+            update_account(email, last_quota=info, last_quota_check_at=probe_ts)
+            p_remain = 100 - info.get("primary_pct", 0)
+            w_remain = 100 - info.get("weekly_pct", 0)
+            logger.info("[%s] (standby) 探测成功 5h剩余 %d%% | 周剩余 %d%%", email, p_remain, w_remain)
+        elif status_str == "exhausted":
+            quota_info = quota_result_quota_info(info) or {}
+            resets_at = quota_result_resets_at(info) or int(probe_ts + 18000)
+            payload = {
+                "last_quota_check_at": probe_ts,
+                "quota_exhausted_at": probe_ts,
+                "quota_resets_at": resets_at,
+            }
+            if quota_info:
+                payload["last_quota"] = quota_info
+            update_account(email, **payload)
+            window = info.get("window") if isinstance(info, dict) else ""
+            logger.warning(
+                "[%s] (standby) %s额度仍未恢复,刷新重置时间",
+                email,
+                "周" if window == "weekly" else "5h",
+            )
+        elif status_str == "auth_error":
+            update_account(email, status=STATUS_AUTH_INVALID, last_quota_check_at=probe_ts)
+            logger.warning("[%s] (standby) auth_file 已失效(401/403),标记 %s", email, STATUS_AUTH_INVALID)
+        elif status_str == "network_error":
+            # 网络抖动 / 5xx / 429 / JSON 解析失败 — 临时性故障。
+            # 关键约束:不写 last_quota_check_at(允许下一轮立刻重试)、不改 status,只 log。
+            # 否则一次大规模网络故障会让整批 standby 号在 24h 内不再被探测,且如果以前
+            # 错误归到 auth_error 还会被批量误标 AUTH_INVALID(就是事故根因)。
+            logger.warning("[%s] (standby) 探测遇到临时网络错误,本轮跳过,不更新状态/时间戳", email)
+        elif status_str == "no_auth":
+            # 理论上入口已过滤,这里兜底:记时间戳避免下一轮重复命中
+            update_account(email, last_quota_check_at=probe_ts)
+            logger.info("[%s] (standby) auth_file 缺失,跳过", email)
+        else:
+            # 未知 status 防御分支:同样不写时间戳。如果误吃了未来新加的 status,
+            # 写 last_quota_check_at 会让账号在 24h 内不再被探测,屏蔽问题。
+            logger.warning("[%s] (standby) 未知探测结果 %s,本轮跳过,不更新时间戳", email, status_str)
 
 
 def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=3, retry_interval=3.0):
@@ -970,23 +2913,351 @@ def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=
         return "failed" if return_status else False
 
 
-def invite_to_team(chatgpt_api, email, seat_type="default"):
-    """邀请账号加入 Team。旧账号用 default，新账号用 usage_based。"""
-    status, data = chatgpt_api.invite_member(email, seat_type=seat_type)
-    if status == 200 and isinstance(data, dict):
-        errored = data.get("errored_emails", [])
-        if errored:
-            err_msg = errored[0].get("error", "unknown")
-            logger.warning("[Team] 邀请 %s 被拒绝: %s", email, err_msg)
-            # default 失败则尝试 usage_based
-            if seat_type == "default":
-                logger.info("[Team] 尝试 usage_based 方式...")
-                return invite_to_team(chatgpt_api, email, seat_type="usage_based")
+def _wait_for_remote_capacity_after_removal(
+    chatgpt_api,
+    *,
+    target: int,
+    removed_email: str,
+    timeout: int = 24,
+    poll_interval: float = 3.0,
+    stage_label: str = "[Team]",
+) -> tuple[int, bool]:
+    """Poll Team member count after a removal before creating a replacement."""
+    deadline = time.time() + max(1, int(timeout))
+    latest_count = -1
+    while time.time() < deadline:
+        latest_count = get_team_member_count(chatgpt_api)
+        if latest_count >= 0 and latest_count < target:
+            logger.info("%s 已释放 %s 的席位，当前成员 %d/%d", stage_label, removed_email, latest_count, target)
+            return latest_count, True
+        logger.info(
+            "%s 等待 %s 的远端席位释放，当前成员=%s/%d",
+            stage_label,
+            removed_email,
+            latest_count if latest_count >= 0 else "unknown",
+            target,
+        )
+        time.sleep(max(0.5, float(poll_interval)))
+    return latest_count, False
+
+
+def _get_remote_team_member(email: str | None, chatgpt_api=None) -> dict | None:
+    """Return remote Team member by email, or None when absent/unknown."""
+    email_l = _normalized_email(email)
+    if not email_l:
+        return None
+    owns_api = chatgpt_api is None
+    api = chatgpt_api or ChatGPTTeamAPI()
+    try:
+        if owns_api or not _chatgpt_session_ready(api):
+            api.start()
+        members, _invites = fetch_team_state(api)
+        for member in members:
+            if _normalized_email(member.get("email")) == email_l:
+                return member
+        return None
+    finally:
+        if owns_api:
+            try:
+                api.stop()
+            except Exception:
+                pass
+
+
+def _wait_for_email_in_team(
+    email: str | None,
+    *,
+    chatgpt_api=None,
+    timeout: int = 60,
+    stage_label: str = "[Team]",
+) -> dict | None:
+    target = _normalized_email(email)
+    if not target:
+        return None
+
+    deadline = time.time() + max(1, int(timeout))
+    last_member_count = -1
+    while time.time() < deadline:
+        member = _get_remote_team_member(target, chatgpt_api=chatgpt_api)
+        if member:
+            logger.info("%s 远端已确认 Team 成员: %s", stage_label, target)
+            return member
+
+        try:
+            if chatgpt_api is not None and _chatgpt_session_ready(chatgpt_api):
+                members, _invites = fetch_team_state(chatgpt_api)
+                last_member_count = len(members)
+        except Exception:
+            pass
+        logger.info("%s 等待远端成员出现: %s（当前成员数=%s）", stage_label, target, last_member_count)
+        time.sleep(3)
+
+    logger.warning("%s 超时仍未在远端 Team 成员列表看到: %s", stage_label, target)
+    return None
+
+
+def _remote_team_occupancy(chatgpt_api) -> tuple[int, int, int]:
+    members, invites = fetch_team_state(chatgpt_api)
+    return len(members), len(invites), len(members) + len(invites)
+
+
+def _has_remote_capacity_for_new_seat(chatgpt_api, *, stage_label: str = "[Team]") -> bool:
+    members_count, invites_count, occupancy = _remote_team_occupancy(chatgpt_api)
+    logger.info(
+        "%s 远端席位占用: members=%d invites=%d total=%d/%d",
+        stage_label,
+        members_count,
+        invites_count,
+        occupancy,
+        TEAM_SEATS_MAX,
+    )
+    if occupancy >= TEAM_SEATS_MAX:
+        logger.warning(
+            "%s 远端席位已满或有 pending invite 占位，停止添加新账号，避免超过 %d 人",
+            stage_label,
+            TEAM_SEATS_MAX,
+        )
+        return False
+    return True
+
+
+def _prepare_remote_capacity_for_new_seat(chatgpt_api, *, stage_label: str = "[创建]") -> bool:
+    if chatgpt_api is None:
+        return True
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+    if not _chatgpt_session_ready(chatgpt_api):
+        logger.warning("%s 无可用 Team API session，跳过远端席位预检", stage_label)
+        return True
+    if _has_remote_capacity_for_new_seat(chatgpt_api, stage_label=stage_label):
+        return True
+    _cancel_stale_pending_invites_for_capacity(chatgpt_api, stage_label=stage_label)
+    return _has_remote_capacity_for_new_seat(chatgpt_api, stage_label=stage_label)
+
+
+def _pending_invite_id(invite: dict | None):
+    if not isinstance(invite, dict):
+        return None
+    for key in ("id", "invite_id", "account_invite_id"):
+        value = invite.get(key)
+        if value:
+            return value
+    return None
+
+
+def _email_matches_current_mail_domain(email: str | None) -> bool:
+    email = _normalized_email(email)
+    domains = _configured_mail_domains()
+    return bool(email and domains and email.rsplit("@", 1)[-1] in domains)
+
+
+def _can_cancel_pending_invite(email: str, acc: dict | None) -> tuple[bool, str]:
+    if not email:
+        return False, "missing_email"
+    if _is_main_account_email(email):
+        return False, "main_account"
+    if acc and _has_auth_file(acc):
+        return False, "local_auth_protected"
+    if _find_team_auth_file(email) is not None:
+        return False, "auth_file_protected"
+    if acc:
+        return True, "local_managed_pending"
+    if _email_matches_current_mail_domain(email):
+        return True, "managed_domain_pending"
+    return False, "external_or_manual_pending"
+
+
+def _wait_for_pending_invite_absent(chatgpt_api, email: str, *, timeout: int = 30) -> bool:
+    target = _normalized_email(email)
+    deadline = time.time() + max(1, int(timeout))
+    while time.time() < deadline:
+        try:
+            _members, invites = fetch_team_state(chatgpt_api)
+            if not any(team_invite_email(invite) == target for invite in invites):
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def _cancel_stale_pending_invites_for_capacity(chatgpt_api, *, stage_label: str = "[Team]", mail_client=None) -> list[str]:
+    """Free capacity by cancelling stale AutoTeam-owned pending invites only."""
+    members, invites = fetch_team_state(chatgpt_api)
+    occupancy = len(members) + len(invites)
+    if occupancy < TEAM_SEATS_MAX or not invites:
+        return []
+
+    accounts = load_accounts()
+    accounts_by_email = {
+        _normalized_email(acc.get("email")): acc
+        for acc in accounts
+        if _normalized_email(acc.get("email"))
+    }
+    account_id = get_chatgpt_account_id()
+    cancelled: list[str] = []
+
+    logger.info(
+        "%s 远端席位满占用且存在 pending invite，尝试取消 AutoTeam 遗留邀请: members=%d invites=%d total=%d/%d",
+        stage_label,
+        len(members),
+        len(invites),
+        occupancy,
+        TEAM_SEATS_MAX,
+    )
+
+    for invite in invites:
+        email = team_invite_email(invite)
+        invite_id = _pending_invite_id(invite)
+        acc = accounts_by_email.get(email)
+        can_cancel, reason = _can_cancel_pending_invite(email, acc)
+        if not can_cancel:
+            logger.warning("%s 保留 pending invite: %s（%s）", stage_label, email or "unknown", reason)
+            continue
+        if not invite_id:
+            logger.warning("%s 无法取消 pending invite: %s（缺少 invite id）", stage_label, email)
+            continue
+
+        result = delete_team_invite(chatgpt_api, account_id, invite, invite_id=invite_id, email=email)
+        if result.get("status") not in (200, 204):
+            logger.warning("%s 取消 pending invite 失败: %s HTTP %s", stage_label, email, result.get("status"))
+            continue
+
+        cancelled.append(email)
+        logger.info("%s 已取消 stale pending invite: %s", stage_label, email)
+        if not _wait_for_pending_invite_absent(chatgpt_api, email):
+            logger.warning("%s pending invite 已提交取消但远端仍暂未消失: %s", stage_label, email)
+
+        if acc:
+            try:
+                delete_managed_account(
+                    email,
+                    remove_remote=False,
+                    remove_cloudmail=True,
+                    sync_cpa_after=False,
+                    chatgpt_api=chatgpt_api,
+                    mail_client=mail_client,
+                )
+            except Exception as exc:
+                logger.warning("%s 清理 pending invite 本地账号失败: %s (%s)", stage_label, email, exc)
+                try:
+                    _discard_auth_repair_failed_account_record(
+                        email,
+                        "stale_pending_invite_cancelled",
+                        status=STATUS_STANDBY,
+                    )
+                except Exception:
+                    pass
+
+        if len(members) + len(invites) - len(cancelled) < TEAM_SEATS_MAX:
+            break
+
+    if cancelled:
+        logger.info("%s 已释放 %d 个 pending invite 占位，下一步可创建新号", stage_label, len(cancelled))
+    return cancelled
+
+
+def _validate_managed_account_operational(
+    email: str,
+    *,
+    threshold: int,
+    stage_label: str = "[轮转验收]",
+    chatgpt_api=None,
+) -> bool:
+    """Validate a newly managed child is remotely present and has usable Codex auth/quota."""
+    acc = find_account(load_accounts(), email)
+    if not acc:
+        logger.warning("%s %s 本地账号不存在", stage_label, email)
+        return False
+    if is_account_disabled(acc):
+        logger.warning("%s %s 已禁用，不能计入可用 child", stage_label, email)
+        return False
+    if acc.get("status") != STATUS_ACTIVE:
+        logger.warning("%s %s status=%s，不能计入可用 child", stage_label, email, acc.get("status"))
+        return False
+    if not _has_auth_file(acc):
+        logger.warning("%s %s 缺少可用 auth_file", stage_label, email)
+        return False
+
+    if chatgpt_api is not None:
+        try:
+            member = _get_remote_team_member(email, chatgpt_api=chatgpt_api)
+        except Exception as exc:
+            logger.warning("%s 查询远端成员失败: %s (%s)", stage_label, email, exc)
+            member = None
+        if not member:
+            logger.warning("%s %s 未出现在远端 Team 成员列表", stage_label, email)
             return False
-    return status == 200
+
+    try:
+        auth_data = json.loads(read_text(Path(acc["auth_file"])))
+        access_token = auth_data.get("access_token")
+        if not access_token:
+            logger.warning("%s %s auth_file 缺少 access_token", stage_label, email)
+            return False
+        status_str, info = check_codex_quota(access_token)
+    except Exception as exc:
+        logger.warning("%s %s quota 验证异常: %s", stage_label, email, exc)
+        return False
+
+    if status_str != "ok" or not isinstance(info, dict):
+        logger.warning("%s %s quota 验证失败: %s", stage_label, email, status_str)
+        return False
+    primary_remaining = 100 - int(info.get("primary_pct", 100) or 100)
+    if primary_remaining < int(threshold):
+        logger.warning("%s %s quota 剩余 %d%% < %d%%", stage_label, email, primary_remaining, threshold)
+        return False
+    update_account(email, last_quota=info, last_active_at=time.time())
+    logger.info("%s %s 运行态验收通过，5h 剩余 %d%%", stage_label, email, primary_remaining)
+    return True
 
 
-def _run_post_register_oauth(email, password, mail_client, leave_workspace=False, out_outcome=None):
+def _kick_team_seat_after_oauth_failure(email: str, *, reason: str) -> None:
+    """OAuth 失败时同步 KICK ws,消除"workspace 有 + 本地 auth 缺失"残废延迟。
+
+    Round 11 — 之前 OAuth 失败只标本地 status=AUTH_INVALID,workspace 中的 Team 席位
+    要等 reconcile 5min 后异步清理。本 helper 在每个失败位点同步 KICK,把延迟降到 0。
+
+    Args:
+        email: 失败子号 email
+        reason: 失败原因短文案(如 "register_blocked_phone" / "plan_unsupported" /
+                "bundle_missing"),写进 log 让事后排查能定位失败位点。
+
+    异常处理:任何异常吞掉只 logger.warning(reconcile 兜底),不让 KICK 失败传播到
+    OAuth 失败处理流(避免 update_account 之后的状态不一致)。
+    """
+    try:
+        cleanup_api = ChatGPTTeamAPI()
+        try:
+            cleanup_api.start()
+            kick_status = remove_from_team(cleanup_api, email, return_status=True)
+            logger.info(
+                "[注册] OAuth 失败(%s) → kick Team 残留席位 %s status=%s",
+                reason, email, kick_status,
+            )
+        finally:
+            try:
+                cleanup_api.stop()
+            except Exception:
+                pass
+    except Exception as kick_exc:
+        logger.warning(
+            "[注册] OAuth 失败(%s) 后 kick %s 抛异常(留给下次对账): %s",
+            reason, email, kick_exc,
+        )
+
+
+def _run_post_register_oauth(
+    email,
+    password,
+    mail_client,
+    leave_workspace=False,
+    out_outcome=None,
+    chatgpt_session_token=None,
+    signup_profile: SignupProfile | None = None,
+    auth_proxy_url: str | None = None,
+    playwright_proxy_url: str | None = None,
+):
     """
     注册（加入 Team）成功后统一的收尾流程：
     - leave_workspace=False: 直接跑 Team 模式 Codex OAuth，状态置为 ACTIVE
@@ -994,6 +3265,9 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
 
     返回 email 表示账号已入账号池；None 表示流程失败。
     out_outcome: 可选 dict，函数内会写入 `{status, email, reason, ...}` 供上游统计/汇总。
+    chatgpt_session_token: 注册阶段从 chatgpt.com 抽出的 __Secure-next-auth.session-token,
+                           personal OAuth 时注入到 auth.openai.com 跳过 /log-in 卡死。
+    signup_profile: 注册阶段填写过的身份快照；OAuth about-you 必须复用同一份快照。
     """
 
     def _record_outcome(status, **extra):
@@ -1002,6 +3276,50 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
             out_outcome.update(status=status, email=email, **extra)
 
     if leave_workspace:
+        # Round 8 — SPEC-2 v1.5 §3.7 + shared/master-subscription-health.md M-T1:
+        # personal OAuth 入口先验证母号订阅健康度。母号 cancel 时 personal 子号必拿 plan_type=team,
+        # 跑完 OAuth 也只是积累一条 plan_drift,所以 fail-fast 不进 OAuth。
+        try:
+            from autoteam.master_health import is_master_subscription_healthy
+            temp_probe_api = ChatGPTTeamAPI()
+            try:
+                temp_probe_api.start()
+                healthy, master_reason, master_evidence = is_master_subscription_healthy(temp_probe_api)
+            finally:
+                try:
+                    temp_probe_api.stop()
+                except Exception:
+                    pass
+        except Exception as probe_exc:
+            logger.warning("[注册] master health probe 异常 %s,按既有逻辑放行", probe_exc)
+            healthy, master_reason, master_evidence = True, "active", {"detail": str(probe_exc)[:200]}
+
+        if not healthy and master_reason == "subscription_cancelled":
+            logger.error(
+                "[注册] master 母号订阅已取消(eligible_for_auto_reactivation=true),fail-fast 不进 personal OAuth: %s",
+                email,
+            )
+            record_failure(
+                email, MASTER_SUBSCRIPTION_DEGRADED,
+                "master subscription cancelled,personal OAuth 必拿 plan_type=team",
+                stage="run_post_register_oauth_personal_precheck",
+                master_account_id=master_evidence.get("account_id"),
+                master_role=master_evidence.get("current_user_role"),
+            )
+            update_account(email, status=STATUS_STANDBY)
+            _record_outcome("master_degraded", reason="master subscription cancelled")
+            return None
+        if not healthy and master_reason in ("network_error", "auth_invalid"):
+            logger.warning(
+                "[注册] master health probe 不确定 (%s),按既有逻辑放行,失败由 plan_drift 兜底",
+                master_reason,
+            )
+        elif not healthy and master_reason in ("workspace_missing", "role_not_owner"):
+            logger.warning(
+                "[注册] master 异常 (%s, role=%s),仍尝试 personal OAuth,reconcile 后续接管",
+                master_reason, master_evidence.get("current_user_role"),
+            )
+
         # 退出 Team 必须用主号权限，临时起一个 ChatGPTTeamAPI 实例完成 DELETE
         logger.info("[注册] leave_workspace=True，先将 %s 从 Team 中移出...", email)
         temp_api = ChatGPTTeamAPI()
@@ -1022,89 +3340,558 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
             _record_outcome("kick_failed", reason=f"主号踢出失败 status={remove_status}")
             return None
 
-        # kick 成功后必须等 OpenAI 后端同步:DELETE /users 返回 2xx 不代表 auth.openai.com
-        # 立刻把 default workspace 从 Team 切回 Personal。如果此时立刻开 OAuth,auth 会
-        # 继续把 Team 当 default 颁发 team plan 的 token,拿到的 bundle 会被 plan_type 校
-        # 验拒收(codex_auth.py login_codex_via_browser 末尾)→ 整个账号 oauth_failed,白跑
-        # 2 分钟。等 8s 足够让 workspace default 切换生效,同时也不会让用户觉得慢
-        if remove_status == "removed":
-            logger.info("[注册] kick 成功,等 8s 让 OpenAI workspace default 同步后再 OAuth...")
-            time.sleep(8)
+        # Round 8 — SPEC-2 v1.5 §3.4.5 + shared/oauth-workspace-selection.md §4.3:
+        # 删除原 time.sleep(8)。kick 成功不等同于 auth.openai.com 把 default_workspace_id 从
+        # Team 切回 Personal — research/sticky-rejoin §1.2-1.3 实测 default 不会自动 unset。
+        # sticky 根因是 default 没切,等多久都没用。改用 oauth_workspace.ensure_personal_workspace_selected
+        # 在 OAuth 内主动 POST /api/accounts/workspace/select 切到 personal,5 次外层重试触发后端最终一致性。
 
-        bundle = login_codex_via_browser(email, password, mail_client=mail_client, use_personal=True)
-        if bundle:
-            auth_file = save_auth_file(bundle)
-            update_account(
-                email,
-                status=STATUS_PERSONAL,
-                auth_file=auth_file,
-                last_active_at=time.time(),
+        # Round 8 — 5 次 personal OAuth 重试外层(spec §3.4 退避表 ±20% jitter)
+        # 触发条件:bundle.plan_type != "free" 但 workspace/select 主路径成功 →
+        #   后端最终一致性短暂滞后,重试可触发刷新(openai/codex#1977 ejntaylor 实证)
+        import random as _random
+
+        from autoteam.register_failures import (
+            OAUTH_PLAN_DRIFT_PERSISTENT as _OAUTH_PLAN_DRIFT_PERSISTENT,
+        )
+        bundle = None
+        max_retries = 5
+        retry_backoff = (0, 5, 10, 20, 30)
+        plan_drift_history = []  # 收集每次拿到的非-free plan_type,fail-fast 时一起 record_failure
+
+        for attempt in range(max_retries):
+            if attempt > 0:
+                base_delay = retry_backoff[attempt] if attempt < len(retry_backoff) else 30
+                jitter = base_delay * _random.uniform(-0.2, 0.2)
+                sleep_secs = max(0, base_delay + jitter)
+                logger.info(
+                    "[注册] personal OAuth 第 %d/%d 次重试,先退避 %.1fs",
+                    attempt + 1, max_retries, sleep_secs,
+                )
+                if sleep_secs > 0:
+                    time.sleep(sleep_secs)
+
+            # SPEC-2 §3.1.3 — personal 分支 catch RegisterBlocked + plan_supported 检查
+            # Round 11 四轮 — 把注册阶段的 chatgpt.com session_token 透给 OAuth,
+            # 让 login_codex_via_browser 注入 auth.openai.com cookie,跳过 /log-in 表单
+            # (实测刚踢出 Team 的新号在 /log-in 页 Continue 按钮变灰禁用,无法登录)。
+            try:
+                bundle = _login_codex_via_browser_with_proxy(
+                    email,
+                    password,
+                    mail_client=mail_client,
+                    use_personal=True,
+                    chatgpt_session_token=chatgpt_session_token,
+                    signup_profile=signup_profile,
+                    playwright_proxy_url=playwright_proxy_url,
+                )
+            except RegisterBlocked as blocked:
+                # add-phone / duplicate 等异常是 terminal,不重试
+                if blocked.is_phone:
+                    logger.error(
+                        "[注册] %s personal OAuth 触发 add-phone (step=%s),从账号池删除",
+                        email, blocked.step,
+                    )
+                    record_failure(
+                        email,
+                        "oauth_phone_blocked",
+                        f"personal OAuth 阶段触发 add-phone (step={blocked.step})",
+                        step=blocked.step,
+                        stage="run_post_register_oauth_personal",
+                        attempt=attempt + 1,
+                    )
+                    delete_account(email)
+                    _record_outcome("oauth_phone_blocked", reason="personal OAuth 触发 add-phone")
+                    return None
+                logger.error("[注册] %s personal OAuth RegisterBlocked: %s", email, blocked.reason)
+                record_failure(
+                    email, "exception",
+                    f"personal OAuth RegisterBlocked: {blocked.reason}",
+                    stage="run_post_register_oauth_personal",
+                    attempt=attempt + 1,
+                )
+                delete_account(email)
+                _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
+                return None
+
+            if not bundle:
+                # Round 11 hotfix — bundle=None 可能原因:
+                # 1. workspace_select 完全失败(auth_code 缺失)— codex_auth.py:1023-1025
+                # 2. plan_type != free 被 codex_auth 拒收 — codex_auth.py:1037-1045
+                # 两种都属于后端最终一致性滞后,W-I9 spec 要求外层 5 次重试,而非 break。
+                # 旧实现 break 在第 1 次 bundle=None 时直接放弃 → 实测发现:codex_auth 拒收 plan=team
+                # 的 bundle 时(第 1 batch)永远没机会触发"5 次重试触发后端最终一致性"。
+                logger.warning(
+                    "[注册] %s personal OAuth 第 %d/%d 次未返回 bundle,继续重试(等后端最终一致性同步)",
+                    email, attempt + 1, max_retries,
+                )
+                plan_drift_history.append({
+                    "attempt": attempt + 1,
+                    "plan_type": "unknown",
+                    "plan_type_raw": None,
+                    "account_id": None,
+                    "reason": "bundle_none",  # 区分 plan_drift 和 bundle_none
+                })
+                continue
+
+            bundle_plan = (bundle.get("plan_type") or "").lower()
+            if bundle_plan == "free":
+                # 拿到 free,直接出循环走后续 plan_supported / quota probe / save_auth_file
+                logger.info("[注册] %s 第 %d 次 personal OAuth 拿到 plan=free,出重试循环",
+                            email, attempt + 1)
+                break
+
+            # plan_type != free → 后端最终一致性滞后,记一笔继续重试
+            plan_drift_history.append({
+                "attempt": attempt + 1,
+                "plan_type": bundle_plan,
+                "plan_type_raw": bundle.get("plan_type_raw"),
+                "account_id": bundle.get("account_id"),
+            })
+            logger.warning(
+                "[注册] %s 第 %d/%d 次 personal OAuth 拿到 plan=%s(非 free),继续重试",
+                email, attempt + 1, max_retries, bundle_plan,
             )
-            logger.info("[注册] 免费号就绪: %s (plan=%s)", email, bundle.get("plan_type"))
-            _record_outcome("success", plan=bundle.get("plan_type"))
-            return email
+            bundle = None  # 清掉这次的 bundle,不让 fall-through 误用
 
-        # personal OAuth 失败 — 不留僵尸 PERSONAL 记录：直接从 accounts.json 删除，失败明细写 register_failures.json
-        # 用户能在失败日志里看到发生了什么（哪个 email / 是什么阶段 / 什么时候），账号列表保持干净
-        logger.error(
-            "[注册] %s 已退出 Team 但 personal Codex OAuth 未返回认证 bundle，从账号池删除",
-            email,
-        )
-        delete_account(email)
-        record_failure(
-            email,
-            "oauth_failed",
-            "已退出 Team 但 personal Codex OAuth 登录未返回 bundle",
-            stage="post_leave_workspace",
-        )
-        _record_outcome("oauth_failed", reason="personal Codex OAuth 未返回 bundle")
-        return None
+        # 退出循环:bundle 要么 None(所有 attempt 都 abort 或 plan_drift),要么 plan==free
+        if not bundle:
+            logger.error(
+                "[注册] %s 5 次 personal OAuth 后仍未拿到 plan=free,fail-fast 删除账号",
+                email,
+            )
+            record_failure(
+                email, _OAUTH_PLAN_DRIFT_PERSISTENT,
+                f"5 次 personal OAuth 后 plan_type 仍非 free (drift_history={len(plan_drift_history)} 条)",
+                stage="run_post_register_oauth_personal",
+                attempts=max_retries,
+                drift_history=plan_drift_history,
+            )
+            delete_account(email)
+            _record_outcome("oauth_failed", reason="5 次 personal OAuth plan_drift 持续")
+            return None
 
-    # 原有 Team 流程
-    bundle = login_codex_via_browser(email, password, mail_client=mail_client)
-    if bundle:
+        # bundle.plan_type=="free" 已在循环内验证,此处仍走完整白名单 + quota 流程保留对称
+        # SPEC-2 shared/plan-type-whitelist §5.2 — plan_supported=False 直接拒,personal 已 leave_workspace 本地无价值
+        plan_supported = bundle.get(
+            "plan_supported", is_supported_plan(bundle.get("plan_type", ""))
+        )
+        if not plan_supported:
+            logger.error(
+                "[注册] %s personal OAuth 拿到 plan_type=%s 不在白名单,从账号池删除",
+                email, bundle.get("plan_type_raw") or bundle.get("plan_type"),
+            )
+            record_failure(
+                email, "plan_unsupported",
+                f"personal OAuth bundle plan_type={bundle.get('plan_type_raw')} 不在白名单",
+                plan_type=bundle.get("plan_type"),
+                plan_type_raw=bundle.get("plan_type_raw"),
+                stage="run_post_register_oauth_personal",
+            )
+            delete_account(email)
+            _record_outcome("plan_unsupported", plan=bundle.get("plan_type"))
+            return None
+
+        _attach_account_proxy_to_bundle(email, bundle, auth_proxy_url)
         auth_file = save_auth_file(bundle)
-        update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
-        logger.info("[注册] 账号就绪: %s", email)
+        update_fields = {
+            "status": STATUS_PERSONAL,
+            "seat_type": "codex",
+            "auth_file": auth_file,
+            "last_active_at": time.time(),
+            "plan_type_raw": bundle.get("plan_type_raw"),
+        }
+        # Round 11 V8 — codex_auth.login_codex_via_browser 拿到的 personal_workspace_id
+        # 透传到 accounts.json,下次 OAuth 复用(避免重复 fetch)。
+        if bundle.get("personal_workspace_id"):
+            update_fields["personal_workspace_id"] = bundle["personal_workspace_id"]
+        # SPEC-2 FR-D3 — personal 分支也 quota probe(对称设计):free plan 也可能"未分配 codex 配额"
+        access_token = bundle.get("access_token")
+        if access_token:
+            try:
+                quota_status, quota_info = check_codex_quota(access_token, account_id=bundle.get("account_id"))
+                if quota_status == "ok" and isinstance(quota_info, dict):
+                    update_fields["last_quota"] = quota_info
+                elif quota_status == "no_quota":
+                    # personal free 无配额 — 记一笔但仍保留 PERSONAL,让用户决定删不删
+                    record_failure(
+                        email, "no_quota_assigned",
+                        "personal free plan 无 codex 配额",
+                        stage="run_post_register_oauth_personal",
+                        raw_rate_limit=_extract_raw_rate_limit_str(quota_info),
+                    )
+            except Exception as exc:
+                record_failure(
+                    email, "quota_probe_network_error",
+                    f"personal quota probe exception: {exc}",
+                    stage="run_post_register_oauth_personal",
+                )
+        # personal 分支:已主动退出 Team,bundle 是个人 free/plus plan,算 codex 席位
+        update_account(email, **update_fields)
+        if update_fields["status"] == STATUS_ACTIVE:
+            _sync_ready_credential_to_targets(email, auth_file, stage_label="[注册]")
+        logger.info("[注册] 免费号就绪: %s (plan=%s, attempts=%d)",
+                    email, bundle.get("plan_type"), len(plan_drift_history) + 1)
         _record_outcome("success", plan=bundle.get("plan_type"))
         return email
-    # 部分成功：账号已入 Team(席位被占用)但 auth_file 缺失,需要用户手动"补登录"。
-    # 上游 cmd_fill 依 `if email: produced+=1` 按席位计数,所以这里仍返回 email;
-    # outcome 打 team_auth_missing 让汇总能显示"这批里有 X 个需要补登录"。
-    update_account(email, status=STATUS_ACTIVE)
-    logger.warning("[注册] 账号已加入 Team 但 Codex 登录失败,需要补登录: %s", email)
+
+    # Round 8 — SPEC-2 v1.5 §3.7 表第 2 行 + shared/master-subscription-health.md M-T2:
+    # Team 分支也需对称 master probe。母号 cancel 时 Team invite 同样必拿 plan_type=free,
+    # 跑完 OAuth 只是堆 plan_drift(实测已观测 28 条)。fail-fast 不进 OAuth 节省 2 分钟。
+    # 与 personal 分支差异:Team 已成功 invite,席位占着 → 标 AUTH_INVALID + 主动 kick 释放席位
+    # (不能 delete_account,席位还在 Team)。
+    try:
+        from autoteam.master_health import is_master_subscription_healthy
+        team_probe_api = ChatGPTTeamAPI()
+        try:
+            team_probe_api.start()
+            t_healthy, t_master_reason, t_master_evidence = is_master_subscription_healthy(team_probe_api)
+        finally:
+            try:
+                team_probe_api.stop()
+            except Exception:
+                pass
+    except Exception as probe_exc:
+        logger.warning("[注册] Team master health probe 异常 %s,按既有逻辑放行", probe_exc)
+        t_healthy, t_master_reason, t_master_evidence = True, "active", {"detail": str(probe_exc)[:200]}
+
+    if not t_healthy and t_master_reason == "subscription_cancelled":
+        logger.error(
+            "[注册] master 母号订阅已取消(eligible_for_auto_reactivation=true),fail-fast 不进 Team OAuth: %s",
+            email,
+        )
+        record_failure(
+            email, MASTER_SUBSCRIPTION_DEGRADED,
+            "master subscription cancelled,Team OAuth 必拿 plan_type=free",
+            stage="run_post_register_oauth_team_precheck",
+            master_account_id=t_master_evidence.get("account_id"),
+            master_role=t_master_evidence.get("current_user_role"),
+        )
+        # Team 已 invite,不能 delete_account → 标 AUTH_INVALID + 主动 kick 释放席位
+        # (避免 28 条 plan_drift 子号长期占着 Team 名额)
+        update_account(
+            email,
+            status=STATUS_AUTH_INVALID,
+            workspace_account_id=get_chatgpt_account_id() or None,
+        )
+        _kick_team_seat_after_oauth_failure(email, reason="master_degraded")
+        _record_outcome("master_degraded", reason="master subscription cancelled (Team)")
+        return None
+
+    # 原有 Team 流程 — SPEC-2 §3.1.2 改造:catch RegisterBlocked + plan_supported 检查 + quota probe
+    try:
+        bundle = _login_codex_via_browser_with_proxy(
+            email,
+            password,
+            mail_client=mail_client,
+            signup_profile=signup_profile,
+            playwright_proxy_url=playwright_proxy_url,
+        )
+    except RegisterBlocked as blocked:
+        if blocked.is_phone:
+            logger.error(
+                "[注册] %s Team OAuth 触发 add-phone (step=%s),账号已入 Team 席位标 AUTH_INVALID 待 reconcile",
+                email, blocked.step,
+            )
+            record_failure(
+                email, "oauth_phone_blocked",
+                f"Team OAuth 阶段触发 add-phone (step={blocked.step})",
+                step=blocked.step,
+                stage="run_post_register_oauth_team",
+            )
+            # Team 模式下账号已成功 invite,不能 delete_account(席位仍占着);标 AUTH_INVALID 让 reconcile 接管
+            update_account(
+                email,
+                status=STATUS_AUTH_INVALID,
+                workspace_account_id=get_chatgpt_account_id() or None,
+            )
+            _kick_team_seat_after_oauth_failure(email, reason="register_blocked_phone")
+            _record_outcome("oauth_phone_blocked", reason="OAuth 阶段触发 add-phone")
+            return None
+        record_failure(email, "exception", f"Team OAuth RegisterBlocked: {blocked.reason}",
+                       stage="run_post_register_oauth_team")
+        update_account(email, status=STATUS_AUTH_INVALID,
+                       workspace_account_id=get_chatgpt_account_id() or None)
+        _kick_team_seat_after_oauth_failure(email, reason="register_blocked_unexpected")
+        _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
+        return None
+
+    if bundle:
+        # SPEC-2 shared/plan-type-whitelist §5 — plan_supported=False:account 已入 Team 但无法用,
+        # 标 AUTH_INVALID + 保留 auth_file 供调试,reconcile 会按 auth_invalid 流程接管
+        plan_supported = bundle.get(
+            "plan_supported", is_supported_plan(bundle.get("plan_type", ""))
+        )
+        auth_file = save_auth_file(bundle)
+        bundle_plan = bundle.get("plan_type", "unknown")  # 已被 _exchange_auth_code 归一化为小写
+
+        if not plan_supported:
+            logger.error(
+                "[注册] %s Team OAuth 拿到 plan_type=%s 不在白名单 → AUTH_INVALID",
+                email, bundle.get("plan_type_raw") or bundle_plan,
+            )
+            record_failure(
+                email, "plan_unsupported",
+                f"Team OAuth bundle plan_type={bundle.get('plan_type_raw')} 不在白名单",
+                plan_type=bundle_plan,
+                plan_type_raw=bundle.get("plan_type_raw"),
+                stage="run_post_register_oauth_team",
+            )
+            update_account(
+                email,
+                status=STATUS_AUTH_INVALID,
+                seat_type="codex",
+                auth_file=auth_file,
+                plan_type_raw=bundle.get("plan_type_raw"),
+                workspace_account_id=get_chatgpt_account_id() or None,
+            )
+            _kick_team_seat_after_oauth_failure(email, reason="plan_unsupported")
+            _record_outcome("plan_unsupported", plan=bundle_plan)
+            return None
+
+        # SPEC-2 FR-D1~D4 — quota probe(与 manual_account._finalize_account 对称)
+        seat_label = "chatgpt" if bundle_plan == "team" else "codex"
+        access_token = bundle.get("access_token")
+        account_id = bundle.get("account_id")
+        update_fields = {
+            "status": STATUS_ACTIVE,
+            "seat_type": seat_label,
+            "auth_file": auth_file,
+            "last_active_at": time.time(),
+            "workspace_account_id": get_chatgpt_account_id() or None,
+            "plan_type_raw": bundle.get("plan_type_raw"),
+        }
+
+        if access_token:
+            try:
+                quota_status, quota_info = check_codex_quota(access_token, account_id=account_id)
+            except Exception as exc:
+                # SPEC-2 FR-D4: probe 异常吞,降级 ACTIVE 但记一笔
+                record_failure(email, "quota_probe_network_error",
+                               f"quota probe exception: {exc}",
+                               stage="run_post_register_oauth_team")
+                quota_status, quota_info = "network_error", None
+
+            if quota_status == "ok" and isinstance(quota_info, dict):
+                update_fields["last_quota"] = quota_info
+            elif quota_status == "exhausted":
+                snapshot = quota_info.get("quota_info") if isinstance(quota_info, dict) else None
+                if snapshot:
+                    update_fields["last_quota"] = snapshot
+                update_fields["status"] = STATUS_EXHAUSTED
+                update_fields["quota_exhausted_at"] = time.time()
+                update_fields["quota_resets_at"] = (
+                    quota_info.get("resets_at") if isinstance(quota_info, dict) else int(time.time() + 18000)
+                )
+            elif quota_status == "no_quota":
+                snapshot = quota_info.get("quota_info") if isinstance(quota_info, dict) else None
+                if snapshot:
+                    update_fields["last_quota"] = snapshot
+                update_fields["status"] = STATUS_AUTH_INVALID
+                record_failure(email, "no_quota_assigned",
+                               "wham/usage 返回 no_quota(workspace 未分配 codex 配额)",
+                               plan_type=bundle_plan,
+                               stage="run_post_register_oauth_team",
+                               raw_rate_limit=_extract_raw_rate_limit_str(quota_info))
+            elif quota_status == "auth_error":
+                update_fields["status"] = STATUS_AUTH_INVALID
+                record_failure(email, "auth_error_at_oauth",
+                               "wham/usage 返回 401/403,token 失效",
+                               stage="run_post_register_oauth_team")
+            elif quota_status == "network_error":
+                # 保留 ACTIVE,等下轮 cmd_check 校准
+                record_failure(email, "quota_probe_network_error",
+                               "wham/usage 网络异常,ACTIVE 状态由下轮 cmd_check 校准",
+                               stage="run_post_register_oauth_team")
+
+        update_account(email, **update_fields)
+        if update_fields["status"] == STATUS_ACTIVE:
+            _sync_ready_credential_to_targets(email, auth_file, stage_label="[注册]")
+        if update_fields["status"] == STATUS_ACTIVE:
+            logger.info("[注册] 账号就绪: %s (seat=%s)", email, seat_label)
+            _record_outcome("success", plan=bundle_plan)
+            return email
+        else:
+            logger.warning("[注册] %s 入池但状态=%s,需要后续处理", email, update_fields["status"])
+            _record_outcome("quota_issue", plan=bundle_plan, status=update_fields["status"])
+            return None
+
+    # Round 11 — OAuth bundle 缺失分支,与同函数其他失败路径保持 status 一致(都是 AUTH_INVALID)。
+    # 之前误用 STATUS_ACTIVE 让 auth_file 缺失的"半残账号"被 active 计数器忽略(api.py:_auto_check_loop
+    # 过滤 auth_file 存在),导致 cmd_rotate 每 30 分钟重复触发 fill 累积僵尸账号。
+    # 改 STATUS_AUTH_INVALID 后 reconcile 会按 auth_invalid 接管(KICK Team workspace + 清本地)。
+    # Registration success is not enough: callers must see failure when the
+    # account has no ready Codex credential bundle, otherwise fill/rotate can
+    # count a half-registered Team seat as usable.
+    update_account(email, status=STATUS_AUTH_INVALID, workspace_account_id=get_chatgpt_account_id() or None)
+    _kick_team_seat_after_oauth_failure(email, reason="bundle_missing")
+    logger.warning("[注册] 账号已加入 Team 但 Codex 登录失败,标 AUTH_INVALID 待 reconcile: %s", email)
     _record_outcome("team_auth_missing", reason="已入 Team 席位但 Codex OAuth 未返回 bundle,需要补登录")
-    return email
+    return None
 
 
-def _complete_registration(email, password, invite_link, mail_client, *, leave_workspace=False, out_outcome=None):
-    """完成注册 + Codex 登录（从已有邀请链接继续）。out_outcome 透传给 _run_post_register_oauth。"""
-    from playwright.sync_api import sync_playwright
+def _get_mail_client_for_account(acc):
+    """模块级 mail client 路由(Round 12 S4):按账号字段返回合适的 mail provider。
 
+    与 `cmd_rotate.ensure_account_mail` 等价,但**无 cache**(每次调用都构造新实例),
+    供 `_complete_registration` / `create_account_direct` / `create_new_account` 等
+    入口在没有外部 mail_client 时使用。
+
+    路由优先级(Round 12 wire-up M4 — 现在真正读 acc 字段了):
+      1. acc.mail_provider 显式指定 → 用 mail._resolve_provider_factory(name) 构造单 provider
+         (绕开 MAIL_PROVIDER_CHAIN 的 fallback dispatch,保证账号锁定到原 provider)
+      2. 否则走 get_mail_client() 默认(MAIL_PROVIDER_CHAIN 优先,然后 MAIL_PROVIDER)
+
+    无 acc 或 acc 无 mail_provider 字段 → 等价于直接 get_mail_client()。
+
+    本 helper **不抛 MailProviderUnavailable**;构造失败时让异常上抛,由调用方决定
+    是否启用 fallback 链 / 切到 RegisterPathRotator。
+    """
+    from autoteam.mail import get_mail_client
+
+    provider_name = ((acc or {}).get("mail_provider") or "").strip().lower() if acc else ""
+    client = None
+    if provider_name:
+        # Round 12 wire-up M4 — 显式 acc 级 provider 锁定。
+        # _resolve_provider_factory 可能没有 export,使用 dynamic getattr 兜底回退默认.
+        try:
+            from autoteam import mail as _mail_pkg
+
+            resolver = getattr(_mail_pkg, "_resolve_provider_factory", None)
+            if callable(resolver):
+                factory = resolver(provider_name)
+                if callable(factory):
+                    client = factory()
+        except Exception as exc:
+            logger.warning(
+                "[mail-route] 账号 %s mail_provider=%s resolve 失败,回退默认: %s",
+                (acc or {}).get("email"),
+                provider_name,
+                exc,
+            )
+            client = None
+
+    if client is None:
+        client = get_mail_client()
+
+    login = getattr(client, "login", None)
+    if callable(login):
+        try:
+            login()
+        except Exception as exc:
+            logger.warning(
+                "[mail-route] 账号 %s mail provider login 失败(将由上层决定是否切换): %s",
+                (acc or {}).get("email") if acc else None,
+                exc,
+            )
+            raise
+    return client
+
+
+def _get_account_mail_client(acc: dict | None):
+    """Compatibility wrapper for auth-repair paths that route mail per account."""
+    return _get_mail_client_for_account(acc)
+
+
+def _resolve_mail_client_or_default(mail_client, acc=None):
+    """统一处理 mail_client=None 入参:按 acc 路由或走全局默认。
+
+    Round 12 S4 — `_complete_registration` / `create_account_direct` /
+    `create_new_account` 的入口适配:旧调用方继续传 mail_client(完全兼容),新调用方
+    可省略 mail_client 让本 helper 按 acc / env 自动构造。
+    """
+    if mail_client is not None:
+        return mail_client
+    return _get_mail_client_for_account(acc)
+
+
+def _complete_registration(
+    email,
+    password,
+    invite_link,
+    mail_client=None,
+    *,
+    leave_workspace=False,
+    out_outcome=None,
+    acc=None,
+    auth_proxy_url: str | None = None,
+    playwright_proxy_url: str | None = None,
+):
+    """完成注册 + Codex 登录(从已有邀请链接继续)。out_outcome 透传给 _run_post_register_oauth。
+
+    Round 12 S3 cherry-pick (上游 `.upstream/manager.py:1225`): 一次性生成
+    SignupProfile 并透传给 register_with_invite,确保注册 about-you 与后续
+    Codex OAuth about-you 拿到完全一致的姓名/生日/年龄(降低 OpenAI 风控触发率).
+
+    Round 12 S4: `mail_client` 改为可选(默认 None) — None 时按 `acc`(可选)
+    通过 `_get_mail_client_for_account(acc)` 路由;旧调用方显式传 mail_client 时
+    完全保留旧行为(向后兼容)。
+    """
     from autoteam.invite import register_with_invite
+    from autoteam.signup_profile import generate_signup_profile
+
+    mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
+
+    signup_profile = generate_signup_profile()
+    if auth_proxy_url is None and playwright_proxy_url is None:
+        try:
+            auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+        except Exception as exc:
+            logger.warning("[注册] IPv6 代理为必需但不可用，停止注册账号 %s: %s", email, exc)
+            if out_outcome is not None:
+                out_outcome["status"] = "ipv6_proxy_unavailable"
+                out_outcome["reason"] = str(exc)
+                out_outcome["last_email"] = email
+            return None
 
     logger.info("[注册] 开始注册 %s...", email)
     with sync_playwright() as p:
-        browser = p.chromium.launch(**get_playwright_launch_options())
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
-        result, password = register_with_invite(page, invite_link, email, mail_client, password=password)
-        browser.close()
+        browser = None
+        context = None
+        page = None
+        try:
+            try:
+                launch_kwargs = get_playwright_launch_options(proxy_url=playwright_proxy_url)
+            except TypeError as exc:
+                if "proxy_url" not in str(exc):
+                    raise
+                launch_kwargs = get_playwright_launch_options()
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(**get_playwright_context_options())
+            page = context.new_page()
+            result, password = register_with_invite(
+                page,
+                invite_link,
+                email,
+                mail_client,
+                password=password,
+                signup_profile=signup_profile,
+            )
+        finally:
+            close_playwright_objects(page, context, browser, logger=logger, label="complete-registration")
 
     if not result:
         logger.error("[注册] 注册 %s 失败", email)
+        _release_account_ipv6_proxy(email)
         if out_outcome is not None:
             out_outcome["status"] = "register_failed"
             out_outcome["reason"] = "invite 注册链路失败（register_with_invite 返回 False）"
             out_outcome["last_email"] = email
         return None
 
-    return _run_post_register_oauth(
-        email, password, mail_client, leave_workspace=leave_workspace, out_outcome=out_outcome
+    post_result = _run_post_register_oauth(
+        email,
+        password,
+        mail_client,
+        leave_workspace=leave_workspace,
+        out_outcome=out_outcome,
+        signup_profile=signup_profile,
+        auth_proxy_url=auth_proxy_url,
+        playwright_proxy_url=playwright_proxy_url,
     )
+    if not post_result:
+        _release_account_ipv6_proxy(email)
+    return post_result
 
 
 def _check_pending_invites(chatgpt_api, mail_client, *, leave_workspace=False, out_outcome=None):
@@ -1155,7 +3942,12 @@ def _check_pending_invites(chatgpt_api, mail_client, *, leave_workspace=False, o
             password = acc.get("password") or random_password()
         else:
             password = random_password()
-            add_account(inv_email, password)
+            add_account(
+                inv_email,
+                password,
+                workspace_account_id=get_chatgpt_account_id() or None,
+                mail_provider=_mail_provider_name_for_client(mail_client),
+            )
 
         # 关闭 ChatGPT 浏览器再注册
         chatgpt_api.stop()
@@ -1186,8 +3978,209 @@ def _is_email_in_team(email):
         logger.warning("[直接注册] 检查 Team 成员失败: %s", exc)
         return False
     finally:
-        if chatgpt and chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
+
+
+def _wait_for_invite_link(mail_client, email: str, *, mail_account_id=None, timeout: int | None = None) -> str | None:
+    timeout = MAIL_TIMEOUT if timeout is None else max(1, int(timeout))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            emails = mail_client.search_emails_by_recipient(email, size=10, account_id=mail_account_id)
+        except TypeError:
+            emails = mail_client.search_emails_by_recipient(email, size=10)
+        except Exception as exc:
+            logger.warning("[邀请创建] 读取邀请邮件失败: %s", exc)
+            emails = []
+
+        for email_data in emails:
+            invite_link = mail_client.extract_invite_link(email_data)
+            if invite_link:
+                return invite_link
+
+        elapsed = max(0, int(timeout - (deadline - time.time())))
+        logger.info("[邀请创建] 等待邀请邮件: %s (%ds/%ds)", email, elapsed, timeout)
+        time.sleep(3)
+
+    return None
+
+
+def _cleanup_failed_created_account(
+    email: str | None,
+    mail_account_id,
+    mail_client,
+    reason: str,
+    *,
+    chatgpt_api=None,
+) -> None:
+    email = _normalized_email(email)
+    if not email:
+        return
+
+    logger.warning("[创建] 丢弃失败新账号: %s（%s）", email, reason)
+    try:
+        _discard_auth_repair_failed_account_record(email, reason, status=STATUS_STANDBY)
+    except Exception:
+        pass
+
+    try:
+        if chatgpt_api is not None and not _chatgpt_session_ready(chatgpt_api):
+            chatgpt_api.start()
+        delete_managed_account(
+            email,
+            remove_remote=True,
+            remove_cloudmail=True,
+            sync_cpa_after=False,
+            chatgpt_api=chatgpt_api,
+            mail_client=mail_client,
+        )
+        return
+    except Exception as exc:
+        logger.warning("[创建] delete_managed_account 清理失败: %s", exc)
+
+    if mail_account_id is not None:
+        try:
+            mail_client.delete_account(mail_account_id)
+        except Exception as exc:
+            logger.warning("[创建] 删除临时邮箱失败: %s", exc)
+    _release_account_ipv6_proxy(email)
+
+
+def create_account_via_invite(
+    chatgpt_api,
+    mail_client=None,
+    *,
+    leave_workspace=False,
+    out_outcome=None,
+    acc=None,
+):
+    """显式远端邀请 -> 邀请链接注册 -> 远端成员确认 -> Codex 凭证。"""
+    mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
+
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+
+    if not _prepare_remote_capacity_for_new_seat(chatgpt_api, stage_label="[邀请创建]"):
+        return None
+
+    mail_account_id = None
+    email = None
+    try:
+        mail_account_id, email = mail_client.create_temp_email()
+    except Exception as exc:
+        logger.warning("[邀请创建] 创建临时邮箱失败: %s", exc)
+        return None
+
+    password = random_password()
+    provider_name = _mail_provider_name_for_client(mail_client)
+    add_account(
+        email,
+        password,
+        cloudmail_account_id=mail_account_id if provider_name == "cloudmail" else None,
+        workspace_account_id=get_chatgpt_account_id() or None,
+        mail_provider=provider_name,
+        mail_account_id=mail_account_id,
+    )
+
+    try:
+        auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+    except Exception as exc:
+        logger.warning("[邀请创建] IPv6 代理为必需但不可用，停止创建账号 %s: %s", email, exc)
+        _cleanup_failed_created_account(
+            email,
+            mail_account_id,
+            mail_client,
+            "ipv6_proxy_required_unavailable",
+            chatgpt_api=chatgpt_api,
+        )
+        return None
+
+    try:
+        if not _has_remote_capacity_for_new_seat(chatgpt_api, stage_label="[邀请创建]"):
+            _cleanup_failed_created_account(
+                email,
+                mail_account_id,
+                mail_client,
+                "remote_capacity_full_before_invite",
+                chatgpt_api=chatgpt_api,
+            )
+            return None
+
+        if not invite_to_team(chatgpt_api, email, seat_type="usage_based"):
+            logger.warning("[邀请创建] 发送 Team 邀请失败或被拒绝: %s", email)
+            _cleanup_failed_created_account(
+                email,
+                mail_account_id,
+                mail_client,
+                "invite_rejected",
+                chatgpt_api=chatgpt_api,
+            )
+            return None
+
+        invite_link = _wait_for_invite_link(mail_client, email, mail_account_id=mail_account_id)
+        if not invite_link:
+            logger.warning("[邀请创建] 未收到邀请链接: %s", email)
+            _cleanup_failed_created_account(
+                email,
+                mail_account_id,
+                mail_client,
+                "invite_email_timeout",
+                chatgpt_api=chatgpt_api,
+            )
+            return None
+
+        if _chatgpt_session_ready(chatgpt_api):
+            chatgpt_api.stop()
+
+        completed_email = _complete_registration(
+            email,
+            password,
+            invite_link,
+            mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+            auth_proxy_url=auth_proxy_url,
+            playwright_proxy_url=playwright_proxy_url,
+        )
+        if not completed_email:
+            _cleanup_failed_created_account(
+                email,
+                mail_account_id,
+                mail_client,
+                "invite_registration_failed",
+                chatgpt_api=chatgpt_api,
+            )
+            return None
+
+        if not leave_workspace:
+            if not _chatgpt_session_ready(chatgpt_api):
+                chatgpt_api.start()
+            if not _wait_for_email_in_team(email, chatgpt_api=chatgpt_api, timeout=75, stage_label="[邀请创建]"):
+                _cleanup_failed_created_account(
+                    email,
+                    mail_account_id,
+                    mail_client,
+                    "remote_member_not_visible",
+                    chatgpt_api=chatgpt_api,
+                )
+                return None
+
+        logger.info("[邀请创建] 新账号已完成邀请注册: %s", email)
+        ready_acc = find_account(load_accounts(), email)
+        _sync_ready_credential_to_targets(email, (ready_acc or {}).get("auth_file"), stage_label="[邀请创建]")
+        return email
+    except Exception as exc:
+        logger.warning("[邀请创建] 新账号创建异常: %s", exc)
+        _cleanup_failed_created_account(
+            email,
+            mail_account_id,
+            mail_client,
+            "invite_create_exception",
+            chatgpt_api=chatgpt_api,
+        )
+        return None
 
 
 _DIRECT_EMAIL_SELECTORS = (
@@ -1197,6 +4190,8 @@ _DIRECT_EMAIL_SELECTORS = (
 )
 _DIRECT_PASSWORD_SELECTORS = 'input[name="password"], input[type="password"]'
 _DIRECT_CODE_SELECTORS = 'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
+_DIRECT_MULTI_CODE_SELECTOR = 'input[maxlength="1"]'
+_DIRECT_CODE_RENDER_TIMEOUT = 25
 
 
 def _safe_invite_screenshot(page, name):
@@ -1239,16 +4234,123 @@ def _pending_historical_exhausted_info(quota_info, now=None):
     return exhausted_info
 
 
-def _first_visible_editable_locator(page, selectors, timeout=800):
+def _historical_low_quota_info(acc, threshold, now=None):
+    """Return a low-quota decision from saved quota when live quota is unavailable."""
+    quota_info = acc.get("last_quota") if isinstance(acc, dict) else None
+    if not isinstance(quota_info, dict):
+        return None
+
+    current_ts = time.time() if now is None else now
+    exhausted_info = _pending_historical_exhausted_info(quota_info, now=current_ts)
+    if exhausted_info:
+        result = dict(exhausted_info)
+        result["remaining"] = 0
+        result["historical_low"] = True
+        return result
+
     try:
-        locator = page.locator(selectors).first
-        if not locator.is_visible(timeout=timeout):
-            return None
-        if locator.is_editable(timeout=timeout):
-            return locator
+        primary_pct = int(quota_info.get("primary_pct", 0) or 0)
+        threshold_int = int(threshold)
     except Exception:
         return None
+
+    remaining = max(0, 100 - primary_pct)
+    if remaining >= threshold_int:
+        return None
+
+    try:
+        primary_resets_at = int(quota_info.get("primary_resets_at", 0) or 0)
+    except Exception:
+        primary_resets_at = 0
+    if primary_resets_at and current_ts >= primary_resets_at:
+        return None
+
+    return {
+        "window": "primary",
+        "resets_at": primary_resets_at or int(current_ts + 18000),
+        "quota_info": quota_info,
+        "remaining": remaining,
+        "historical_low": True,
+    }
+
+
+def _first_visible_editable_locator(page, selectors, timeout=800):
+    candidates = selectors if isinstance(selectors, (list, tuple)) else [selectors]
+    for selector in candidates:
+        try:
+            locator = page.locator(selector).first
+            if not locator.is_visible(timeout=timeout):
+                continue
+            if locator.is_editable(timeout=timeout):
+                return locator
+        except Exception:
+            continue
     return None
+
+
+def _visible_single_char_code_inputs(page, timeout=300):
+    try:
+        visible_inputs = []
+        for locator in page.locator(_DIRECT_MULTI_CODE_SELECTOR).all():
+            try:
+                if locator.is_visible(timeout=timeout) and locator.is_editable(timeout=timeout):
+                    visible_inputs.append(locator)
+            except Exception:
+                continue
+        if len(visible_inputs) >= 4:
+            return visible_inputs
+    except Exception:
+        pass
+    return []
+
+
+def _wait_for_direct_code_target(page, timeout=_DIRECT_CODE_RENDER_TIMEOUT):
+    deadline = time.time() + max(0.0, float(timeout))
+
+    while time.time() < deadline:
+        split_inputs = _visible_single_char_code_inputs(page, timeout=300)
+        if split_inputs:
+            return {"mode": "split", "target": split_inputs}
+
+        code_input = _first_visible_editable_locator(page, _DIRECT_CODE_SELECTORS, timeout=300)
+        if code_input:
+            return {"mode": "single", "target": code_input}
+
+        step = _detect_direct_register_step(page)
+        if step != "code":
+            return {"mode": "advanced", "step": step}
+        time.sleep(0.5)
+
+    step = _detect_direct_register_step(page)
+    if step != "code":
+        return {"mode": "advanced", "step": step}
+    return {"mode": "timeout", "step": "code"}
+
+
+def _submit_direct_verification_code(page, code_target, verification_code):
+    mode = (code_target or {}).get("mode")
+    target = (code_target or {}).get("target")
+    submit_field = None
+    current_step = _detect_direct_register_step(page)
+
+    if mode == "split" and isinstance(target, list):
+        for index, char in enumerate(verification_code):
+            if index >= len(target):
+                break
+            target[index].fill(char)
+            time.sleep(0.1)
+        if target:
+            submit_field = target[0]
+    elif mode == "single" and target:
+        target.fill(verification_code)
+        submit_field = target
+    else:
+        return _detect_direct_register_step(page)
+
+    time.sleep(0.5)
+    if submit_field is not None:
+        _click_primary_auth_button(page, submit_field, ["Continue", "继续", "Verify"])
+    return _wait_for_direct_step_change(page, current_step, timeout=20)
 
 
 def _collect_date_spinbutton_meta(page):
@@ -1372,6 +4474,8 @@ def _detect_direct_register_step(page):
     url = (page.url or "").lower()
     if _is_google_redirect(page):
         return "google"
+    if "/api/auth/error" in url or url.endswith("/auth/error"):
+        return "error"
 
     if "email-verification" in url:
         return "code"
@@ -1417,6 +4521,8 @@ def _wait_for_direct_register_step(page, allowed_steps, timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
         step = _detect_direct_register_step(page)
+        if step == "error":
+            return step
         if step in allowed_steps:
             return step
         time.sleep(0.5)
@@ -1433,22 +4539,17 @@ def _wait_for_direct_step_change(page, current_step, timeout=15):
     return _detect_direct_register_step(page)
 
 
-def _complete_direct_about_you(page):
+def _complete_direct_about_you(page, signup_profile: SignupProfile | None = None):
     """尽量完成 about-you 页面，兼容不同生日字段顺序。"""
     if "about-you" not in (page.url or "").lower():
         return True
 
     # 本账号整个注册周期内固定一份身份数据，避免多次点提交导致生日漂移
-    identity_bday = random_birthday()
-    identity_name = random_full_name()
-    identity_age = random_age()
-
-    # 字段顺序只尝试 3 种排列，但全部使用相同的随机生日值
-    birthday_orders = [
-        (identity_bday["year"], identity_bday["month"], identity_bday["day"]),
-        (identity_bday["month"], identity_bday["day"], identity_bday["year"]),
-        (identity_bday["day"], identity_bday["month"], identity_bday["year"]),
-    ]
+    signup_profile = signup_profile or generate_signup_profile()
+    identity_bday = dict(signup_profile.birthday or {})
+    identity_name = signup_profile.full_name
+    identity_age = signup_profile.age_text
+    birthday_orders = signup_profile.positional_birthday_orders()
 
     for attempt, values in enumerate(birthday_orders, 1):
         if "about-you" not in (page.url or "").lower():
@@ -1551,350 +4652,546 @@ def _complete_direct_about_you(page):
     return False
 
 
-def _register_direct_once(mail_client, email, password, cloudmail_account_id=None):
+def _register_direct_once(
+    mail_client,
+    email,
+    password,
+    cloudmail_account_id=None,
+    signup_profile=None,
+    playwright_proxy_url: str | None = None,
+):
     """执行一次直接注册，返回是否完成注册并进入 Team。
 
     在邮箱/密码/验证码/about-you 四个提交节点调用 assert_not_blocked，
     一旦命中 add-phone / duplicate 就抛 RegisterBlocked，由 create_account_direct 分流处理。
     """
-    from playwright.sync_api import sync_playwright
-
     from autoteam.invite import RegisterBlocked, assert_not_blocked
 
     logger.info("[直接注册] %s", email)
     signup_url = "https://chatgpt.com/auth/login"
 
     with sync_playwright() as p:
-        launch_kwargs = get_playwright_launch_options()
-        if sys.platform.startswith("win"):
-            launch_kwargs["slow_mo"] = 100
-        browser = p.chromium.launch(**launch_kwargs)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
+        browser = None
+        context = None
+        page = None
+        cleanup_done = False
 
-        page.goto(signup_url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(5)
+        def cleanup_direct_register() -> None:
+            nonlocal cleanup_done
+            if cleanup_done:
+                return
+            cleanup_done = True
+            close_playwright_objects(page, context, browser, logger=logger, label="direct-register")
 
-        for i in range(12):
-            html = page.content()[:2000].lower()
-            if "verify you are human" not in html and "challenge" not in page.url:
-                break
-            logger.info("[直接注册] 等待 Cloudflare... (%ds)", i * 5)
+        try:
+            try:
+                launch_kwargs = get_playwright_launch_options(proxy_url=playwright_proxy_url)
+            except TypeError as exc:
+                if "proxy_url" not in str(exc):
+                    raise
+                launch_kwargs = get_playwright_launch_options()
+            if sys.platform.startswith("win"):
+                launch_kwargs["slow_mo"] = 100
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(**get_playwright_context_options())
+            page = context.new_page()
+
+            page.goto(signup_url, wait_until="domcontentloaded", timeout=60000)
             time.sleep(5)
 
-        _safe_invite_screenshot(page, "direct_01_login_page.png")
+            for i in range(12):
+                html = page.content()[:2000].lower()
+                if "verify you are human" not in html and "challenge" not in page.url:
+                    break
+                logger.info("[直接注册] 等待 Cloudflare... (%ds)", i * 5)
+                time.sleep(5)
 
-        # OpenAI 首页有多种 A/B 测试变体，需要逐步找到邮箱输入框
-        try:
-            email_visible = page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=3000)
-            if not email_visible:
-                # 尝试按优先级点击各种按钮来展开/跳转到邮箱输入
-                for sel, desc in [
-                    ('button:has-text("More options")', "More options"),
-                    ('button:has-text("更多选项")', "更多选项"),
-                    ('a:has-text("Sign up for free")', "Sign up for free"),
-                    ('button:has-text("Sign up for free")', "Sign up for free"),
-                    ('a:has-text("Sign up")', "Sign up"),
-                    ('button:has-text("Sign up")', "Sign up"),
-                    ('a:has-text("注册")', "注册"),
-                    ('button:has-text("注册")', "注册"),
-                    ('a:has-text("Log in")', "Log in"),
-                    ('button:has-text("Log in")', "Log in"),
-                ]:
-                    try:
-                        btn = page.locator(sel).first
-                        if btn.is_visible(timeout=1000):
-                            logger.info("[直接注册] 点击: %s", desc)
-                            btn.click()
-                            time.sleep(2)
-                            # 检查邮箱输入框是否出现了
-                            step = _wait_for_direct_register_step(
-                                page,
-                                {"email", "password", "code", "profile", "completed", "google"},
-                                timeout=10,
-                            )
-                            if step != "unknown":
-                                break
-                    except Exception:
+            _safe_invite_screenshot(page, "direct_01_login_page.png")
+
+            # OpenAI 首页有多种 A/B 测试变体，需要逐步找到邮箱输入框
+            try:
+                email_visible = page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=3000)
+                if not email_visible:
+                    # 尝试按优先级点击各种按钮来展开/跳转到邮箱输入
+                    for sel, desc in [
+                        ('button:has-text("More options")', "More options"),
+                        ('button:has-text("更多选项")', "更多选项"),
+                        ('a:has-text("Sign up for free")', "Sign up for free"),
+                        ('button:has-text("Sign up for free")', "Sign up for free"),
+                        ('a:has-text("Sign up")', "Sign up"),
+                        ('button:has-text("Sign up")', "Sign up"),
+                        ('a:has-text("注册")', "注册"),
+                        ('button:has-text("注册")', "注册"),
+                        ('a:has-text("Log in")', "Log in"),
+                        ('button:has-text("Log in")', "Log in"),
+                    ]:
+                        try:
+                            btn = page.locator(sel).first
+                            if btn.is_visible(timeout=1000):
+                                logger.info("[直接注册] 点击: %s", desc)
+                                btn.click()
+                                time.sleep(2)
+                                # 检查邮箱输入框是否出现了
+                                step = _wait_for_direct_register_step(
+                                    page,
+                                    {"email", "password", "code", "profile", "completed", "google"},
+                                    timeout=10,
+                                )
+                                if step != "unknown":
+                                    break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            _safe_invite_screenshot(page, "direct_02_signup.png")
+
+            logger.info("[直接注册] 输入邮箱: %s", email)
+            email_step = _wait_for_direct_register_step(
+                page,
+                {"email", "password", "code", "profile", "completed", "google"},
+                timeout=15,
+            )
+            logger.info("[直接注册] 邮箱步骤初始状态: %s | URL: %s", email_step, page.url)
+
+            if email_step == "google":
+                logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录页")
+                cleanup_direct_register()
+                return False, None
+            if email_step == "unknown":
+                logger.warning("[直接注册] 未识别到邮箱步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
+
+            try:
+                for attempt in range(3):
+                    step = _detect_direct_register_step(page)
+                    if step != "email":
+                        break
+
+                    email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=1500)
+                    if not email_input:
+                        logger.info("[直接注册] 邮箱输入框不可编辑，等待页面继续跳转...")
+                        next_step = _wait_for_direct_step_change(page, "email", timeout=10)
+                        if next_step != "email":
+                            break
+                        logger.warning("[直接注册] 邮箱输入框仍不可编辑，继续重试 | URL: %s", page.url)
                         continue
-        except Exception:
-            pass
 
-        _safe_invite_screenshot(page, "direct_02_signup.png")
+                    email_input.fill(email)
+                    time.sleep(0.5)
+                    logger.info("[直接注册] 邮箱已填入，点击 Continue... (attempt %d)", attempt + 1)
+                    _safe_invite_screenshot(page, f"direct_02b_email_filled_{attempt}.png")
+                    _click_primary_auth_button(page, email_input, ["Continue", "继续"])
 
-        logger.info("[直接注册] 输入邮箱: %s", email)
-        email_step = _wait_for_direct_register_step(
-            page,
-            {"email", "password", "code", "profile", "completed", "google"},
-            timeout=15,
-        )
-        logger.info("[直接注册] 邮箱步骤初始状态: %s | URL: %s", email_step, page.url)
+                    next_step = _wait_for_direct_step_change(page, "email", timeout=15)
+                    logger.info("[直接注册] 点击 Continue 后状态: %s | URL: %s", next_step, page.url)
+                    _safe_invite_screenshot(page, f"direct_02c_after_continue_{attempt}.png")
 
-        if email_step == "google":
-            logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录页")
-            browser.close()
-            return False
-        if email_step == "unknown":
-            logger.warning("[直接注册] 未识别到邮箱步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
-            return False
-
-        try:
-            for attempt in range(3):
-                step = _detect_direct_register_step(page)
-                if step != "email":
-                    break
-
-                email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=1500)
-                if not email_input:
-                    logger.info("[直接注册] 邮箱输入框不可编辑，等待页面继续跳转...")
-                    next_step = _wait_for_direct_step_change(page, "email", timeout=10)
-                    if next_step != "email":
-                        break
-                    logger.warning("[直接注册] 邮箱输入框仍不可编辑，继续重试 | URL: %s", page.url)
-                    continue
-
-                email_input.fill(email)
-                time.sleep(0.5)
-                logger.info("[直接注册] 邮箱已填入，点击 Continue... (attempt %d)", attempt + 1)
-                _safe_invite_screenshot(page, f"direct_02b_email_filled_{attempt}.png")
-                _click_primary_auth_button(page, email_input, ["Continue", "继续"])
-
-                next_step = _wait_for_direct_step_change(page, "email", timeout=15)
-                logger.info("[直接注册] 点击 Continue 后状态: %s | URL: %s", next_step, page.url)
-                _safe_invite_screenshot(page, f"direct_02c_after_continue_{attempt}.png")
-
-                if next_step == "google":
-                    _safe_invite_screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
-                    logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
-                    page.go_back(wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(2)
-                    continue
-                if next_step != "email":
-                    break
-
-                email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=600)
-                if not email_input:
-                    logger.info("[直接注册] 邮箱框已只读/跳转中，额外等待页面推进...")
-                    next_step = _wait_for_direct_step_change(page, "email", timeout=10)
-                    logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
+                    if next_step == "google":
+                        _safe_invite_screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
+                        logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                        page.go_back(wait_until="domcontentloaded", timeout=30000)
+                        time.sleep(2)
+                        continue
                     if next_step != "email":
                         break
 
-                logger.warning(
-                    "[直接注册] 点击 Continue 后仍停留在邮箱步骤，准备重试... | URL: %s | body=%s",
-                    page.url,
-                    _page_excerpt(page),
-                )
-        except Exception as exc:
-            logger.warning("[直接注册] 邮箱步骤异常: %s | URL: %s", exc, page.url)
+                    email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=600)
+                    if not email_input:
+                        logger.info("[直接注册] 邮箱框已只读/跳转中，额外等待页面推进...")
+                        next_step = _wait_for_direct_step_change(page, "email", timeout=10)
+                        logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
+                        if next_step != "email":
+                            break
 
-        _safe_invite_screenshot(page, "direct_03_after_email.png")
-        current_step = _detect_direct_register_step(page)
-        logger.info("[直接注册] 邮箱步骤结束状态: %s | URL: %s", current_step, page.url)
-        if current_step == "google":
-            logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
-            browser.close()
-            return False
-        if current_step == "email":
-            logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
-            return False
+                    logger.warning(
+                        "[直接注册] 点击 Continue 后仍停留在邮箱步骤，准备重试... | URL: %s | body=%s",
+                        page.url,
+                        _page_excerpt(page),
+                    )
+            except Exception as exc:
+                logger.warning("[直接注册] 邮箱步骤异常: %s | URL: %s", exc, page.url)
 
-        try:
-            assert_not_blocked(page, "email_submit")
-        except RegisterBlocked:
-            browser.close()
-            raise
+            _safe_invite_screenshot(page, "direct_03_after_email.png")
+            current_step = _detect_direct_register_step(page)
+            logger.info("[直接注册] 邮箱步骤结束状态: %s | URL: %s", current_step, page.url)
+            if current_step == "google":
+                logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
+                cleanup_direct_register()
+                return False, None
+            if current_step == "error":
+                logger.warning("[直接注册] 邮箱步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
+            if current_step == "unknown":
+                logger.warning("[直接注册] 邮箱步骤进入未知状态 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
+            if current_step == "email":
+                logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
 
-        # 等待页面跳转完成（可能跳到 create-account/password）
-        password_step = _wait_for_direct_register_step(
-            page,
-            {"password", "code", "profile", "completed", "google", "email"},
-            timeout=15,
-        )
-        logger.info("[直接注册] 密码页检测状态: %s | URL: %s", password_step, page.url)
-        _safe_invite_screenshot(page, "direct_03b_before_password.png")
+            try:
+                assert_not_blocked(page, "email_submit")
+            except RegisterBlocked:
+                cleanup_direct_register()
+                raise
 
-        try:
-            for attempt in range(2):
-                if _detect_direct_register_step(page) != "password":
-                    logger.info("[直接注册] 未检测到密码输入框，跳过")
-                    break
+            # 等待页面跳转完成（可能跳到 create-account/password）
+            password_step = _wait_for_direct_register_step(
+                page,
+                {"password", "code", "profile", "completed", "google", "email", "error"},
+                timeout=15,
+            )
+            logger.info("[直接注册] 密码页检测状态: %s | URL: %s", password_step, page.url)
+            _safe_invite_screenshot(page, "direct_03b_before_password.png")
+            if password_step == "error":
+                logger.warning("[直接注册] 密码步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
+            if password_step == "unknown":
+                logger.warning("[直接注册] 无法识别密码/验证码步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
 
-                pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=1500)
-                if not pwd_input:
-                    logger.info("[直接注册] 密码输入框不可编辑，等待页面继续跳转...")
-                    next_step = _wait_for_direct_step_change(page, "password", timeout=10)
+            try:
+                for attempt in range(2):
+                    if _detect_direct_register_step(page) != "password":
+                        logger.info("[直接注册] 未检测到密码输入框，跳过")
+                        break
+
+                    pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=1500)
+                    if not pwd_input:
+                        logger.info("[直接注册] 密码输入框不可编辑，等待页面继续跳转...")
+                        next_step = _wait_for_direct_step_change(page, "password", timeout=10)
+                        if next_step != "password":
+                            break
+                        logger.warning("[直接注册] 密码输入框仍不可编辑，继续重试 | URL: %s", page.url)
+                        continue
+
+                    logger.info("[直接注册] 设置密码")
+                    pwd_input.fill(password)
+                    time.sleep(0.5)
+                    _click_primary_auth_button(page, pwd_input, ["Continue", "继续", "Log in"])
+                    next_step = _wait_for_direct_step_change(page, "password", timeout=15)
+                    logger.info("[直接注册] 提交密码后状态: %s | URL: %s", next_step, page.url)
+
+                    if next_step == "google":
+                        _safe_invite_screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
+                        logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                        page.go_back(wait_until="domcontentloaded", timeout=30000)
+                        time.sleep(2)
+                        continue
                     if next_step != "password":
                         break
-                    logger.warning("[直接注册] 密码输入框仍不可编辑，继续重试 | URL: %s", page.url)
-                    continue
 
-                logger.info("[直接注册] 设置密码")
-                pwd_input.fill(password)
-                time.sleep(0.5)
-                _click_primary_auth_button(page, pwd_input, ["Continue", "继续", "Log in"])
-                next_step = _wait_for_direct_step_change(page, "password", timeout=15)
-                logger.info("[直接注册] 提交密码后状态: %s | URL: %s", next_step, page.url)
+                    pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=600)
+                    if not pwd_input:
+                        logger.info("[直接注册] 密码框已只读/跳转中，额外等待页面推进...")
+                        next_step = _wait_for_direct_step_change(page, "password", timeout=10)
+                        logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
+                        if next_step != "password":
+                            break
+            except Exception as exc:
+                logger.warning("[直接注册] 密码步骤异常: %s | URL: %s", exc, page.url)
 
-                if next_step == "google":
-                    _safe_invite_screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
-                    logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
-                    page.go_back(wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(2)
-                    continue
-                if next_step != "password":
-                    break
+            _safe_invite_screenshot(page, "direct_04_after_password.png")
+            current_step = _detect_direct_register_step(page)
+            if current_step == "google":
+                logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
+                cleanup_direct_register()
+                return False, None
+            if current_step == "error":
+                logger.warning("[直接注册] 密码步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
+            if current_step == "unknown":
+                logger.warning("[直接注册] 密码步骤进入未知状态 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
+            if current_step == "email":
+                logger.warning("[直接注册] 提交密码前流程回退到邮箱页 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
 
-                pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=600)
-                if not pwd_input:
-                    logger.info("[直接注册] 密码框已只读/跳转中，额外等待页面推进...")
-                    next_step = _wait_for_direct_step_change(page, "password", timeout=10)
-                    logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
-                    if next_step != "password":
-                        break
-        except Exception as exc:
-            logger.warning("[直接注册] 密码步骤异常: %s | URL: %s", exc, page.url)
+            try:
+                assert_not_blocked(page, "password_submit")
+            except RegisterBlocked:
+                cleanup_direct_register()
+                raise
 
-        _safe_invite_screenshot(page, "direct_04_after_password.png")
-        current_step = _detect_direct_register_step(page)
-        if current_step == "google":
-            logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
-            browser.close()
-            return False
-        if current_step == "email":
-            logger.warning("[直接注册] 提交密码前流程回退到邮箱页 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
-            return False
+            code_step = _detect_direct_register_step(page)
+            code_target = None
+            if code_step == "code":
+                logger.info("[直接注册] 等待验证码输入框渲染...")
+                code_target_result = _wait_for_direct_code_target(page, timeout=_DIRECT_CODE_RENDER_TIMEOUT)
+                mode = code_target_result.get("mode")
+                if mode in {"single", "split"}:
+                    code_target = code_target_result
+                    logger.info("[直接注册] 验证码输入框已就绪（mode=%s）", mode)
+                elif mode == "advanced":
+                    logger.info(
+                        "[直接注册] 验证码页等待期间流程已推进到 %s | URL: %s",
+                        code_target_result.get("step"),
+                        page.url,
+                    )
+                else:
+                    logger.warning(
+                        "[直接注册] 已停留在 email-verification 但 %ss 内未就绪验证码输入框 | URL: %s",
+                        _DIRECT_CODE_RENDER_TIMEOUT,
+                        page.url,
+                    )
 
-        try:
-            assert_not_blocked(page, "password_submit")
-        except RegisterBlocked:
-            browser.close()
-            raise
-
-        code_input = None
-        try:
-            code_input = page.locator(_DIRECT_CODE_SELECTORS).first
-            if not code_input.is_visible(timeout=5000):
-                code_input = None
-        except Exception:
-            code_input = None
-
-        if code_input:
-            logger.info("[直接注册] 等待验证码...")
-            verification_code = None
-            start_t = time.time()
-            while time.time() - start_t < MAIL_TIMEOUT:
-                emails = mail_client.search_emails_by_recipient(email, size=10, account_id=cloudmail_account_id)
-                for em in emails:
-                    verification_code = mail_client.extract_verification_code(em)
+            if code_target:
+                logger.info("[直接注册] 等待验证码...")
+                verification_code = None
+                start_t = time.time()
+                while time.time() - start_t < MAIL_TIMEOUT:
+                    emails = mail_client.search_emails_by_recipient(email, size=10, account_id=cloudmail_account_id)
+                    for em in emails:
+                        verification_code = mail_client.extract_verification_code(em)
+                        if verification_code:
+                            break
                     if verification_code:
                         break
+                    elapsed = int(time.time() - start_t)
+                    print(f"\r  等待验证码... ({elapsed}s)", end="", flush=True)
+                    time.sleep(3)
+
                 if verification_code:
-                    break
-                elapsed = int(time.time() - start_t)
-                print(f"\r  等待验证码... ({elapsed}s)", end="", flush=True)
-                time.sleep(3)
+                    logger.info("[直接注册] 输入验证码: %s", verification_code)
+                    next_step = _submit_direct_verification_code(page, code_target, verification_code)
+                    logger.info("[直接注册] 验证码提交后状态: %s | URL: %s", next_step, page.url)
+                else:
+                    logger.error("[直接注册] 未收到验证码")
+                    cleanup_direct_register()
+                    return False, None
 
-            if verification_code:
-                logger.info("[直接注册] 输入验证码: %s", verification_code)
-                code_input.fill(verification_code)
-                time.sleep(0.5)
-                _click_primary_auth_button(page, code_input, ["Continue", "继续"])
-                time.sleep(8)
+            _safe_invite_screenshot(page, "direct_05_after_code.png")
+            logger.info("[直接注册] 当前 URL: %s", page.url)
+
+            try:
+                assert_not_blocked(page, "code_submit")
+            except RegisterBlocked:
+                cleanup_direct_register()
+                raise
+
+            try:
+                _complete_direct_about_you(page, signup_profile=signup_profile)
+            except RegisterBlocked:
+                # add-phone / duplicate 必须穿透给 create_account_direct 处理
+                cleanup_direct_register()
+                raise
+            except Exception as exc:
+                logger.warning("[直接注册] about-you 步骤异常: %s | URL: %s", exc, page.url)
+
+            _safe_invite_screenshot(page, "direct_06_after_profile.png")
+            logger.info("[直接注册] 当前 URL: %s", page.url)
+
+            try:
+                join_btn = page.locator('button:has-text("Accept"), button:has-text("Join"), button:has-text("加入")').first
+                if join_btn.is_visible(timeout=5000):
+                    join_btn.click()
+                    time.sleep(5)
+            except Exception:
+                pass
+
+            _safe_invite_screenshot(page, "direct_07_final.png")
+
+            current_url = page.url
+            success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
+            if success:
+                logger.info("[直接注册] 注册成功并已加入 workspace!")
             else:
-                logger.error("[直接注册] 未收到验证码")
-                browser.close()
-                return False
+                logger.warning("[直接注册] 注册可能未完成，URL: %s", current_url)
 
-        _safe_invite_screenshot(page, "direct_05_after_code.png")
-        logger.info("[直接注册] 当前 URL: %s", page.url)
+            # Round 11 四轮 — 注册成功后从 chatgpt.com context 抽 __Secure-next-auth.session-token,
+            # 透给后续 personal OAuth 用,跳过 auth.openai.com /log-in 页(实测刚踢出 Team 的新号
+            # 在 /log-in 页 Continue 按钮变灰 → 卡死)。SessionCodexAuthFlow._inject_auth_cookies
+            # 是同样的注入模式(主号专用),这里把模式扩展给 personal 子号。
+            session_token = _extract_session_token_from_context(context) if success else None
 
+            cleanup_direct_register()
+            return success, session_token
+        finally:
+            cleanup_direct_register()
+
+
+def _extract_session_token_from_context(context):
+    """从 Playwright BrowserContext 的 cookies 里抽 __Secure-next-auth.session-token。
+
+    chatgpt.com 大 token 会被切成 .0 / .1 chunked 形式写入,需按 suffix 排序拼回。
+    返回拼接后的 session_token(str)或 None。
+    """
+    try:
+        cookies = context.cookies()
+    except Exception as exc:
+        logger.warning("[直接注册] 抽 session_token 时读取 cookies 异常: %s", exc)
+        return None
+
+    session_parts = {}
+    session_token = None
+    for cookie in cookies:
+        name = cookie.get("name", "")
+        if name == "__Secure-next-auth.session-token":
+            session_token = cookie.get("value", "")
+        elif name.startswith("__Secure-next-auth.session-token."):
+            suffix = name.rsplit(".", 1)[-1]
+            session_parts[suffix] = cookie.get("value", "")
+
+    if not session_token and session_parts:
+        session_token = "".join(session_parts[k] for k in sorted(session_parts))
+
+    if session_token:
+        logger.info("[直接注册] 已抽出 session_token (len=%d) 用于 personal OAuth 注入", len(session_token))
+    else:
+        logger.warning("[直接注册] cookies 中未发现 __Secure-next-auth.session-token,personal OAuth 仍走 /log-in")
+    return session_token or None
+
+
+def _direct_register_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _direct_register_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cap_direct_register_parallel(requested: int) -> int:
+    requested = max(1, min(4, int(requested or 1)))
+    if requested <= 1:
+        return 1
+
+    try:
+        from autoteam.runtime_resources import collect_runtime_resource_snapshot
+
+        snapshot = collect_runtime_resource_snapshot()
+    except Exception as exc:
+        logger.debug("[直接注册] 读取资源快照失败，保留并行=%d: %s", requested, exc)
+        return requested
+
+    memory_ratio = snapshot.get("cgroup_memory_usage_ratio")
+    browser_live = int(snapshot.get("browser_process_live") or 0)
+    warn_ratio = _direct_register_float_env("AUTOTEAM_REGISTER_PARALLEL_MEMORY_WARN_RATIO", 0.72)
+    max_browser_live = _direct_register_int_env("AUTOTEAM_REGISTER_PARALLEL_MAX_BROWSER_LIVE", 4)
+
+    if memory_ratio is not None and float(memory_ratio) >= warn_ratio:
+        logger.warning(
+            "[直接注册] 内存占用 %.1f%% >= %.1f%%，并行注册从 %d 降级为 1，避免 OOM",
+            float(memory_ratio) * 100,
+            warn_ratio * 100,
+            requested,
+        )
+        return 1
+
+    if browser_live >= max_browser_live:
+        logger.warning(
+            "[直接注册] 浏览器进程数 %d >= %d，并行注册从 %d 降级为 1，避免进程堆积",
+            browser_live,
+            max_browser_live,
+            requested,
+        )
+        return 1
+
+    return requested
+
+
+def _direct_register_parallel_size() -> int:
+    """读取并行尝试数（DIRECT_REGISTER_PARALLEL），范围 [1, 4]，再按本机资源降级。"""
+    try:
+        from autoteam.config import DIRECT_REGISTER_PARALLEL
+
+        raw = int(DIRECT_REGISTER_PARALLEL)
+    except Exception:
         try:
-            assert_not_blocked(page, "code_submit")
-        except RegisterBlocked:
-            browser.close()
-            raise
-
-        try:
-            _complete_direct_about_you(page)
-        except RegisterBlocked:
-            # add-phone / duplicate 必须穿透给 create_account_direct 处理
-            browser.close()
-            raise
-        except Exception as exc:
-            logger.warning("[直接注册] about-you 步骤异常: %s | URL: %s", exc, page.url)
-
-        _safe_invite_screenshot(page, "direct_06_after_profile.png")
-        logger.info("[直接注册] 当前 URL: %s", page.url)
-
-        try:
-            join_btn = page.locator('button:has-text("Accept"), button:has-text("Join"), button:has-text("加入")').first
-            if join_btn.is_visible(timeout=5000):
-                join_btn.click()
-                time.sleep(5)
+            raw = int(os.environ.get("DIRECT_REGISTER_PARALLEL", "1"))
         except Exception:
-            pass
-
-        _safe_invite_screenshot(page, "direct_07_final.png")
-
-        current_url = page.url
-        success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
-        if success:
-            logger.info("[直接注册] 注册成功并已加入 workspace!")
-        else:
-            logger.warning("[直接注册] 注册可能未完成，URL: %s", current_url)
-
-        browser.close()
-        return success
+            raw = 1
+    return _cap_direct_register_parallel(raw)
 
 
-def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=None):
-    """
-    直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
-    流程：创建邮箱 → 注册 ChatGPT → 自动加入 workspace → Codex 登录
-    leave_workspace: 加入 workspace 后是否立即退出，转为 personal 模式跑 OAuth。
-    out_outcome:     可选 dict，函数会把最终结局（success/phone_blocked/duplicate_exhausted/register_failed/...）
-                     + 统计信息（register_attempts / duplicate_swaps / last_email / reason）写入，供上游汇总。
-
-    捕获 RegisterBlocked：
-    - is_phone=True:     当前邮箱已暴露给 OpenAI，立即删邮箱、整个账号放弃（return None）
-    - is_duplicate=True: 换个临时邮箱继续尝试，独立计数不消耗 register_attempts
-    - 其他异常:          归入现有 retry 计数
-    """
+def _attempt_chatgpt_signup_only(mail_client, *, acc=None, out_outcome=None) -> dict:
+    """Run direct ChatGPT signup only; caller decides whether to persist/OAuth the winner."""
     from autoteam.invite import RegisterBlocked
 
+    mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
     account_id, email = mail_client.create_temp_email()
     password = random_password()
+    signup_profile = generate_signup_profile()
+    auth_proxy_url = ""
+    playwright_proxy_url = ""
+    local_outcome: dict = {}
 
     def _record_outcome(status, **extra):
+        local_outcome.clear()
+        local_outcome.update(
+            status=status,
+            last_email=email,
+            register_attempts=register_attempts,
+            duplicate_swaps=duplicate_swaps,
+            **extra,
+        )
         if out_outcome is not None:
             out_outcome.clear()
-            out_outcome.update(
-                status=status,
-                last_email=email,
-                register_attempts=register_attempts,
-                duplicate_swaps=duplicate_swaps,
-                **extra,
-            )
+            out_outcome.update(local_outcome)
 
     def _discard_email(reason):
         try:
             mail_client.delete_account(account_id)
         except Exception as exc:
             logger.warning("[直接注册] 删除 %s 的临时邮箱失败（%s）: %s", reason, email, exc)
+        _release_account_ipv6_proxy(email)
+
+    def _assign_proxy_or_fail(reason):
+        nonlocal auth_proxy_url, playwright_proxy_url
+        try:
+            auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+            return True
+        except Exception as exc:
+            logger.warning("[直接注册] IPv6 代理为必需但不可用，删除临时邮箱 %s: %s", email, exc)
+            _discard_email(reason)
+            record_failure(
+                email,
+                "ipv6_proxy_unavailable",
+                f"IPv6 proxy unavailable: {exc}",
+                register_attempts=register_attempts,
+                duplicate_swaps=duplicate_swaps,
+            )
+            _record_outcome("ipv6_proxy_unavailable", reason=str(exc))
+            return False
+
+    def _build_result(success_value: bool) -> dict:
+        return {
+            "success": bool(success_value),
+            "email": email,
+            "password": password,
+            "account_id": account_id,
+            "session_token": session_token,
+            "signup_profile": signup_profile,
+            "auth_proxy_url": auth_proxy_url,
+            "playwright_proxy_url": playwright_proxy_url,
+            "mail_client": mail_client,
+            "outcome": dict(local_outcome),
+        }
 
     # 注册失败（非 duplicate）最多重试 3 次；duplicate 额外独立上限，防止 CloudMail 异常导致无限换邮箱
     success = False
+    session_token = None  # Round 11 四轮 — 注册成功后从 chatgpt.com 抽出来,透给 personal OAuth 跳过 /log-in
     MAX_REGISTER_ATTEMPTS = 3
     MAX_DUPLICATE_SWAPS = 5
     register_attempts = 0
     duplicate_swaps = 0
+    if not _assign_proxy_or_fail("ipv6_proxy_required_unavailable"):
+        return _build_result(False)
+
     while register_attempts < MAX_REGISTER_ATTEMPTS:
         logger.info(
             "[直接注册] 开始注册尝试: %s（已试 %d/%d，duplicate 换邮箱 %d/%d）",
@@ -1905,7 +5202,25 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
             MAX_DUPLICATE_SWAPS,
         )
         try:
-            success = _register_direct_once(mail_client, email, password, cloudmail_account_id=account_id)
+            try:
+                success, session_token = _register_direct_once(
+                    mail_client,
+                    email,
+                    password,
+                    cloudmail_account_id=account_id,
+                    signup_profile=signup_profile,
+                    playwright_proxy_url=playwright_proxy_url,
+                )
+            except TypeError as exc:
+                if "playwright_proxy_url" not in str(exc):
+                    raise
+                success, session_token = _register_direct_once(
+                    mail_client,
+                    email,
+                    password,
+                    cloudmail_account_id=account_id,
+                    signup_profile=signup_profile,
+                )
         except RegisterBlocked as blocked:
             logger.error("[直接注册] %s 被阻断: %s", email, blocked)
             if blocked.is_phone:
@@ -1920,7 +5235,7 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
                     duplicate_swaps=duplicate_swaps,
                 )
                 _record_outcome("phone_blocked", reason=f"add-phone 手机验证 step={blocked.step}", step=blocked.step)
-                return None
+                return _build_result(False)
             if blocked.is_duplicate:
                 # 邮箱重复 → 换一个全新的临时邮箱再来，不计入 register_attempts
                 duplicate_swaps += 1
@@ -1937,14 +5252,18 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
                         "duplicate_exhausted",
                         reason=f"duplicate 换邮箱 {duplicate_swaps} 次仍失败",
                     )
-                    return None
+                    return _build_result(False)
                 _discard_email("duplicate")
                 account_id, email = mail_client.create_temp_email()
                 password = random_password()
+                signup_profile = generate_signup_profile()
                 logger.info("[直接注册] 已换新临时邮箱: %s", email)
+                if not _assign_proxy_or_fail("ipv6_proxy_required_unavailable_after_duplicate"):
+                    return _build_result(False)
                 continue
             # 其他阻断按普通失败处理
             success = False
+            session_token = None
         except Exception as exc:
             # Playwright 崩溃 / 网络异常等:不清理邮箱会让 CloudMail 积压,必须补一刀 discard 再抛。
             logger.error(
@@ -1994,28 +5313,313 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
             duplicate_swaps=duplicate_swaps,
         )
         _record_outcome("register_failed", reason=f"注册 {register_attempts} 次均未进入 Team")
+        return _build_result(False)
+
+    _record_outcome("success", reason="")
+    return _build_result(True)
+
+
+def _direct_signup_mail_client_factory(base_mail_client, acc=None):
+    def _factory(idx: int):
+        if idx <= 0:
+            return base_mail_client
+        try:
+            client = type(base_mail_client)()
+        except Exception:
+            client = _resolve_mail_client_or_default(None, acc=acc)
+        login = getattr(client, "login", None)
+        if callable(login):
+            login()
+        return client
+
+    return _factory
+
+
+def _discard_direct_signup_loser(outcome: dict) -> None:
+    email = outcome.get("email")
+    account_id = outcome.get("account_id")
+    mail_client = outcome.get("mail_client")
+    if email:
+        chatgpt = None
+        try:
+            chatgpt = ChatGPTTeamAPI()
+            chatgpt.start()
+            remove_from_team(chatgpt, email, return_status=True)
+        except Exception as exc:
+            logger.warning("[直接注册] 清理并行 loser Team 席位失败: %s (%s)", email, exc)
+        finally:
+            if chatgpt is not None:
+                try:
+                    chatgpt.stop()
+                except Exception:
+                    pass
+        _release_account_ipv6_proxy(email)
+    if account_id is not None and mail_client is not None:
+        try:
+            mail_client.delete_account(account_id)
+            logger.info("[直接注册] 已丢弃并行 loser 临时邮箱: %s", email)
+        except Exception as exc:
+            logger.warning("[直接注册] 丢弃并行 loser 临时邮箱失败: %s (%s)", email, exc)
+
+
+def _race_chatgpt_signup(mail_client_factory, *, parallel: int, acc=None, out_outcome=None) -> dict:
+    """Run direct signup race and return the first successful signup-only outcome."""
+    import concurrent.futures
+
+    parallel = _cap_direct_register_parallel(parallel)
+    if parallel <= 1:
+        return _attempt_chatgpt_signup_only(mail_client_factory(0), acc=acc, out_outcome=out_outcome)
+
+    logger.info("[直接注册] 启动 %d 个并行注册尝试", parallel)
+    winner: dict | None = None
+    failures: list[dict] = []
+    losers: list[dict] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="direct-signup") as pool:
+        future_map = {
+            pool.submit(
+                _attempt_chatgpt_signup_only,
+                mail_client_factory(idx),
+                acc=acc,
+            ): idx
+            for idx in range(parallel)
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            try:
+                outcome = future.result()
+            except Exception as exc:
+                logger.warning("[直接注册] 并行 worker 异常: %s", exc)
+                failures.append({"success": False, "outcome": {"status": "exception", "reason": str(exc)}})
+                continue
+            if outcome.get("success") and winner is None:
+                winner = outcome
+                logger.info("[直接注册] 并行获胜: %s", outcome.get("email"))
+            elif outcome.get("success"):
+                losers.append(outcome)
+            else:
+                failures.append(outcome)
+
+    for loser in losers:
+        _discard_direct_signup_loser(loser)
+
+    selected = winner or (failures[-1] if failures else {"success": False, "outcome": {"status": "register_failed"}})
+    if out_outcome is not None:
+        out_outcome.clear()
+        out_outcome.update(selected.get("outcome") or {})
+        out_outcome["direct_register_parallel"] = parallel
+        out_outcome["direct_register_failures"] = len(failures)
+        out_outcome["direct_register_losers"] = len(losers)
+    return selected
+
+
+def create_account_direct(
+    mail_client=None,
+    *,
+    leave_workspace=False,
+    out_outcome=None,
+    acc=None,
+    path_rotator=None,
+    parallel: int | None = None,
+):
+    """
+    直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
+    流程：创建邮箱 → 注册 ChatGPT → 自动加入 workspace → Codex 登录
+    leave_workspace: 加入 workspace 后是否立即退出，转为 personal 模式跑 OAuth。
+    out_outcome:     可选 dict，函数会把最终结局（success/phone_blocked/duplicate_exhausted/register_failed/...）
+                     + 统计信息（register_attempts / duplicate_swaps / last_email / reason）写入，供上游汇总。
+    parallel:        direct signup race 并行度；None 时读取 DIRECT_REGISTER_PARALLEL 并按资源预算降级。
+
+    捕获 RegisterBlocked：
+    - is_phone=True:     当前邮箱已暴露给 OpenAI，立即删邮箱、整个账号放弃（return None）
+    - is_duplicate=True: 换个临时邮箱继续尝试，独立计数不消耗 register_attempts
+    - 其他异常:          归入现有 retry 计数
+
+    Round 12 S4: `mail_client` 改为可选(默认 None) — None 时按 `acc`(可选)走
+    `_get_mail_client_for_account(acc)` 路由;旧调用方显式传 mail_client 时完全
+    保留旧行为(向后兼容)。register-level 多 provider rotation 由 `MAIL_PROVIDER_CHAIN`
+    env 驱动:配置 chain 时 `get_mail_client()` 返回 `FallbackMailProvider`,
+    自动在 mail-API 级失败时降级;邮箱-粒度的 provider 切换通过 `RegisterPathRotator`
+    包装(参见 `autoteam.mail.register_dual_path`),业务调用方可自行编排。
+
+    Round 12 wire-up (M3): `path_rotator` 可选 — 传入 `RegisterPathRotator` 实例时
+    启用邮箱-粒度的 provider 切换(OTP_TIMEOUT / DOMAIN_REJECTED / INVITE_LINK_MISSING
+    自动切下一 provider 重试整个注册流程);None 时走旧逻辑(单 provider + retry 3 次).
+    """
+    # Round 12 wire-up M3 — 邮箱-粒度 provider 切换。
+    if path_rotator is not None:
+        return _create_account_direct_via_rotator(
+            path_rotator,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+            parallel=parallel,
+        )
+
+    mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
+    if parallel is None:
+        parallel = _direct_register_parallel_size()
+    else:
+        parallel = _cap_direct_register_parallel(parallel)
+
+    if parallel <= 1:
+        signup = _attempt_chatgpt_signup_only(mail_client, acc=acc, out_outcome=out_outcome)
+    else:
+        signup = _race_chatgpt_signup(
+            _direct_signup_mail_client_factory(mail_client, acc=acc),
+            parallel=parallel,
+            acc=acc,
+            out_outcome=out_outcome,
+        )
+
+    if not signup.get("success"):
         return None
 
-    add_account(email, password, cloudmail_account_id=account_id)
+    email = signup["email"]
+    password = signup["password"]
+    account_id = signup["account_id"]
+    session_token = signup.get("session_token")
+    signup_profile = signup.get("signup_profile")
+    auth_proxy_url = signup.get("auth_proxy_url") or ""
+    playwright_proxy_url = signup.get("playwright_proxy_url") or ""
+    winner_mail_client = signup.get("mail_client") or mail_client
 
-    return _run_post_register_oauth(
+    add_account(
         email,
         password,
-        mail_client,
-        leave_workspace=leave_workspace,
-        out_outcome=out_outcome,
+        cloudmail_account_id=account_id,
+        workspace_account_id=get_chatgpt_account_id() or None,
+        mail_provider=_mail_provider_name_for_client(winner_mail_client),
+        mail_account_id=account_id,
     )
 
+    post_result = _run_post_register_oauth(
+        email,
+        password,
+        winner_mail_client,
+        leave_workspace=leave_workspace,
+        out_outcome=out_outcome,
+        chatgpt_session_token=session_token,
+        signup_profile=signup_profile,
+        auth_proxy_url=auth_proxy_url,
+        playwright_proxy_url=playwright_proxy_url,
+    )
+    if not post_result:
+        _release_account_ipv6_proxy(email)
+    return post_result
 
-def create_new_account(chatgpt_api, mail_client, *, leave_workspace=False, out_outcome=None):
+
+def _create_account_direct_via_rotator(
+    path_rotator, *, leave_workspace=False, out_outcome=None, acc=None, parallel: int | None = None
+):
+    """Round 12 wire-up (M3) — 用 RegisterPathRotator 编排邮箱-粒度的 provider 切换。
+
+    流程:
+      1. rotator.try_each(action) 内,对每个 strategy 调 factory() 拿一个 mail provider,
+         action 调用 create_account_direct(client=that_provider) 跑一遍注册。
+      2. 若 action 抛 OTP_TIMEOUT / INVITE_LINK_MISSING / DOMAIN_REJECTED, rotator
+         记账后切下一个 provider 重试整个流程(包括创建新邮箱)。
+      3. 全失败 → 抛 RegisterPathExhausted, 调用方决定如何写 out_outcome / 上报失败.
+
+    与 `create_account_direct(mail_client=...)` 串行路径的关键差异:rotator 路径
+    把"创建邮箱"与"注册账号"绑在同一个 strategy 内, OTP 超时不再死循环单 provider,
+    而是切到下一个 provider 重新创建邮箱.
+    """
+    from autoteam.mail.register_dual_path import (
+        InviteLinkMissingError,  # noqa: F401 — 仅供 docstring 引用,实际由调用方抛
+        RegisterPathExhausted,
+        classify_register_failure,
+    )
+
+    def _action(mail_client, provider_name, ctx):
+        # 在 action 内部执行注册.失败时 action 必须把 RegisterBlocked /
+        # TimeoutError / InviteLinkMissingError 原样抛, rotator 内的
+        # classify_register_failure 决定是否切下一 provider.
+        local_outcome = {}
+        result_email = create_account_direct(
+            mail_client=mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=local_outcome,
+            acc=acc,
+            path_rotator=None,  # 避免递归
+            parallel=parallel,
+        )
+        if result_email is None:
+            status = local_outcome.get("status") or "register_failed"
+            reason = local_outcome.get("reason") or "create_account_direct returned None"
+            # 把外层 outcome 透传给 caller(最后一次 strategy 的细节也保留)
+            if out_outcome is not None:
+                out_outcome.clear()
+                out_outcome.update(local_outcome)
+                out_outcome["provider"] = provider_name
+                out_outcome["provider_chain_history"] = list(ctx.get("history") or [])
+            # 抛一个携带 status/reason 的 ValueError, rotator 用 classify_register_failure
+            # 决定是否切换. OTP / domain / invite_missing 文本会被识别为切换信号.
+            raise RuntimeError(f"create_account_direct failed: {status} — {reason}")
+        # 成功 → 透传 outcome
+        if out_outcome is not None:
+            out_outcome.clear()
+            out_outcome.update(local_outcome)
+            out_outcome["provider"] = provider_name
+            out_outcome["provider_chain_history"] = list(ctx.get("history") or [])
+        return result_email
+
+    try:
+        return path_rotator.try_each(_action)
+    except RegisterPathExhausted as exhausted:
+        logger.error(
+            "[直接注册-rotator] 所有 provider 均失败: %s (history=%s)",
+            exhausted, exhausted.history,
+        )
+        if out_outcome is not None:
+            out_outcome.setdefault("status", "register_failed")
+            out_outcome["reason"] = (
+                f"register path exhausted: {len(exhausted.history)} provider(s) tried"
+            )
+            out_outcome["provider_chain_history"] = list(exhausted.history)
+        return None
+    except Exception as exc:
+        # rotator 对 OTHER 类直接 raise(spec §Q2);上层调用方决定如何处理
+        ftype = classify_register_failure(exc)
+        logger.warning(
+            "[直接注册-rotator] non-rotating failure (%s): %s",
+            ftype.value, exc,
+        )
+        if out_outcome is not None:
+            out_outcome.setdefault("status", "register_failed")
+            out_outcome["reason"] = f"unrecoverable failure ({ftype.value}): {exc}"
+        return None
+
+
+def create_new_account(
+    chatgpt_api,
+    mail_client=None,
+    *,
+    leave_workspace=False,
+    out_outcome=None,
+    acc=None,
+    path_rotator=None,
+    parallel: int | None = None,
+):
     """
     创建新账号。优先用直接注册模式（域名自动加入 workspace）。
     chatgpt_api 可为 None（直接注册不需要）。
     leave_workspace: 注册成功后是否退出 Team 走 personal OAuth。
     out_outcome:     透传给 create_account_direct 的可选统计容器。
+
+    Round 12 S4: `mail_client` 改为可选 — 缺省时按 acc 路由 / 走 get_mail_client()。
     """
+    mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
+    try:
+        from autoteam.config import ROTATE_SKIP_REUSE
+    except Exception:
+        ROTATE_SKIP_REUSE = False
+
+    mode = _runtime_new_account_mode()
+    fallback_invite = _domain_auto_join_fallback_invite_enabled()
+    direct_attempted = False
+
     # 先检查 pending invites
-    if chatgpt_api and chatgpt_api.browser:
+    if chatgpt_api and _chatgpt_session_ready(chatgpt_api) and not ROTATE_SKIP_REUSE:
         logger.info("[创建] 先检查 pending invites...")
         completed = _check_pending_invites(
             chatgpt_api,
@@ -2026,12 +5630,80 @@ def create_new_account(chatgpt_api, mail_client, *, leave_workspace=False, out_o
         if completed:
             logger.info("[创建] 从 pending invites 完成了 %d 个账号", len(completed))
             return completed[0]
+    elif chatgpt_api and _chatgpt_session_ready(chatgpt_api):
+        logger.info("[创建] ROTATE_SKIP_REUSE 启用：跳过历史 pending invite，只创建新账号")
 
-    # 直接注册模式（不需要邀请）
-    logger.info("[创建] 使用直接注册模式...")
-    if chatgpt_api and chatgpt_api.browser:
+    auto_join_allowed = mode == "direct_first" or (
+        mode == "domain_auto_join_first" and _mail_domain_auto_join_allowed(mail_client)
+    )
+    if mode == "domain_auto_join_first" and not auto_join_allowed:
+        logger.warning(
+            "[创建] path=domain_auto_join 跳过：当前邮箱域名不在 AUTOTEAM_AUTO_JOIN_DOMAINS 中，改用邀请路径"
+        )
+
+    if auto_join_allowed:
+        logger.info(
+            "[创建] path=domain_auto_join mode=%s fallback_invite=%s：跳过邀请邮件，直接注册并等待远端成员确认",
+            mode,
+            fallback_invite,
+        )
+        if chatgpt_api is not None:
+            if not _prepare_remote_capacity_for_new_seat(chatgpt_api, stage_label="[直接注册]"):
+                logger.warning("[创建] path=domain_auto_join 远端席位不可用，停止直接注册")
+                return None
+            if _chatgpt_session_ready(chatgpt_api):
+                chatgpt_api.stop()
+
+        direct_attempted = True
+        direct_email = create_account_direct(
+            mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+            path_rotator=path_rotator,
+            parallel=parallel,
+        )
+        if direct_email:
+            return direct_email
+        if not fallback_invite:
+            logger.warning("[创建] path=domain_auto_join 失败且 fallback invite 已关闭")
+            return None
+        logger.warning("[创建] path=domain_auto_join 失败，尝试 path=invite_fallback")
+
+    if chatgpt_api is not None and (auto_join_allowed or mode == "invite_first" or _chatgpt_session_ready(chatgpt_api)):
+        invite_path = "invite_fallback" if auto_join_allowed else "invite_legacy"
+        logger.info(
+            "[创建] path=%s 使用远端邀请注册模式（members+invites 先验容量，注册后确认远端成员）...",
+            invite_path,
+        )
+        invited_email = create_account_via_invite(
+            chatgpt_api,
+            mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+        )
+        if invited_email:
+            return invited_email
+        if direct_attempted:
+            logger.warning("[创建] path=invite_fallback 失败，direct 注册已经尝试过，停止本轮新号创建")
+            return None
+        logger.warning("[创建] 远端邀请注册模式失败，尝试直接注册兜底（仍要求远端成员确认）...")
+        if not _prepare_remote_capacity_for_new_seat(chatgpt_api, stage_label="[创建兜底]"):
+            logger.warning("[创建] 远端席位已满或有 pending invite 占位，跳过直接注册兜底")
+            return None
+
+    logger.info("[创建] path=direct_fallback 使用直接注册兜底模式...")
+    if chatgpt_api and _chatgpt_session_ready(chatgpt_api):
         chatgpt_api.stop()
-    return create_account_direct(mail_client, leave_workspace=leave_workspace, out_outcome=out_outcome)
+    return create_account_direct(
+        mail_client,
+        leave_workspace=leave_workspace,
+        out_outcome=out_outcome,
+        acc=acc,
+        path_rotator=path_rotator,
+        parallel=parallel,
+    )
 
 
 def reinvite_account(chatgpt_api, mail_client, acc):
@@ -2050,16 +5722,14 @@ def reinvite_account(chatgpt_api, mail_client, acc):
 
     logger.info("[轮转] 恢复旧账号: %s（统一 OAuth 登录）", email)
 
-    # 关闭 ChatGPT API 浏览器避免冲突
-    if chatgpt_api and chatgpt_api.browser:
+    # 关闭已有 Team API session 避免 OAuth 浏览器冲突；auto transport 下可能没有 browser 但仍 started。
+    if chatgpt_api and _chatgpt_session_ready(chatgpt_api):
         chatgpt_api.stop()
-
-    bundle = login_codex_via_browser(email, password, mail_client=mail_client)
 
     def _cleanup_team_leftover(reason):
         """OAuth 失败/plan 不对时,兜底 kick 账号,避免假 standby。"""
         try:
-            if not chatgpt_api.browser:
+            if not _chatgpt_session_ready(chatgpt_api):
                 chatgpt_api.start()
             kick_status = remove_from_team(chatgpt_api, email, return_status=True)
             if kick_status == "removed":
@@ -2071,19 +5741,113 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         except Exception as exc:
             logger.warning("[轮转] OAuth 失败后 kick %s 抛异常(留给下次对账兜底): %s", email, exc)
 
+    try:
+        auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+        bundle = _login_codex_via_browser_with_proxy(
+            email,
+            password,
+            mail_client=mail_client,
+            playwright_proxy_url=playwright_proxy_url,
+        )
+    except RegisterBlocked as exc:
+        # OAuth 阶段触发 add-phone / 双重验证 / 重复账号风控 — 不可恢复,锁 AUTH_INVALID
+        # 而非 STANDBY,避免下一轮 rotate 又选中它死循环。
+        logger.warning("[轮转] %s reinvite OAuth 被 add-phone/duplicate 阻断: %s", email, exc)
+        _cleanup_team_leftover("oauth_phone_blocked")
+        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        # Round 12 wire-up (C1) — 记录 auth_retry_* 状态字段(衰退式 retry / pause).
+        # 注意调用顺序: 已经 _cleanup_team_leftover 过, _record_auth_repair_failure 内
+        # 的 _release_auth_repair_team_seat 走 already_absent 路径, 不会重复 kick.
+        try:
+            _record_auth_repair_failure(
+                email, error_type="add_phone",
+                error_detail=str(exc),
+                chatgpt_api=chatgpt_api,
+            )
+        except Exception as repair_exc:
+            logger.warning(
+                "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
+                email, repair_exc,
+            )
+        try:
+            from autoteam.register_failures import record_failure
+            record_failure(email, "oauth_phone_blocked", stage="reinvite_account", detail=str(exc))
+        except Exception:
+            pass
+        return False
+
     if not bundle:
         logger.warning("[轮转] 旧账号 OAuth 登录失败，保持 standby: %s", email)
         _cleanup_team_leftover("no_bundle")
         update_account(email, status=STATUS_STANDBY)
+        # Round 12 wire-up (C1) — bundle 缺失走衰退式 retry, 而非死循环.
+        try:
+            _record_auth_repair_failure(
+                email, error_type="login_failed",
+                error_detail="oauth bundle missing",
+                chatgpt_api=chatgpt_api,
+            )
+        except Exception as repair_exc:
+            logger.warning(
+                "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
+                email, repair_exc,
+            )
         return False
 
+    plan_type_raw = bundle.get("plan_type_raw") or bundle.get("plan_type") or ""
     plan_type = (bundle.get("plan_type") or "").lower()
-    if plan_type != "team":
-        logger.warning("[轮转] 旧账号登录后 plan=%s，不是 team，恢复失败: %s", plan_type or "unknown", email)
-        _cleanup_team_leftover(f"plan={plan_type or 'unknown'}")
-        update_account(email, status=STATUS_STANDBY)
+    if not is_supported_plan(plan_type_raw):
+        # plan_type 不在白名单(self_serve_business_usage_based / enterprise / unknown 等)
+        # → 这种账号即使 OAuth 成功也无法稳定调用 Codex,锁 AUTH_INVALID 而非 standby。
+        logger.warning("[轮转] %s reinvite 后 plan_type=%s 不被支持,标 AUTH_INVALID", email, plan_type_raw)
+        _cleanup_team_leftover(f"plan_unsupported={plan_type_raw}")
+        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        # Round 12 wire-up (C1) — plan_unsupported 为永久失败, 走衰退式 retry 不
+        # 立刻无限循环(实际更可能等下次 OAuth 拿到正确 plan).
+        try:
+            _record_auth_repair_failure(
+                email, error_type="non_team_plan",
+                error_detail=f"plan_type={plan_type_raw}",
+                chatgpt_api=chatgpt_api,
+            )
+        except Exception as repair_exc:
+            logger.warning(
+                "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
+                email, repair_exc,
+            )
+        try:
+            from autoteam.register_failures import record_failure
+            record_failure(email, "plan_unsupported", stage="reinvite_account", detail=f"plan_type={plan_type_raw}")
+        except Exception:
+            pass
         return False
 
+    if plan_type != "team":
+        # plan 漂移(白名单内但不是 team,例如 free) — 邀请阶段成功的 Team 席位但 OAuth 拿到的
+        # 是个人 plan,反复 reinvite 也不会变 team。锁 AUTH_INVALID 让下游清账,不再死循环。
+        logger.warning("[轮转] %s reinvite 后 plan=%s 漂移,不是 team,标 AUTH_INVALID", email, plan_type or "unknown")
+        _cleanup_team_leftover(f"plan_drift={plan_type or 'unknown'}")
+        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        # Round 12 wire-up (C1) — 同 plan_unsupported, 走衰退式 retry.
+        try:
+            _record_auth_repair_failure(
+                email, error_type="non_team_plan",
+                error_detail=f"plan_drift plan_type={plan_type or 'unknown'}",
+                chatgpt_api=chatgpt_api,
+            )
+        except Exception as repair_exc:
+            logger.warning(
+                "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
+                email, repair_exc,
+            )
+        try:
+            from autoteam.register_failures import record_failure
+            record_failure(email, "plan_drift", stage="reinvite_account", detail=f"plan_type={plan_type or 'unknown'}")
+        except Exception:
+            pass
+        return False
+
+    _attach_account_proxy_to_bundle(email, bundle, auth_proxy_url)
     auth_file = save_auth_file(bundle)
 
     # OAuth 成功 plan=team 不等于"账号真的活了"。存在一类竞态:刚 kick 的账号在 OpenAI
@@ -2135,6 +5899,16 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                     update_account(email, last_quota=quota_info)
                 fail_reason = "exhausted"
                 logger.warning("[轮转] %s OAuth 成功但实测 exhausted,判定假恢复", email)
+            elif status_str == "no_quota":
+                # 没有发放任何配额(primary_total=0 或 rate_limit 字段全空),不是耗尽。
+                # 锁 5h 没意义,直接 AUTH_INVALID 让下游清账,避免反复假恢复。
+                fail_reason = "no_quota_assigned"
+                logger.warning("[轮转] %s reinvite 后未分配配额(no_quota),判定 AUTH_INVALID", email)
+            elif status_str == "network_error":
+                # 网络错误不是 token 风控也不是 quota 用尽。当作"未验证",走 exception 分支
+                # 同款处置:不锁 5h(token 还活着),让下一轮自然重试。
+                fail_reason = "network_error"
+                logger.warning("[轮转] %s 额度验证遇到临时网络错误,本轮判定未验证", email)
             else:
                 # auth_error/其他 — token 风控类,wham 401 token_revoked 落这里
                 fail_reason = "auth_error"
@@ -2156,6 +5930,22 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 quota_exhausted_at=now_ts,
                 quota_resets_at=now_ts + 18000,
             )
+        elif fail_reason == "no_quota_assigned":
+            # 后端没发配额 —— 不是耗尽,锁 5h 没用,锁 AUTH_INVALID 让下游清账。
+            update_account(
+                email,
+                status=STATUS_AUTH_INVALID,
+                auth_file=None,
+                quota_exhausted_at=None,
+                quota_resets_at=None,
+            )
+            try:
+                from autoteam.register_failures import record_failure
+                record_failure(email, "no_quota_assigned", stage="reinvite_account",
+                               detail="primary_total=0 or rate_limit_empty",
+                               raw_rate_limit=_extract_raw_rate_limit_str(info))
+            except Exception:
+                pass
         else:
             # token 风控/异常 —— 锁 5h 没用,token revoke 等不来。降级到 standby 但
             # 不写 quota_exhausted_at/resets_at,让下次有机会重新尝试 OAuth(说不定
@@ -2170,7 +5960,23 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             )
         return False
 
-    update_account(email, status=STATUS_ACTIVE, last_active_at=time.time(), auth_file=auth_file)
+    update_account(
+        email,
+        status=STATUS_ACTIVE,
+        last_active_at=time.time(),
+        auth_file=auth_file,
+        workspace_account_id=get_chatgpt_account_id() or None,
+    )
+    # Round 12 wire-up (C1) — 注册/复用成功后清空 auth_repair 状态字段,
+    # 避免历史 auth_retry_* 累积影响下次 cmd_rotate 跳过判断.
+    try:
+        _auth_repair_reset(email)
+    except Exception as repair_exc:
+        logger.warning(
+            "[轮转] %s _auth_repair_reset 抛异常(忽略): %s",
+            email, repair_exc,
+        )
+    _sync_ready_credential_to_targets(email, auth_file, stage_label="[轮转]")
     logger.info("[轮转] 旧账号已恢复: %s", email)
     return True
 
@@ -2280,6 +6086,11 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
                     elif status_str == "auth_error":
                         logger.info("[替换] 跳过 %s(token auth_error,无法验证额度)", cand_email)
                         continue
+                    # network_error:临时网络故障,不能当"额度恢复"凭证,本轮不复用,
+                    # 等下一轮再试(不动 acc 状态)
+                    elif status_str == "network_error":
+                        logger.info("[替换] 跳过 %s(临时网络错误,本轮无法验证额度)", cand_email)
+                        continue
             except Exception as exc:
                 logger.info("[替换] %s 额度验证抛异常(跳过): %s", cand_email, exc)
                 continue
@@ -2289,7 +6100,7 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
             continue
 
         logger.info("[替换] 尝试复用 standby: %s", cand_email)
-        if not chatgpt.browser:
+        if not _chatgpt_session_ready(chatgpt):
             chatgpt.start()
         if reinvite_account(chatgpt, mail_client, acc):
             outcome["filled_by"] = cand_email
@@ -2300,7 +6111,7 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
 
     # 4. 无可复用 standby → 创建新号
     logger.info("[替换] 无可复用 standby,创建新号补位...")
-    if not chatgpt.browser:
+    if not _chatgpt_session_ready(chatgpt):
         chatgpt.start()
     try:
         new_email = create_new_account(chatgpt, mail_client)
@@ -2331,7 +6142,7 @@ def cmd_replace_one(email, reason=""):
     try:
         return _replace_single(chatgpt, mail_client, email, reason=reason)
     finally:
-        if chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
         try:
             sync_to_cpa()
@@ -2355,7 +6166,7 @@ def cmd_replace_batch(emails, trigger=""):
     try:
         for email in emails:
             try:
-                if not chatgpt.browser:
+                if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 out = _replace_single(chatgpt, mail_client, email, reason=trigger or "batch")
                 outcomes.append({"email": email, **out})
@@ -2363,7 +6174,7 @@ def cmd_replace_batch(emails, trigger=""):
                 logger.error("[替换] %s 单个替换抛异常: %s", email, exc)
                 outcomes.append({"email": email, "kicked": False, "filled_by": None, "error": f"exception: {exc}"})
     finally:
-        if chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
         try:
             sync_to_cpa()
@@ -2375,7 +6186,157 @@ def cmd_replace_batch(emails, trigger=""):
     return outcomes
 
 
-def cmd_rotate(target_seats=5):
+# ---------------------------------------------------------------------------
+# Round 12 S6 — standby 复用单元(可被 ThreadPoolExecutor 并发调度).
+#
+# 把原 cmd_rotate 内 for 循环里"额度校验 → reinvite_account"两段抽出来,
+# 让 ROTATE_CONCURRENCY > 1 时多个席位的 mail wait 可并行(主要 IO 瓶颈).
+#
+# ⚠️ Round 12 wire-up (C3 fix) — chatgpt browser 调用 (reinvite_account 内的
+# chatgpt.invite_member / remove_from_team / fetch_team_state) 走 Playwright
+# sync_api,该 API **非线程安全**:多个 worker 共享同一 BrowserContext 会触发
+# `greenlet.error: cannot switch to a different thread` / `Connection closed`.
+# 因此 cmd_rotate 在 ROTATE_CONCURRENCY > 1 时会自动降级为串行,只让 mail
+# wait + auth file IO 单线程跑.要真正实现 per-worker browser context 需要
+# 重构 chatgpt_api 的 lifecycle (round-13 backlog).
+# ---------------------------------------------------------------------------
+_STANDBY_REUSE_RESULTS = frozenset({"reused", "skipped_quota", "skipped_auto", "failed"})
+
+
+def _reuse_one_standby(
+    acc: dict,
+    threshold: int,
+    *,
+    chatgpt_provider,
+    mail_provider,
+    reinvite_fn=None,
+    quota_fn=None,
+    now=None,
+) -> dict:
+    """Process one standby account end-to-end.
+
+    Parameters
+    ----------
+    acc:
+        Standby account dict (already filtered for non-main + STATUS_STANDBY).
+    threshold:
+        AUTO_CHECK_THRESHOLD percent — quota below this is treated as "not recovered".
+    chatgpt_provider:
+        Zero-arg callable returning a started :class:`ChatGPTTeamAPI` instance.
+    mail_provider:
+        ``acc -> mail_client`` callable (per-acc routed, S3 ensure_account_mail).
+    reinvite_fn:
+        Override for :func:`reinvite_account` (tests pass a mock).
+    quota_fn:
+        Override for :func:`check_codex_quota` (tests pass a mock).
+    now:
+        Override for ``time.time()`` (tests inject deterministic time).
+
+    Returns
+    -------
+    dict with keys ``email`` / ``result`` (one of ``_STANDBY_REUSE_RESULTS``) /
+    ``error`` (None on success, str on caught exception). Never raises —
+    failures land in ``result="failed"`` so concurrent map can aggregate.
+    """
+    reinvite_callable = reinvite_fn or reinvite_account
+    quota_callable = quota_fn or check_codex_quota
+    current_ts = now if now is not None else time.time()
+    email = (acc or {}).get("email") or "<unknown>"
+
+    try:
+        skip_reason = _auto_reuse_skip_reason(acc)
+        if skip_reason:
+            logger.info("[4/5] 跳过 %s（%s）", email, skip_reason)
+            return {"email": email, "result": "skipped_auto", "error": None}
+
+        # Round 12 wire-up (C1) — auth_repair 冷却 / 已暂停账号跳过本轮复用.
+        # _auth_repair_skip_reason 返回非空字符串 = 跳过(包含中文标签便于日志).
+        repair_skip = _auth_repair_skip_reason(acc)
+        if repair_skip:
+            logger.info("[4/5] 跳过 %s（%s）", email, repair_skip)
+            return {"email": email, "result": "skipped_auto", "error": None}
+
+        auth_file = acc.get("auth_file")
+        quota_ok = False
+        if auth_file and Path(auth_file).exists():
+            try:
+                auth_data = json.loads(read_text(Path(auth_file)))
+                access_token = auth_data.get("access_token")
+                if access_token:
+                    status_str, info = quota_callable(access_token)
+                    if status_str == "exhausted":
+                        quota_info = quota_result_quota_info(info)
+                        if quota_info:
+                            update_account(email, last_quota=quota_info)
+                        logger.info("[4/5] 跳过 %s（额度未恢复）", email)
+                        return {"email": email, "result": "skipped_quota", "error": None}
+                    if status_str == "ok" and isinstance(info, dict):
+                        p_remain = 100 - info.get("primary_pct", 0)
+                        if p_remain < threshold:
+                            logger.info("[4/5] 跳过 %s（剩余 %d%% < %d%%）", email, p_remain, threshold)
+                            return {"email": email, "result": "skipped_quota", "error": None}
+                        quota_ok = True
+                    if status_str == "network_error":
+                        logger.info("[4/5] 跳过 %s（临时网络错误,本轮无法验证额度）", email)
+                        return {"email": email, "result": "skipped_quota", "error": None}
+                    if status_str == "auth_error":
+                        lq = acc.get("last_quota")
+                        if lq:
+                            exhausted_info = _pending_historical_exhausted_info(lq)
+                            if exhausted_info:
+                                window_label = _quota_window_label(exhausted_info.get("window"))
+                                logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
+                                return {"email": email, "result": "skipped_quota", "error": None}
+                            p_resets = lq.get("primary_resets_at", 0)
+                            if p_resets and current_ts >= p_resets:
+                                logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
+                                quota_ok = True
+                            else:
+                                p_remain = 100 - lq.get("primary_pct", 0)
+                                if p_remain < threshold:
+                                    logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
+                                    return {"email": email, "result": "skipped_quota", "error": None}
+                                quota_ok = True
+            except Exception:
+                pass
+
+        if not quota_ok:
+            lq = acc.get("last_quota")
+            if lq:
+                exhausted_info = _pending_historical_exhausted_info(lq)
+                if exhausted_info:
+                    window_label = _quota_window_label(exhausted_info.get("window"))
+                    logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
+                    return {"email": email, "result": "skipped_quota", "error": None}
+                p_resets = lq.get("primary_resets_at", 0)
+                if p_resets and current_ts >= p_resets:
+                    logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
+                else:
+                    p_remain = 100 - lq.get("primary_pct", 0)
+                    if p_remain < threshold:
+                        logger.info("[4/5] 跳过 %s（历史额度 %d%% < %d%%）", email, p_remain, threshold)
+                        return {"email": email, "result": "skipped_quota", "error": None}
+            else:
+                resets_at = acc.get("quota_resets_at")
+                if resets_at and current_ts < resets_at:
+                    mins = max(0, int((resets_at - current_ts) / 60))
+                    logger.info("[4/5] 跳过 %s（%d 分钟后恢复）", email, mins)
+                    return {"email": email, "result": "skipped_quota", "error": None}
+
+        logger.info("[4/5] 复用: %s", email)
+        chatgpt = chatgpt_provider()
+        mail_client = mail_provider(acc)
+        ok = reinvite_callable(chatgpt, mail_client, acc)
+        if ok:
+            return {"email": email, "result": "reused", "error": None}
+        return {"email": email, "result": "failed", "error": "reinvite_account returned False"}
+    except Exception as exc:
+        # 关键: 并发模式下任何席位异常都不能波及其他席位,聚合层做 failed 计数.
+        logger.exception("[4/5] %s 复用流程抛异常,标记 failed: %s", email, exc)
+        return {"email": email, "result": "failed", "error": str(exc)}
+
+
+def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=False):
     """
     智能轮转 - 保持 Team 始终有 target_seats 个可用成员，尽量少创建新账号。
 
@@ -2385,10 +6346,19 @@ def cmd_rotate(target_seats=5):
     3. 统计当前 Team 空缺数
     4. 优先从 standby 中选额度已恢复的旧账号填补
     5. 仅当所有旧账号都不可用时，才创建新账号
-    """
-    TARGET = target_seats
 
-    from autoteam.config import AUTO_CHECK_THRESHOLD
+    Round 12 S3 cherry-pick:
+      - vacancy 兜底改用 _estimate_local_team_member_count(替代旧 STATUS_ACTIVE 单字段统计).
+      - ensure_account_mail(acc) 按账号 mail_provider 路由 mail client(S2 多 provider 必备).
+      - 双指标终止条件: current_count >= TARGET AND pool_active >= ACTIVE_TARGET
+        (避免 "Team 满员但本地全是 standby/auth_invalid" 假满足).
+    """
+    TARGET = _clamp_team_target_seats(target_seats)
+    ACTIVE_TARGET = _pool_active_target(TARGET)
+    started_at = time.time()
+
+    from autoteam.config import AUTO_CHECK_THRESHOLD, ROTATE_MAX_DURATION, ROTATE_SKIP_REUSE
+    rotate_deadline = started_at + float(ROTATE_MAX_DURATION)
 
     try:
         from autoteam.api import _auto_check_config
@@ -2397,59 +6367,183 @@ def cmd_rotate(target_seats=5):
     except ImportError:
         threshold = AUTO_CHECK_THRESHOLD
 
+    def _bump(stage: str) -> None:
+        try:
+            from autoteam.api import bump_task_progress
+
+            bump_task_progress(stage)
+        except Exception:
+            pass
+
+    def _deadline_exceeded(stage: str) -> bool:
+        if time.time() < rotate_deadline:
+            return False
+        logger.warning(
+            "[轮转] 总时长熔断触发 (%s)，已用 %ds，优雅退出本轮 rotate",
+            stage,
+            int(time.time() - started_at),
+        )
+        return True
+
+    skip_reuse = bool(ROTATE_SKIP_REUSE)
+    if skip_reuse:
+        logger.info("[轮转] ROTATE_SKIP_REUSE 启用：跳过旧号复用，优先释放不可用占席子号后创建新号")
+
     chatgpt = None
     mail_client = None
+    # 按账号 mail_provider 复用 mail client(同 provider 只 login 一次,避免 N 个号 N 次握手)
+    reuse_mail_clients: dict[str, object] = {}
 
     def ensure_chatgpt():
         nonlocal chatgpt
-        if not chatgpt or not chatgpt.browser:
+        if not chatgpt or not _chatgpt_session_ready(chatgpt):
             chatgpt = ChatGPTTeamAPI()
             chatgpt.start()
         return chatgpt
 
     def ensure_mail():
+        """全局默认 mail client(给"创建新号"等不绑定具体 acc 的路径用).
+
+        旧路径仍走 CloudMailClient()(等价 get_mail_client(),由 MAIL_PROVIDER /
+        MAIL_PROVIDER_CHAIN 决定). 已绑定 mail_provider 的旧 acc 复用走
+        ensure_account_mail(acc).
+        """
         nonlocal mail_client
         if not mail_client:
             mail_client = CloudMailClient()
             mail_client.login()
         return mail_client
 
+    def ensure_account_mail(acc):
+        """按账号 mail_provider 路由 mail client(上游 `.upstream/manager.py:132` _get_account_mail_client 等价).
+
+        - 已绑定 mail_provider / mail_account_id / cloudmail_account_id 的 acc → 走对应 provider
+          (从 reuse_mail_clients 缓存复用).
+        - 未绑定 → fallback 全局默认 ensure_mail()(向后兼容旧 CloudMail 主路径).
+
+        S2 多 provider 接入(addy_io / simplelogin / maillab / cf_temp_email)的关键基础设施.
+        """
+        acc = acc or {}
+        provider_name = (acc.get("mail_provider") or "").strip().lower()
+        has_explicit_binding = bool(provider_name) or acc.get("mail_account_id") is not None
+        has_legacy_binding = acc.get("cloudmail_account_id") is not None
+
+        if not (has_explicit_binding or has_legacy_binding):
+            return ensure_mail()
+
+        # 缓存键: provider 名优先,其次 account_id 单 provider 模式
+        cache_key = provider_name or f"_legacy_cloudmail:{acc.get('cloudmail_account_id')}"
+        cached = reuse_mail_clients.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            from autoteam.mail import get_mail_client
+
+            client = get_mail_client()
+            login = getattr(client, "login", None)
+            if callable(login):
+                login()
+            reuse_mail_clients[cache_key] = client
+            return client
+        except Exception as exc:
+            logger.warning(
+                "[轮转] 账号 %s 指定 mail_provider=%s 路由失败,回退默认: %s",
+                acc.get("email"),
+                provider_name or "<legacy>",
+                exc,
+            )
+            return ensure_mail()
+
     logger.info("[1/5] 同步 Team 状态...")
+    _bump("rotate:sync_team")
     sync_account_states()
 
     logger.info("[2/5] 检查额度...")
+    _bump("rotate:check_quota")
     cmd_check()
+
+    # Round 12 S5 — 预测式抢先替换(可选,默认关).
+    # 仅当 PREDICTIVE_ENABLED=true 时执行: 遍历 ACTIVE 子号,基于 quota_history
+    # 时序拟合预测耗尽时刻,在 PREDICTIVE_LEAD_MIN 分钟内的主动 kick → STANDBY,
+    # 让后续 [3/5] vacancy 兜底 + [5/5] 新号填补流程自动接管.
+    try:
+        from autoteam.config import PREDICTIVE_ENABLED, PREDICTIVE_LEAD_MIN
+    except ImportError:
+        PREDICTIVE_ENABLED = False
+        PREDICTIVE_LEAD_MIN = 15
+    if PREDICTIVE_ENABLED:
+        try:
+            from autoteam.quota_predictor import default_predictor
+
+            preempt_candidates = []
+            for acc in load_accounts():
+                if _is_main_account_email(acc.get("email")) or acc.get("status") != STATUS_ACTIVE:
+                    continue
+                # 先记录当前 last_quota → 累积历史(用 acc.last_quota,避免重复 API 调用)
+                lq = acc.get("last_quota") or {}
+                p_remain = 100 - lq.get("primary_pct", 0) if "primary_pct" in lq else None
+                if p_remain is not None:
+                    default_predictor.record(acc["email"], p_remain, lq.get("primary_resets_at"))
+                if default_predictor.should_preempt(acc["email"], PREDICTIVE_LEAD_MIN):
+                    preempt_candidates.append(acc)
+            if preempt_candidates:
+                logger.info("[2.5/5] 预测式抢先替换 %d 个即将耗尽的账号...", len(preempt_candidates))
+                if not chatgpt or not _chatgpt_session_ready(chatgpt):
+                    ensure_chatgpt()
+                for acc in preempt_candidates:
+                    email = acc["email"]
+                    remove_status = remove_from_team(chatgpt, email, return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        update_account(email, status=STATUS_STANDBY, _reason="predictive_preempt")
+                        logger.info("[2.5/5] %s → standby（预测式抢先,lead=%dmin）", email, PREDICTIVE_LEAD_MIN)
+            else:
+                logger.debug("[2.5/5] 预测式: 无 ACTIVE 子号需要抢先替换")
+        except Exception as exc:
+            logger.warning("[2.5/5] 预测式抢先替换异常(忽略,走旧路径): %s", exc)
 
     try:
         # 移出所有 exhausted 账号（包括之前已标记的）
         all_accounts = load_accounts()
         all_exhausted = [
-            a for a in all_accounts if a["status"] == STATUS_EXHAUSTED and not _is_main_account_email(a.get("email"))
+            a
+            for a in all_accounts
+            if _is_replaceable_pool_blocker(a)
         ]
         initial_api_count = -1
         removed_now = 0
         already_absent_count = 0
 
         if all_exhausted:
-            logger.info("[3/5] 移出 %d 个额度用完的账号...", len(all_exhausted))
+            logger.info("[3/5] 移出 %d 个不可用占席账号...", len(all_exhausted))
             ensure_chatgpt()
             initial_api_count = get_team_member_count(chatgpt)
             for acc in all_exhausted:
+                if _deadline_exceeded("rotate:remove_blockers"):
+                    break
                 email = acc["email"]
-                if not chatgpt.browser:
+                reason = _replaceable_pool_blocker_reason(acc) or "replaceable_pool_blocker"
+                if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 remove_status = remove_from_team(chatgpt, email, return_status=True)
                 if remove_status in ("removed", "already_absent"):
-                    update_account(email, status=STATUS_STANDBY)
+                    update_account(email, status=STATUS_STANDBY, _reason=reason)
                     if remove_status == "removed":
                         removed_now += 1
-                        logger.info("[3/5] %s → standby（已从 Team 移出）", email)
+                        logger.info("[3/5] %s → standby（已从 Team 移出）| reason=%s", email, reason)
+                        _wait_for_remote_capacity_after_removal(
+                            chatgpt,
+                            target=TARGET,
+                            removed_email=email,
+                            timeout=24,
+                            stage_label="[3/5]",
+                        )
                     else:
                         already_absent_count += 1
-                        logger.info("[3/5] %s → standby（远端已不存在）", email)
+                        logger.info("[3/5] %s → standby（远端已不存在）| reason=%s", email, reason)
         else:
             logger.info("[3/5] 无需移出账号")
-        if not chatgpt or not chatgpt.browser:
+        if not chatgpt or not _chatgpt_session_ready(chatgpt):
             ensure_chatgpt()
         api_count = get_team_member_count(chatgpt)
         logger.info(
@@ -2459,10 +6553,15 @@ def cmd_rotate(target_seats=5):
             already_absent_count,
         )
         if api_count <= 0:
-            # API 返回异常，用本地 active 账号数兜底
-            local_active = sum(1 for a in load_accounts() if a["status"] == STATUS_ACTIVE)
-            logger.warning("[4/5] API 成员数异常 (%d)，使用本地 active 数: %d", api_count, local_active)
-            current_count = local_active
+            # API 返回异常,用 _estimate_local_team_member_count 兜底
+            # (上游 `.upstream/manager.py:183` 等价: ACTIVE+EXHAUSTED+AUTH_INVALID 全算席位).
+            local_estimate = _estimate_local_team_member_count(TARGET)
+            logger.warning(
+                "[4/5] API 成员数异常 (%d)，使用本地估算: %d (含 ACTIVE/EXHAUSTED/AUTH_INVALID + 主号)",
+                api_count,
+                local_estimate,
+            )
+            current_count = local_estimate
         else:
             # 保守估算当前成员数：
             # - api_count 是移除后的最新观察值
@@ -2485,7 +6584,12 @@ def cmd_rotate(target_seats=5):
                 # 只移除本地管理的账号，优先移除额度最低的
                 all_accs = load_accounts()
                 local_active = [
-                    a for a in all_accs if a["status"] == STATUS_ACTIVE and not _is_main_account_email(a.get("email"))
+                    a
+                    for a in all_accs
+                    if a["status"] == STATUS_ACTIVE
+                    and not _is_main_account_email(a.get("email"))
+                    and not is_account_disabled(a)
+                    and not _is_protected_local_credential_seat(a)
                 ]
                 # 按额度排序，额度低的优先移除
                 local_active.sort(key=lambda a: 100 - (a.get("last_quota") or {}).get("primary_pct", 0))
@@ -2507,110 +6611,131 @@ def cmd_rotate(target_seats=5):
         logger.info("[4/5] 填补 %d 个空缺 (当前 %d/%d)...", vacancies, current_count, TARGET)
 
         # 优先复用旧账号（先验证额度是否真的恢复了）
+        # Round 12 S6 — ROTATE_CONCURRENCY > 1 时用 ThreadPoolExecutor 并发,
+        # 否则保持串行(向后兼容老行为). 每席位独立 try/except 在 _reuse_one_standby
+        # 内已收敛 → result ∈ {reused / skipped_quota / skipped_auto / failed}.
         filled = 0
         standby_list = [a for a in get_standby_accounts() if not _is_main_account_email(a.get("email"))]
-        quota_skipped = []
-        auto_reuse_skipped = []
+        quota_skipped: list[dict] = []
+        auto_reuse_skipped: list[dict] = []
 
         from autoteam import cancel_signal
+        from autoteam.config import ROTATE_CONCURRENCY
 
-        for acc in standby_list:
-            if cancel_signal.is_cancelled():
-                logger.warning("[轮转] 收到取消请求,中止 standby 复用阶段")
-                break
-            if filled >= vacancies:
-                break
-            email = acc["email"]
-            auth_file = acc.get("auth_file")
+        # 注: 不截断到 vacancies — 旧行为会迭代全部 standby,遇到不可复用的(skipped_auto/
+        # skipped_quota)就继续看下一个,直到 filled >= vacancies 才 break. 截断会导致
+        # 第一个候选若 skipped 则放弃后续可用候选,破坏 test_cmd_rotate_skips_google_accounts.
+        if skip_reuse:
+            logger.info("[4/5] ROTATE_SKIP_REUSE 启用：跳过 standby 复用，直接创建新账号补位")
+            candidates = []
+        else:
+            candidates = list(standby_list)
 
-            skip_reason = _auto_reuse_skip_reason(acc)
-            if skip_reason:
-                logger.info("[4/5] 跳过 %s（%s）", email, skip_reason)
-                auto_reuse_skipped.append(acc)
-                continue
-
-            # 验证额度是否真的恢复了
-            quota_ok = False
-            if auth_file and Path(auth_file).exists():
-                try:
-                    auth_data = json.loads(read_text(Path(auth_file)))
-                    access_token = auth_data.get("access_token")
-                    if access_token:
-                        status_str, info = check_codex_quota(access_token)
-                        if status_str == "exhausted":
-                            quota_info = quota_result_quota_info(info)
-                            if quota_info:
-                                update_account(email, last_quota=quota_info)
-                            logger.info("[4/5] 跳过 %s（额度未恢复）", email)
-                            quota_skipped.append(acc)
-                            continue
-                        if status_str == "ok" and isinstance(info, dict):
-                            p_remain = 100 - info.get("primary_pct", 0)
-                            if p_remain < threshold:
-                                logger.info("[4/5] 跳过 %s（剩余 %d%% < %d%%）", email, p_remain, threshold)
-                                quota_skipped.append(acc)
-                                continue
-                            quota_ok = True
-                        # auth_error: token 失效，用 last_quota 判断（但重置时间已过的不算）
-                        if status_str == "auth_error":
-                            lq = acc.get("last_quota")
-                            if lq:
-                                exhausted_info = _pending_historical_exhausted_info(lq)
-                                if exhausted_info:
-                                    window_label = _quota_window_label(exhausted_info.get("window"))
-                                    logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
-                                    quota_skipped.append(acc)
-                                    continue
-                                p_resets = lq.get("primary_resets_at", 0)
-                                if p_resets and time.time() >= p_resets:
-                                    logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
-                                    quota_ok = True
-                                else:
-                                    p_remain = 100 - lq.get("primary_pct", 0)
-                                    if p_remain < threshold:
-                                        logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
-                                        quota_skipped.append(acc)
-                                        continue
-                                    quota_ok = True
-                except Exception:
-                    pass
-
-            # 没有认证文件或无法查询额度时，用 last_quota / quota_resets_at 兜底
-            if not quota_ok:
-                lq = acc.get("last_quota")
-                if lq:
-                    exhausted_info = _pending_historical_exhausted_info(lq)
-                    if exhausted_info:
-                        window_label = _quota_window_label(exhausted_info.get("window"))
-                        logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
-                        quota_skipped.append(acc)
-                        continue
-                    p_resets = lq.get("primary_resets_at", 0)
-                    if p_resets and time.time() >= p_resets:
-                        # 重置时间已过，旧数据作废，视为额度已恢复
-                        logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
-                    else:
-                        p_remain = 100 - lq.get("primary_pct", 0)
-                        if p_remain < threshold:
-                            logger.info("[4/5] 跳过 %s（历史额度 %d%% < %d%%）", email, p_remain, threshold)
-                            quota_skipped.append(acc)
-                            continue
-                else:
-                    # 没有 last_quota，看 quota_resets_at 是否已过
-                    resets_at = acc.get("quota_resets_at")
-                    if resets_at and time.time() < resets_at:
-                        mins = max(0, int((resets_at - time.time()) / 60))
-                        logger.info("[4/5] 跳过 %s（%d 分钟后恢复）", email, mins)
-                        quota_skipped.append(acc)
-                        continue
-
-            logger.info("[4/5] 复用: %s", email)
-            if not chatgpt or not chatgpt.browser:
+        def _chatgpt_provider():
+            if not chatgpt or not _chatgpt_session_ready(chatgpt):
                 ensure_chatgpt()
-            if reinvite_account(chatgpt, ensure_mail(), acc):
-                filled += 1
-                current_count += 1
-            else:
+            return chatgpt
+
+        def _process(acc):
+            return _reuse_one_standby(
+                acc,
+                threshold,
+                chatgpt_provider=_chatgpt_provider,
+                mail_provider=ensure_account_mail,
+            )
+
+        outcomes: list[dict] = []
+        # Round 12 wire-up (C3) — Playwright sync_api is not thread-safe;
+        # multiple workers sharing the same chatgpt BrowserContext crash
+        # with greenlet.error.  Until per-worker browser lifecycle is added
+        # (round-13 backlog), force serial when reinvite_account is the
+        # action (it touches chatgpt browser).  Allow opt-out via
+        # ROTATE_CONCURRENCY_ALLOW_BROWSER_RACE=1 for advanced users who
+        # mock chatgpt away (only tests do that).
+        _allow_browser_race = os.environ.get(
+            "ROTATE_CONCURRENCY_ALLOW_BROWSER_RACE", "0"
+        ).strip().lower() in ("1", "true", "yes")
+        effective_concurrency = ROTATE_CONCURRENCY
+        if ROTATE_CONCURRENCY > 1 and not _allow_browser_race:
+            logger.warning(
+                "[4/5] ROTATE_CONCURRENCY=%d 已配置,但 reinvite_account 走 "
+                "Playwright sync_api(非线程安全),自动降级为串行以避免 "
+                "BrowserContext 跨线程崩溃 (C3). 如已通过 mock 绕开 browser "
+                "调用,可设 ROTATE_CONCURRENCY_ALLOW_BROWSER_RACE=1 强制并发.",
+                ROTATE_CONCURRENCY,
+            )
+            effective_concurrency = 1
+        if effective_concurrency <= 1 or len(candidates) <= 1:
+            # 串行: 完全等同改造前的 for 循环行为(测试可复现)
+            for acc in candidates:
+                if cancel_signal.is_cancelled():
+                    logger.warning("[轮转] 收到取消请求,中止 standby 复用阶段")
+                    break
+                if _deadline_exceeded("rotate:standby_reuse"):
+                    break
+                if filled >= vacancies:
+                    break
+                result = _process(acc)
+                outcomes.append(result)
+                if result["result"] == "reused":
+                    filled += 1
+                    current_count += 1
+        else:
+            # 并发: 邮件 wait + OTP 提取是主要 IO 瓶颈,ThreadPoolExecutor 显著缩短
+            # 轮转总时长. 注意 — 并发模式会同时处理至多 vacancies + concurrency 个候选,
+            # 比串行多做一些"探测",换取吞吐. 已 reused 数量达到 vacancies 后停止 submit.
+            import concurrent.futures
+
+            workers = max(1, min(effective_concurrency, len(candidates), vacancies))
+            logger.info("[4/5] 并发复用 standby(候选 %d,max_workers=%d)...", len(candidates), workers)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                future_map: dict = {}
+                # 先 submit 一批(数量 = workers),后续按 future 完成情况补 submit.
+                pending = iter(candidates)
+                for _ in range(workers):
+                    nxt = next(pending, None)
+                    if nxt is None:
+                        break
+                    future_map[pool.submit(_process, nxt)] = nxt
+
+                while future_map and filled < vacancies:
+                    done, _not_done = concurrent.futures.wait(
+                        future_map, return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    for future in done:
+                        future_map.pop(future, None)
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            logger.exception("[4/5] 并发任务异常: %s", exc)
+                            result = {"email": "<unknown>", "result": "failed", "error": str(exc)}
+                        outcomes.append(result)
+                        if result["result"] == "reused":
+                            filled += 1
+                            current_count += 1
+                        # 还能补 submit 且未达 vacancies → 拉新候选
+                        if filled < vacancies and not cancel_signal.is_cancelled():
+                            nxt = next(pending, None)
+                            if nxt is not None:
+                                future_map[pool.submit(_process, nxt)] = nxt
+                # cancel pending(已 submit 但还未完成的会跑完),不再 submit 新 task
+                if cancel_signal.is_cancelled():
+                    logger.warning("[轮转] 收到取消请求,等待 in-flight 完成后中止")
+                # 收尾: 等剩余 in-flight 完成(filled 已够了仍要收 result 避免线程泄漏)
+                for future in concurrent.futures.as_completed(list(future_map)):
+                    try:
+                        outcomes.append(future.result())
+                    except Exception as exc:
+                        outcomes.append({"email": "<unknown>", "result": "failed", "error": str(exc)})
+
+        # 聚合分类: 并发模式 outcomes 顺序与候选不同,但分类计数稳定
+        for outcome in outcomes:
+            email = outcome["email"]
+            acc = next((a for a in candidates if a.get("email") == email), {"email": email})
+            res = outcome["result"]
+            if res == "skipped_auto":
+                auto_reuse_skipped.append(acc)
+            elif res == "skipped_quota" or res == "failed":
                 quota_skipped.append(acc)
 
         if quota_skipped:
@@ -2628,28 +6753,82 @@ def cmd_rotate(target_seats=5):
                 if cancel_signal.is_cancelled():
                     logger.warning("[轮转] 收到取消请求,已创建 %d/%d 个新号", i, remaining)
                     break
+                if _deadline_exceeded("rotate:create_new"):
+                    break
                 logger.info("[5/5] 创建第 %d/%d 个...", i + 1, remaining)
-                if not chatgpt or not chatgpt.browser:
+                if not chatgpt or not _chatgpt_session_ready(chatgpt):
                     ensure_chatgpt()
-                if create_new_account(chatgpt, ensure_mail()):
+                created_email = create_new_account(chatgpt, ensure_mail())
+                if created_email and (
+                    not isinstance(created_email, str)
+                    or _validate_managed_account_operational(
+                        created_email,
+                        threshold=threshold,
+                        stage_label="[轮转验收]",
+                        chatgpt_api=chatgpt,
+                    )
+                ):
                     current_count += 1
+                elif created_email:
+                    logger.warning("[5/5] 新账号未通过运行验收，释放席位并丢弃: %s", created_email)
+                    if not _chatgpt_session_ready(chatgpt):
+                        chatgpt.start()
+                    remove_status = remove_from_team(chatgpt, created_email, return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        update_account(created_email, status=STATUS_STANDBY, _reason="new_account_not_ready")
 
-        if not chatgpt or not chatgpt.browser:
+        if not chatgpt or not _chatgpt_session_ready(chatgpt):
             ensure_chatgpt()
         final_count = get_team_member_count(chatgpt)
-        logger.info("[轮转] 最终 Team 成员数: %d（目标: %d）", final_count, TARGET)
+        # 双指标终止条件 (Round 12 S3 cherry-pick, 上游 `.upstream/manager.py` 终止条件):
+        #   final_count >= TARGET 且 pool_active >= ACTIVE_TARGET 才算"真满员".
+        # 避免"Team 满员但本地全是 standby/auth_invalid → 实际可用 0"假正常状态.
+        final_pool_active = _count_pool_active_accounts()
+        logger.info(
+            "[轮转] 最终 Team 成员数: %d（目标: %d），子号 pool_active=%d（目标: %d）",
+            final_count,
+            TARGET,
+            final_pool_active,
+            ACTIVE_TARGET,
+        )
         if final_count > TARGET:
             logger.warning("[轮转] 最终 Team 成员数超出目标，后续将按清理逻辑修正")
         elif 0 <= final_count < TARGET:
             logger.warning("[轮转] 最终 Team 成员数仍低于目标 (%d/%d)", final_count, TARGET)
+        elif final_pool_active < ACTIVE_TARGET:
+            logger.warning(
+                "[轮转] Team 满员但本地子号 pool_active 不足 (%d/%d) — 子号多为 standby/auth_invalid,"
+                "下一轮会继续修复或补号",
+                final_pool_active,
+                ACTIVE_TARGET,
+            )
 
     finally:
-        if chatgpt and chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
-        # 所有操作完成后统一同步 CPA，避免中途同步导致 CPA 不可用
-        logger.info("[轮转] 轮转完成，同步 CPA...")
-        sync_to_cpa()
-        logger.info("[轮转] 完成，使用 status 命令查看最新状态")
+        # 所有操作完成后统一同步远端，避免中途同步导致远端状态不一致。
+        logger.info("[轮转] 轮转完成，同步已启用远端...")
+        if background_post_sync:
+            _schedule_post_task_sync("[轮转]")
+            logger.info("[轮转] 完成，远端同步已转入后台；使用 status 命令查看最新状态")
+        else:
+            sync_to_cpa()
+            logger.info("[轮转] 完成，使用 status 命令查看最新状态")
+        # Round 9 RT-5 — cmd_rotate 收尾跑一次 retroactive(走 5min cache,失败仅 warning)。
+        # spec/shared/master-subscription-health.md v1.1 §11.3。
+        try:
+            from autoteam.master_health import _apply_master_degraded_classification
+
+            retro = _apply_master_degraded_classification()
+            if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+                logger.info(
+                    "[轮转] retroactive: GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                    len(retro.get("marked_grace") or []),
+                    len(retro.get("marked_standby") or []),
+                    len(retro.get("reverted_active") or []),
+                )
+        except Exception as exc:
+            logger.warning("[轮转] retroactive helper 异常: %s", exc)
 
 
 def cmd_add():
@@ -2667,7 +6846,7 @@ def cmd_add():
         else:
             logger.error("[添加] 添加失败")
     finally:
-        if chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
 
 
@@ -2900,14 +7079,18 @@ def get_team_member_count(chatgpt_api):
     return len(members)
 
 
-def cmd_fill(target=5, leave_workspace=False):
+def cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=True, direct_parallel: int | None = None):
     """
     补位流程。
     leave_workspace=False: 补满 Team 席位到 target（原行为），优先复用 standby 旧号
     leave_workspace=True:  按 target 作为"要生产的免费号数量"，每个账号注册后立刻退出 Team、走 personal OAuth
+    post_sync=False:       调度器批量执行时跳过每个 worker 内部 CPA 同步，由父任务收敛同步
+    print_status=False:    调度器批量执行时跳过每个 worker 内部状态表输出
     """
     if leave_workspace:
         return _cmd_fill_personal(target)
+    target = _clamp_team_target_seats(target)
+    from autoteam.config import AUTO_CHECK_THRESHOLD, ROTATE_SKIP_REUSE
 
     chatgpt = ChatGPTTeamAPI()
     chatgpt.start()
@@ -2928,11 +7111,17 @@ def cmd_fill(target=5, leave_workspace=False):
             return
 
         logger.info("[填充] 需要添加 %d 个账号", need)
-        standby_list = [
-            a
-            for a in get_standby_accounts()
-            if a.get("_quota_recovered") and not _is_main_account_email(a.get("email"))
-        ]
+        if ROTATE_SKIP_REUSE:
+            logger.info("[填充] ROTATE_SKIP_REUSE 启用：不复用旧账号，只创建新账号补位")
+            standby_list = []
+        else:
+            standby_list = [
+                a
+                for a in get_standby_accounts()
+                if a.get("_quota_recovered")
+                and not _is_main_account_email(a.get("email"))
+                and not is_account_disabled(a)
+            ]
         standby_index = 0
 
         from autoteam import cancel_signal
@@ -2954,8 +7143,8 @@ def cmd_fill(target=5, leave_workspace=False):
                     logger.info("[填充] 跳过旧账号: %s（%s）", email, skip_reason)
                     continue
                 logger.info("[填充] 复用旧账号: %s", email)
-                # 确保 chatgpt 浏览器可用
-                if not chatgpt.browser:
+                # 确保 Team API session 可用；auto transport 不一定有 browser。
+                if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 added = reinvite_account(chatgpt, mail_client, reusable)
                 if added:
@@ -2965,26 +7154,48 @@ def cmd_fill(target=5, leave_workspace=False):
             if not added:
                 # 创建新账号
                 logger.info("[填充] 创建新账号...")
-                if not chatgpt.browser:
+                if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
-                added = create_new_account(chatgpt, mail_client)
+                if direct_parallel is None:
+                    created_email = create_new_account(chatgpt, mail_client)
+                else:
+                    created_email = create_new_account(chatgpt, mail_client, parallel=direct_parallel)
+                if created_email and (
+                    not isinstance(created_email, str)
+                    or _validate_managed_account_operational(
+                        created_email,
+                        threshold=AUTO_CHECK_THRESHOLD,
+                        stage_label="[填充验收]",
+                        chatgpt_api=chatgpt,
+                    )
+                ):
+                    added = created_email
+                elif created_email:
+                    logger.warning("[填充] 新账号未通过运行验收，释放席位并丢弃: %s", created_email)
+                    if not _chatgpt_session_ready(chatgpt):
+                        chatgpt.start()
+                    remove_status = remove_from_team(chatgpt, created_email, return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        update_account(created_email, status=STATUS_STANDBY, _reason="fill_new_account_not_ready")
 
             if not added:
                 logger.warning("[填充] 本轮补位失败，第 %d/%d 个空缺仍未填上", i + 1, need)
 
             # 验证成员数
-            if not chatgpt.browser:
+            if not _chatgpt_session_ready(chatgpt):
                 chatgpt.start()
             new_count = get_team_member_count(chatgpt)
             if new_count >= 0:
                 logger.info("[填充] 当前成员数: %d/%d", new_count, target)
 
         logger.info("[填充] 填充完成")
-        sync_to_cpa()
-        cmd_status()
+        if post_sync:
+            sync_to_cpa()
+        if print_status:
+            cmd_status()
 
     finally:
-        if chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
 
 
@@ -3144,7 +7355,8 @@ def _cmd_fill_personal(count):
     生产 count 个免费号:注册 → 主号踢出 → personal OAuth → 状态置 PERSONAL。
 
     风控策略(用户明确要求):
-    1. 一个主号同时最多 4 个子号在 Team 里 → 每批限制 this_round = min(4, remaining)
+    1. 一个主号同时最多 TEAM_SUB_ACCOUNT_HARD_CAP 个子号在 Team 里
+       → 每批限制 this_round 不超过当前可用子号席位
     2. 不强制清空 Team 现有席位:进入时把非主号成员邮箱快照为 baseline(可能是 Team fill
        创建的真实 Team 子号,用户希望保留)。每批结束后只等"本批注册的新号"被踢干净,
        不管 baseline 成员是否还在。
@@ -3158,7 +7370,7 @@ def _cmd_fill_personal(count):
         logger.info("[免费号] 数量为 0，跳过")
         return
 
-    BATCH_SIZE = 4
+    BATCH_SIZE = TEAM_SUB_ACCOUNT_HARD_CAP
     WAIT_TEAM_EMPTY_TIMEOUT = 180
 
     mail_client = CloudMailClient()
@@ -3168,13 +7380,13 @@ def _cmd_fill_personal(count):
     chatgpt = [None]
 
     def _ensure_chatgpt():
-        if not chatgpt[0] or not chatgpt[0].browser:
+        if not chatgpt[0] or not _chatgpt_session_ready(chatgpt[0]):
             chatgpt[0] = ChatGPTTeamAPI()
             chatgpt[0].start()
         return chatgpt[0]
 
     def _stop_chatgpt():
-        if chatgpt[0] and chatgpt[0].browser:
+        if chatgpt[0]:
             try:
                 chatgpt[0].stop()
             except Exception as exc:
@@ -3242,7 +7454,7 @@ def _cmd_fill_personal(count):
                 logger.warning("[免费号] 收到取消请求,停止后续批次")
                 break
             batch_idx += 1
-            # Team 席位总上限 TEAM_SUB_ACCOUNT_HARD_CAP(4):baseline 已占了一部分,
+            # Team 席位总上限 TEAM_SUB_ACCOUNT_HARD_CAP:baseline 已占了一部分,
             # 本批最多再加 (cap - baseline) 个,严格不超员。若 baseline 已占满,
             # 入口处已经拒绝并 return,这里不会走到。
             max_new_this_batch = TEAM_SUB_ACCOUNT_HARD_CAP - len(baseline_emails)
@@ -3562,6 +7774,159 @@ def cmd_pull_cpa():
     return result
 
 
+def cmd_reset_quota_recovery():
+    """清空所有托管非主号账号的本地额度恢复记录。"""
+    accounts = load_accounts()
+    if not accounts:
+        summary = {
+            "total_accounts": 0,
+            "updated_accounts": 0,
+            "rearmed_exhausted_to_active": 0,
+            "rearmed_exhausted_to_auth_pending": 0,
+        }
+        logger.info("[额度重置] 本地无账号记录")
+        return summary
+
+    total_accounts = 0
+    updated_accounts = 0
+    rearmed_to_active = 0
+    rearmed_to_auth_pending = 0
+
+    for acc in accounts:
+        email = acc.get("email", "")
+        if _is_main_account_email(email):
+            continue
+
+        total_accounts += 1
+        changed = False
+
+        for key in ("last_quota", "quota_resets_at", "quota_exhausted_at", "quota_window"):
+            if acc.get(key) is not None:
+                acc[key] = None
+                changed = True
+
+        if acc.get("status") == STATUS_EXHAUSTED:
+            desired_status = STATUS_ACTIVE if _has_auth_file(acc) else STATUS_AUTH_PENDING
+            if acc.get("status") != desired_status:
+                acc["status"] = desired_status
+                changed = True
+            if desired_status == STATUS_ACTIVE:
+                rearmed_to_active += 1
+            else:
+                rearmed_to_auth_pending += 1
+
+        if changed:
+            updated_accounts += 1
+
+    if updated_accounts:
+        save_accounts(accounts)
+
+    summary = {
+        "total_accounts": total_accounts,
+        "updated_accounts": updated_accounts,
+        "rearmed_exhausted_to_active": rearmed_to_active,
+        "rearmed_exhausted_to_auth_pending": rearmed_to_auth_pending,
+    }
+    logger.info(
+        "[额度重置] 完成: 扫描 %d 个账号，更新 %d 个，恢复 exhausted -> active %d 个，exhausted -> auth_pending %d 个",
+        total_accounts,
+        updated_accounts,
+        rearmed_to_active,
+        rearmed_to_auth_pending,
+    )
+    return summary
+
+
+def _reconcile_master_degraded_subaccounts(*, dry_run: bool = False, chatgpt_api=None):
+    """Round 8 — SPEC-2 v1.5 §3.5.3:reconcile retroactive 清理。
+
+    Round 9 SPEC v2.0 — 改为 _apply_master_degraded_classification helper 的薄 wrapper,
+    保留旧返回结构(degraded_marked / skipped_reason)以兼容既有 cmd_reconcile 调用方。
+    新加 marked_grace / reverted_active / errors 字段透传,便于 audit。
+
+    若母号订阅 cancelled 且子号 JWT grace_until 仍未过期 → DEGRADED_GRACE
+    若 grace 已过期 / JWT 解析失败                          → STANDBY
+    若母号已恢复 active                                       → DEGRADED_GRACE 撤回为 ACTIVE
+    """
+    from autoteam.master_health import _apply_master_degraded_classification
+
+    raw = _apply_master_degraded_classification(
+        chatgpt_api=chatgpt_api, dry_run=dry_run,
+    )
+
+    # 旧返回字段映射:degraded_marked = grace + standby (统一视为"被重分类")
+    degraded_marked = list(raw.get("marked_grace") or []) + list(raw.get("marked_standby") or [])
+
+    return {
+        "degraded_marked": degraded_marked,
+        "marked_grace": raw.get("marked_grace") or [],
+        "marked_standby": raw.get("marked_standby") or [],
+        "reverted_active": raw.get("reverted_active") or [],
+        "skipped_reason": raw.get("skipped_reason"),
+        "errors": raw.get("errors") or [],
+        "dry_run": raw.get("dry_run", bool(dry_run)),
+    }
+
+
+def cmd_reconcile(dry_run: bool = False):
+    """独立运行一次对账,修正残废 / 错位 / 耗尽未抛弃 / ghost 成员。
+
+    与 cmd_check 内部的 `_reconcile_team_members` 共享同一套逻辑,但:
+    - 不做额度检查、不触发 Codex 登录,纯做状态对齐
+    - 入口日志更友好,返回结构化 result 便于 API / 脚本消费
+    - dry_run=True 等价于 cmd_reconcile_dry_run,只输出诊断不动账户
+
+    Round 8 — 在常规 reconcile 后额外做 master-degraded retroactive cleanup。
+    """
+    logger.info("[对账] 开始独立对账 dry_run=%s", dry_run)
+    recon = _reconcile_team_members(dry_run=dry_run)
+
+    # 汇总日志,方便看出哪些分支命中
+    summary_keys = [
+        "kicked",
+        "flipped_to_active",
+        "orphan_kicked",
+        "orphan_marked",
+        "misaligned_fixed",
+        "exhausted_marked",
+        "ghost_kicked",
+        "ghost_seen",
+        "over_cap_kicked",
+    ]
+    parts = [f"{k}={len(recon.get(k) or [])}" for k in summary_keys]
+    logger.info("[对账] %s结果: %s", "(dry-run)" if dry_run else "", ", ".join(parts))
+
+    # 具体列表只在非空时打,避免日志噪声
+    for k in summary_keys:
+        items = recon.get(k) or []
+        if items:
+            logger.info("[对账] %s → %s", k, items)
+
+    # Round 8 — retroactive cleanup
+    try:
+        retro = _reconcile_master_degraded_subaccounts(dry_run=dry_run)
+        recon["master_degraded_retroactive"] = retro
+        if retro.get("degraded_marked"):
+            logger.info(
+                "[对账-retroactive] %s标 standby %d 个: %s",
+                "(dry-run) " if dry_run else "",
+                len(retro["degraded_marked"]),
+                retro["degraded_marked"],
+            )
+    except Exception as exc:
+        logger.warning("[对账-retroactive] 异常未阻塞主对账: %s", exc)
+        recon["master_degraded_retroactive"] = {
+            "degraded_marked": [], "skipped_reason": f"exception:{exc}",
+        }
+
+    return recon
+
+
+def cmd_reconcile_dry_run():
+    """诊断模式:只输出报告,不 kick 任何账号、不写 accounts.json。"""
+    return cmd_reconcile(dry_run=True)
+
+
 def main():
     import argparse
 
@@ -3572,9 +7937,14 @@ def main():
     sub = parser.add_subparsers(dest="command", help="可用命令")
 
     sub.add_parser("status", help="查看所有账号状态")
-    sub.add_parser("check", help="检查活跃账号 Codex 额度")
+    check_p = sub.add_parser("check", help="检查活跃账号 Codex 额度")
+    check_p.add_argument(
+        "--include-standby",
+        action="store_true",
+        help="同时探测 standby 池的 quota(限速+24h 去重,会对每个 standby 账号打一次 wham/usage)",
+    )
     rotate_p = sub.add_parser("rotate", help="智能轮转（检查额度 → 移出 → 复用旧号 → 万不得已才创建新号）")
-    rotate_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
+    rotate_p.add_argument("target", type=int, nargs="?", default=3, help="目标成员数（默认 3，最多 3）")
     sub.add_parser("add", help="手动添加一个新账号")
     sub.add_parser("manual-add", help="手动 OAuth 添加账号（打开链接登录后粘贴回调 URL）")
     admin_login_p = sub.add_parser("admin-login", help="交互式完成管理员主号登录")
@@ -3584,13 +7954,24 @@ def main():
     sub.add_parser("main-codex-sync", help="交互式同步主号 Codex 到 CPA")
 
     fill_p = sub.add_parser("fill", help="补满 Team 成员到指定数量")
-    fill_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
+    fill_p.add_argument("target", type=int, nargs="?", default=3, help="目标成员数（默认 3，最多 3）")
 
     cleanup_p = sub.add_parser("cleanup", help="清理多余成员（只移除本地管理的）")
     cleanup_p.add_argument("max_seats", type=int, nargs="?", default=None, help="最大席位数")
 
+    sub.add_parser("reset-quota", help="清空本地额度恢复记录，并把 exhausted 账号恢复为可检查状态")
     sub.add_parser("sync", help="手动同步认证文件到 CPA")
     sub.add_parser("pull-cpa", help="从 CPA 反向同步认证文件到本地")
+
+    reconcile_p = sub.add_parser(
+        "reconcile",
+        help="对账 Team 实际成员 vs 本地状态,修复残废 / 错位 / 耗尽未抛弃 / ghost",
+    )
+    reconcile_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只输出诊断报告,不 kick、不改 accounts.json",
+    )
 
     api_p = sub.add_parser("api", help="启动 HTTP API 服务器")
     api_p.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
@@ -3618,7 +7999,7 @@ def main():
     if args.command == "status":
         cmd_status()
     elif args.command == "check":
-        cmd_check()
+        cmd_check(include_standby=getattr(args, "include_standby", False))
     elif args.command == "rotate":
         cmd_rotate(args.target)
     elif args.command == "add":
@@ -3635,10 +8016,14 @@ def main():
         cmd_fill(args.target)
     elif args.command == "cleanup":
         cmd_cleanup(args.max_seats)
+    elif args.command == "reset-quota":
+        cmd_reset_quota_recovery()
     elif args.command == "sync":
         sync_to_cpa()
     elif args.command == "pull-cpa":
         cmd_pull_cpa()
+    elif args.command == "reconcile":
+        cmd_reconcile(dry_run=getattr(args, "dry_run", False))
     elif args.command == "api":
         from autoteam.api import start_server
 

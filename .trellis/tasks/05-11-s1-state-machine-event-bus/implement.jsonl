@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "code quality + lint requirements baseline"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "explicit error handling + custom exceptions guidance"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "structured logging + log level conventions"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "atomic file write patterns (state_log.jsonl is JSONL store)"}
+{"file": ".trellis/tasks/05-11-upstream-align-register-multimail-frontend-refresh/prd.md", "reason": "parent PRD — S1 scope, decision matrix, dependency graph"}
+{"file": ".trellis/tasks/05-11-upstream-align-register-multimail-frontend-refresh/research/caveat-verified-2026-05-11.md", "reason": "parent task research — overall round-12 caveats"}
+{"file": ".trellis/tasks/05-11-s1-state-machine-event-bus/prd.md", "reason": "this task PRD"}

@@ -10,15 +10,15 @@ cp .env.example .env
 
 | 配置项 | 说明 | 必填 |
 |--------|------|------|
-| `MAIL_PROVIDER` | 临时邮箱后端,`cf_temp_email`(默认) 或 `maillab` | 否 |
-| `CLOUDMAIL_BASE_URL` | cf_temp_email 后端的 API 地址 | `MAIL_PROVIDER=cf_temp_email` 时是 |
-| `CLOUDMAIL_PASSWORD` | cf_temp_email 后端的管理员密码 | `MAIL_PROVIDER=cf_temp_email` 时是 |
-| `CLOUDMAIL_DOMAIN` | 临时邮箱域名(如 `@example.com`) | 是 |
+| `MAIL_PROVIDER` | 临时邮箱后端,`cf_temp_email`(默认) 或 `maillab` | **是(默认 `cf_temp_email`)** |
+| `CLOUDMAIL_BASE_URL` | cf_temp_email 后端的 API 地址，必须包含 `/api` 前缀(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
+| `CLOUDMAIL_PASSWORD` | cf_temp_email 后端的管理员密码(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
+| `CLOUDMAIL_DOMAIN` | 临时邮箱域名(如 `@example.com`,Web 面板可填) | 是 |
 | `CLOUDMAIL_EMAIL` | 已废弃,保留只为兼容旧 `.env`;不再被使用 | 否 |
-| `MAILLAB_API_URL` | maillab/cloud-mail 后端的 API 地址 | `MAIL_PROVIDER=maillab` 时是 |
-| `MAILLAB_USERNAME` | maillab 主账号邮箱(用于登录) | `MAIL_PROVIDER=maillab` 时是 |
-| `MAILLAB_PASSWORD` | maillab 主账号密码 | `MAIL_PROVIDER=maillab` 时是 |
-| `MAILLAB_DOMAIN` | maillab 创建邮箱时的域名;缺省回落 `CLOUDMAIL_DOMAIN` | 否 |
+| `MAILLAB_API_URL` | maillab/cloud-mail 后端的 API 地址(Web 面板可填) | `MAIL_PROVIDER=maillab` 时是 |
+| `MAILLAB_USERNAME` | maillab 主账号邮箱(Web 面板可填) | `MAIL_PROVIDER=maillab` 时是 |
+| `MAILLAB_PASSWORD` | maillab 主账号密码(Web 面板可填) | `MAIL_PROVIDER=maillab` 时是 |
+| `MAILLAB_DOMAIN` | maillab 创建邮箱时的域名;缺省回落 `CLOUDMAIL_DOMAIN`(Web 面板可填) | 否 |
 | `CPA_URL` | CLIProxyAPI 地址 | 是（留空使用默认 `http://127.0.0.1:8317`） |
 | `CPA_KEY` | CPA 管理密钥 | 是 |
 | `API_KEY` | Web 面板 / API 鉴权密钥 | 是（首次启动可自动生成） |
@@ -27,24 +27,57 @@ cp .env.example .env
 | `AUTO_CHECK_THRESHOLD` | 额度低于此百分比触发轮转 | 否（默认 `10`） |
 | `AUTO_CHECK_INTERVAL` | 巡检间隔（秒） | 否（默认 `300`） |
 | `AUTO_CHECK_MIN_LOW` | 至少几个账号低于阈值才触发 | 否（默认 `2`） |
+| `MULTI_MASTER_MAX_OWNER_WORKERS` | 多 Team 母号并行补位时同时运行的 owner worker 数 | 否（默认 `2`） |
+| `MULTI_MASTER_BROWSER_BUDGET` | owner 并发与 direct signup race 共用的全局浏览器预算 | 否（默认 `4`） |
+| `MULTI_MASTER_MEMORY_DOWNGRADE_RATIO` | cgroup 内存比例达到该值时，多母号并行自动降级为串行 | 否（默认 `0.85`） |
+| `DIRECT_REGISTER_PARALLEL` | 单个注册目标的 direct signup race 预算，当前多母号切片先用于预算/可观测 | 否（默认 `1`） |
+| `ROTATE_NEW_ACCOUNT_MODE` | 新号创建策略：`domain_auto_join_first` / `invite_first` / `direct_first` | 否（默认 `domain_auto_join_first`） |
+| `AUTOTEAM_AUTO_JOIN_DOMAINS` | 允许免邀请自动入工作空间的邮箱域名；`auto` 表示当前邮箱服务域名，多个用逗号分隔 | 否（默认 `auto`） |
+| `ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE` | direct 注册未能远端确认入席时是否回退邀请链接注册 | 否（默认 `true`） |
+| `RECONCILE_KICK_ORPHAN` | 对账发现“残废”成员(workspace 有 active + 本地 `auth_file` 缺失)时是否自动 KICK。关掉则标记 `STATUS_ORPHAN` 等人工处理 | 否（默认 `true`） |
+| `RECONCILE_KICK_GHOST` | 对账发现“ghost”成员(workspace 有但本地完全无记录)时是否自动 KICK。关掉则留给 `sync_account_states` 反向补录 | 否（默认 `true`） |
+
+## 账号状态与席位字段
+
+`accounts.json` 中每条记录的 `status` 枚举(常量见 `src/autoteam/accounts.py`):
+
+| 状态 | 含义 |
+|------|------|
+| `active` | 在 Team 中且本地认为可用 |
+| `exhausted` | 在 Team 中但额度耗尽,等待移出 |
+| `standby` | 已移出 Team,等待后续复用 |
+| `pending` | 注册 / 创建流程尚未完成 |
+| `personal` | 已主动退出 Team,走个人号 Codex OAuth,不再参与 Team 轮转 |
+| `auth_invalid` | `auth_file` token 已失效(401/403),等对账清理或重登。`cmd_check --include-standby` 探到 401/403 时会落到这个状态 |
+| `orphan` | workspace 仍占席但本地 `auth_file` 缺失。`RECONCILE_KICK_ORPHAN=false` 时对账会把残废成员打上此标记而不 KICK,等人工补登 |
+
+`seat_type` 字段标记该账号在 ChatGPT Team 里被授予的席位种类:
+
+| seat_type | 含义 |
+|-----------|------|
+| `chatgpt` | 完整 ChatGPT 席位(PATCH `seat_type=default` 成功) |
+| `codex` | 仅 Codex 席位(`usage_based`,PATCH 改 default 失败时的兜底) |
+| `unknown` | 未知 / 老记录默认值,手动导入时若未指定也落在这里 |
+
+`last_quota_check_at`(epoch 秒)记录最近一次 wham/usage 探测时间,供 `cmd_check --include-standby` 的 24h 去重使用。
 
 ## Mail Provider 切换
 
-AutoTeam 支持两个临时邮箱后端,通过 `MAIL_PROVIDER` 环境变量切换:
+AutoTeam 支持两个临时邮箱后端,通过 `MAIL_PROVIDER` 环境变量切换。**推荐先选 `maillab`,再选 `cf_temp_email`**:
 
-| Provider          | 上游仓库                                 | 适配字段                                                  |
-| ----------------- | ---------------------------------------- | --------------------------------------------------------- |
-| `cf_temp_email`   | `dreamhunter2333/cloudflare_temp_email`  | `CLOUDMAIL_BASE_URL` / `CLOUDMAIL_PASSWORD` / `CLOUDMAIL_DOMAIN` |
-| `maillab`         | `maillab/cloud-mail`                     | `MAILLAB_API_URL` / `MAILLAB_USERNAME` / `MAILLAB_PASSWORD` / `MAILLAB_DOMAIN` |
+| Provider          | 上游仓库                                 | 部署形态                          | 适配字段                                                  |
+| ----------------- | ---------------------------------------- | --------------------------------- | --------------------------------------------------------- |
+| `maillab`(推荐)| `maillab/cloud-mail` (skymail.ink)       | 一键 Docker / Cloudflare Workers,中文社区活跃 | `MAILLAB_API_URL` / `MAILLAB_USERNAME` / `MAILLAB_PASSWORD` / `MAILLAB_DOMAIN` |
+| `cf_temp_email`   | `dreamhunter2333/cloudflare_temp_email`  | 较早一代 Cloudflare Workers 实现 | `CLOUDMAIL_BASE_URL` / `CLOUDMAIL_PASSWORD` / `CLOUDMAIL_DOMAIN` |
 
 > 命名说明:旧版的 `CLOUDMAIL_*` 配置实际指向的是 `cloudflare_temp_email`,
 > 与 `maillab/cloud-mail`(社区里另一个同名项目)是两个不同的后端,因此在
-> v2026-04 起拆分了两套配置。`MAIL_PROVIDER` 缺省为 `cf_temp_email`,与历史行为完全一致。
+> v2026-04 起拆分了两套配置。从 SPEC-1 起,`.env.example` 已强引导显式声明 `MAIL_PROVIDER`。
 
-切换方法:在 `.env` 中显式设置:
+切换方法:在 `.env` 中显式设置(也可以在 Web 面板「设置 → 邮箱后端」中切换):
 
 ```dotenv
-# 用社区 maillab/cloud-mail
+# 推荐:maillab/cloud-mail
 MAIL_PROVIDER=maillab
 MAILLAB_API_URL=https://your-maillab.example.com
 MAILLAB_USERNAME=admin@example.com
@@ -54,6 +87,46 @@ MAILLAB_DOMAIN=@example.com
 
 业务调用方零改动:`from autoteam.cloudmail import CloudMailClient` 仍然有效,
 工厂会按 `MAIL_PROVIDER` 自动 dispatch 到对应 provider 实例。
+
+### 邮箱归属验证
+
+切换 / 首次配置后,SetupPage 会调用 `/api/mail-provider/probe` 探测后端归属:
+
+1. **指纹嗅探(fingerprint)** — 探 `/setting/websiteConfig`(maillab) 或 `/admin/address`(cf_temp_email),返回 `detected_provider` 与 `domain_list`。
+2. **凭据校验(credentials)** — 用管理员密码 (`x-admin-auth`) 或 `/login` 拿 token,确认能登录。
+3. **域名归属(domain_ownership)** — 在目标域名下创建 `probe-{ts}{uuid}` 邮箱并立即删除,验证管理员持有该域名;若 maillab `addVerify=1` 会拒绝创建,需先在管理后台把域名加入白名单。
+
+`/api/config/register-domain`(注册域名)内部使用同一个 `probe.probe_domain_ownership` helper,语义对齐。
+
+### ⚠️ 协议错配排查(issue #1)
+
+**最常见的错配场景**:从 `cnitlrt/AutoTeam` 上游迁过来的用户,`.env` 里只有 `CLOUDMAIL_*` 配置(因为上游叫"cloudmail"),但本 fork 默认 `MAIL_PROVIDER=cf_temp_email` 走的是 `dreamhunter2333/cloudflare_temp_email` 协议,而上游的 `cloudmail` 实际是 `maillab/cloud-mail` → 启动后看到:
+
+```
+[CloudMail] 管理员鉴权通过        # /admin/address 被 maillab catch-all 路由误回 200
+[验证] CloudMail 登录成功
+[验证] CloudMail 创建邮箱失败: 创建邮箱失败: 响应缺少 address 字段:
+       {'code': 401, 'message': '身份认证失效,请重新登录'}
+```
+
+**修复路径(Web 面板)**:打开 SetupPage / 「设置 → 邮箱后端」 → 选对后端类型 → 「测试连接」(若指纹错配会立即报 `PROVIDER_MISMATCH`)→ 「验证归属」 → 保存。
+
+**修复路径(命令行)**:在 `.env` 里加一行 `MAIL_PROVIDER=maillab`,把 `CLOUDMAIL_*` 替换为 `MAILLAB_*` 配置(见上表)。
+
+启动时的协议指纹嗅探(`setup_wizard._sniff_provider_mismatch`)会在 base_url 与 `MAIL_PROVIDER` 不匹配时**直接 abort**(`return False`);`CfTempEmailClient.login()` / `MaillabClient._parse_response()` 也会在响应特征不对时抛出明确切换提示,不会再出现"半成功"假象。如需在已知错配场景下临时跳过嗅探,可设 `AUTOTEAM_SKIP_PROVIDER_SNIFF=1`(SPEC-1 §3.4 决策)。
+
+### 错误码对照表(`/api/mail-provider/probe`)
+
+| `error_code` | 说明 | 修复方向 |
+|---|---|---|
+| `PROVIDER_MISMATCH` | base_url 指纹与所选 provider 不匹配 | 切到正确的 provider 后重试 |
+| `ROUTE_NOT_FOUND` | base_url 不是任何已知后端 | 检查 URL 是否包含 /api 前缀 / 协议是否正确 |
+| `EMPTY_DOMAIN_LIST` | maillab `domainList` 空 | 在 maillab 管理后台先添加可用域名 |
+| `UNAUTHORIZED` | 凭据校验失败 | 重置密码或排查管理员账号 |
+| `CAPTCHA_REQUIRED` | maillab 启用了登录验证码 | 暂时关闭 captcha 或改用 admin 直登 |
+| `DOMAIN_REJECTED` | 创建探测邮箱被拒(`addVerify=1` 等) | 先在后台把域名加入白名单 |
+| `RATE_LIMITED` | 60 req/min 限速触发 | 等 1 分钟后重试 |
+| `NETWORK_ERROR` / `TIMEOUT` | 网络异常 | 检查 base_url 可达性 |
 
 ## Playwright 代理
 
@@ -76,6 +149,24 @@ PLAYWRIGHT_PROXY_URL=socks5://username:password@host.docker.internal:1080
 
 - `PLAYWRIGHT_PROXY_URL` 会被解析为 Playwright 所需的 `server` / `username` / `password` 字段
 - `PLAYWRIGHT_PROXY_BYPASS` 建议至少包含 `localhost,127.0.0.1`，避免本地回调或容器内本地服务误走代理
+
+## 轮转新号创建策略
+
+如果 ChatGPT workspace 已完成 Verified Domains，并在 Workspace -> Identity & Access 开启 Automatic account creation，建议保留默认策略：
+
+```dotenv
+ROTATE_NEW_ACCOUNT_MODE=domain_auto_join_first
+AUTOTEAM_AUTO_JOIN_DOMAINS=auto
+ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE=true
+```
+
+行为说明：
+
+- `domain_auto_join_first` 会先确认当前邮箱服务域名在 allowlist 内，然后跳过 Team invite 和邀请邮件等待，直接注册 ChatGPT 账号。
+- direct 注册成功后仍必须通过远端 Team members、本地 auth file 和 Codex quota 验收；未确认不会被当作可用 active 账号。
+- direct 注册失败且 `ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE=true` 时，会回退到邀请链接注册路径。
+- 如果邮箱域名还没有完成 verified domain / automatic account creation，请改为 `ROTATE_NEW_ACCOUNT_MODE=invite_first`。
+- `direct_first` 是强制模式，只建议在确认所有临时邮箱域名都能自动加入 workspace 时使用。
 
 ### 内联注释
 
